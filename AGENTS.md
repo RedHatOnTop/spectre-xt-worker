@@ -1,6 +1,9 @@
 # remote-agent
 
-24/7 ZCode worker box for the idle HP Spectre XT (i7-3517U, 12 GB, dual SSD).
+24/7 ZCode worker box for the idle HP Spectre XT TouchSmart (13-2000,
+2012, i7-3517U, 12 GB, 256 GB + 120 GB SSD). This is not an HP ZBook
+and not the 15-inch ENVY Spectre XT. The daily driver is the ASUS
+Zenbook Duo (`fedora`).
 This directory is its own git repository. Do not mix commits with sibling
 projects under `distribution-project/`.
 

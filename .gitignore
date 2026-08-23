@@ -5,3 +5,5 @@ health.env
 credentials.json
 node_modules/
 *.log
+__pycache__/
+*.pyc

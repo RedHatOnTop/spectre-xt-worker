@@ -34,7 +34,8 @@ apt-get install -y \
   cockpit \
   unattended-upgrades apt-listchanges \
   acpid upower alsa-utils x11-xserver-utils iw \
-  xfce4 lightdm lightdm-gtk-greeter openssh-server dbus-x11 sudo
+  xfce4 lightdm lightdm-gtk-greeter openssh-server dbus-x11 sudo \
+  rsync sqlite3 python3 parted e2fsprogs udev
 apt-get install -y intel-microcode firmware-iwlwifi firmware-linux cockpit-pcp \
   xserver-xorg-video-intel || true
 
@@ -80,6 +81,7 @@ systemctl restart systemd-logind.service
 
 loginctl enable-linger "${PERSON_USER}"
 
+bash "${REPO_DIR}/scripts/setup-disks.sh" || true
 install -d -m 0755 /work
 install -d -m 0755 -o "${PERSON_USER}" -g "${PERSON_USER}" /work/person /work/logs /work/npm-cache /work/hardened-zai-proxy
 install -m 0755 "${REPO_DIR}/scripts/healthcheck.sh" /usr/local/bin/spectre-healthcheck
@@ -150,6 +152,7 @@ fi
 
 bash "${REPO_DIR}/scripts/install-zcode.sh" "${PERSON_USER}"
 install -m 0755 "${REPO_DIR}/scripts/bind-cockpit.sh" /usr/local/bin/spectre-bind-cockpit
+bash "${REPO_DIR}/scripts/install-warp.sh"
 if tailscale ip -4 >/dev/null 2>&1; then
   bash "${REPO_DIR}/scripts/bind-cockpit.sh" || true
 fi
@@ -161,4 +164,5 @@ echo "  sudo spectre-bind-cockpit"
 echo "  copy hardened-zai-proxy into /work/hardened-zai-proxy (no node_modules)"
 echo "  systemctl --user enable --now glm-proxy.service"
 echo "  sudo spectre-stealth closed && close the lid"
+echo "  warp to fedora / warp from fedora   (same path as on the Zenbook)"
 echo "  verify: systemctl is-active lid-inhibit.service"

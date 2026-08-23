@@ -1,0 +1,17 @@
+node_modules
+target
+dist
+.next
+__pycache__
+.venv
+venv
+build
+.cache
+*.pyc
+graphify-out/cache
+**/src-tauri/target
+hardened-zai-proxy/node_modules
+log-viewer/src-tauri/target
+.terraform
+*.iso
+*.img

@@ -1,7 +1,9 @@
 # Spectre XT 24/7 agent worker
 
-Target: HP ENVY Spectre XT (2012), i7-3517U (2C/4T, 17 W), 12 GB, 256 GB +
-120 GB SSD, battery replaced years ago.
+Target: HP Spectre XT TouchSmart (13-2000 series, 2012), i7-3517U
+(2C/4T, 17 W), 12 GB, 256 GB + 120 GB SSD, battery replaced years ago.
+Not an HP ZBook. Not the 15-inch ENVY Spectre XT. The machine named
+`fedora` is the ASUS Zenbook Duo, which stays the daily driver.
 
 The box is an agent runtime. LLM calls wait on the network; the CPU is the
 bottleneck only when a session compiles. Budget **one ZCode window, at most
@@ -97,29 +99,29 @@ After first boot, do **not** enable GNOME later. If XFCE feels wrong,
 
 ## 3. Disk layout
 
-256 GB SSD = OS. 120 GB SSD = work + swap. Do not put swap on the OS
-disk; 24-hour Chromium + Node will write it.
+Two SSDs, identified by size, never by `sda`/`sdb` (those swap).
 
-256 GB (`/dev/sda`, confirm with `lsblk` before touching):
+**Debian installer: use only the 256 GB disk.** Guided — entire disk, LVM
+off, ext4, write the bootloader there. Leave the 120 GB disk unused.
+If the installer lists both, the ~238 GiB one is OS; the ~112 GiB one
+is work. Pick the large one. If only one disk appears, the 120 GB is
+mSATA still disabled in BIOS.
 
-```
-sda1  512M  vfat  /boot/efi
-sda2  rest  ext4  /
-```
+`scripts/setup-disks.sh` (run by the one-click) then:
 
-120 GB (`/dev/sdb`):
+- refuses to touch the disk that holds `/`
+- finds the other disk in the 90–140 GB window
+- if it is empty: GPT, 8 GB swap, rest ext4 labelled `SPECTREWORK` → `/work`
+- if it already says `SPECTREWORK`: just mount
+- if it already has some other filesystem: stop and print `lsblk`. It
+  will not wipe a disk that looks used.
 
-```
-sdb1    8G  swap
-sdb2   rest ext4  /work
-```
-
-`/work` holds project clones, ZCode workspace copies, proxy logs if they
-grow, and `npm` cache (`npm config set cache /work/npm-cache`). `/` stays
+Projects stay at the same absolute path as on the Zenbook,
+`/home/person/Projects/...`, so Warp does not rewrite ZCode session
+paths. `/work` is swap, `npm-cache`, proxy logs, bulky clones. `/` stays
 replaceable.
 
-ext4, not btrfs. This is a 2012 SSD pair running 24/7; we want fsck, not
-a snapshot story.
+ext4, not btrfs.
 
 ---
 
@@ -395,6 +397,39 @@ sudo systemctl restart cockpit.socket
 
 RustDesk / VNC: no. HD 4000 plus H.264 encode will melt the 17 W part
 and buy you nothing Bot Channel does not.
+
+---
+
+## 7.5 Warp (Zenbook ↔ Spectre)
+
+`warp` sends the current project and its ZCode sessions to the other
+machine at the **same absolute path**. That is why Projects stay under
+`/home/person/Projects` on the Spectre instead of `/work`.
+
+On the Zenbook, once:
+
+```bash
+bash scripts/install-warp.sh
+```
+
+```bash
+cd /home/person/Projects/whatever
+warp to spectre          # this machine → Spectre
+warp from spectre        # Spectre → this machine
+```
+
+On the Spectre the inverse is `warp to fedora` / `warp from fedora`.
+
+`target/`, `node_modules/`, `.next/`, and the rest of
+`config/warp-excludes.txt` stay behind. Uncommitted files go; this is
+the point.
+
+Close ZCode on the **destination** first. The source can stay open —
+sessions are snapshotted from WAL. If the dest still has ZCode open,
+files still land and you run `warp apply ~/.cache/spectre-warp/in.*/sessions.db`
+after quitting.
+
+`warp status` shows last direction, peer, and path.
 
 ---
 
