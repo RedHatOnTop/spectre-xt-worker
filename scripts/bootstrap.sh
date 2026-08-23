@@ -35,13 +35,23 @@ apt-get install -y \
   unattended-upgrades apt-listchanges \
   acpid upower alsa-utils x11-xserver-utils iw \
   xfce4 lightdm lightdm-gtk-greeter openssh-server dbus-x11 sudo \
-  rsync sqlite3 python3 parted e2fsprogs udev
+  rsync sqlite3 python3 parted e2fsprogs udev mosh locales
 apt-get install -y intel-microcode firmware-iwlwifi firmware-linux cockpit-pcp \
   xserver-xorg-video-intel || true
 
 systemctl enable --now ssh.service
 systemctl enable lightdm.service
 systemctl set-default graphical.target
+
+install -d -m 0755 /etc/ssh/sshd_config.d
+cat >/etc/ssh/sshd_config.d/spectre.conf <<'EOF'
+ClientAliveInterval 15
+ClientAliveCountMax 4
+TCPKeepAlive yes
+EOF
+systemctl reload ssh.service || systemctl reload sshd.service || true
+
+bash "${REPO_DIR}/scripts/locale-and-time.sh"
 
 apt-get purge -y light-locker xfce4-screensaver 2>/dev/null || true
 
@@ -151,11 +161,28 @@ fi
 PERSON_HOME="$(getent passwd "${PERSON_USER}" | cut -d: -f6)"
 if [[ -n "${PERSON_HOME}" ]]; then
   install -d -m 0755 -o "${PERSON_USER}" -g "${PERSON_USER}" \
-    "${PERSON_HOME}/.config/autostart"
+    "${PERSON_HOME}/.config/autostart" \
+    "${PERSON_HOME}/.config/systemd/user"
   install -m 0644 -o "${PERSON_USER}" -g "${PERSON_USER}" \
     "${REPO_DIR}/desktop/stealth-session.desktop" \
     "${PERSON_HOME}/.config/autostart/stealth-session.desktop"
+  install -m 0644 -o "${PERSON_USER}" -g "${PERSON_USER}" \
+    "${REPO_DIR}/systemd/tmux-work.service" \
+    "${PERSON_HOME}/.config/systemd/user/tmux-work.service"
+  sudo -u "${PERSON_USER}" XDG_RUNTIME_DIR="/run/user/$(id -u "${PERSON_USER}")" \
+    systemctl --user enable tmux-work.service 2>/dev/null || true
 fi
+
+install -m 0755 "${REPO_DIR}/scripts/status.sh" /usr/local/bin/spectre-status
+install -m 0755 "${REPO_DIR}/scripts/pull-operator-keys.sh" /usr/local/bin/spectre-pull-keys
+cat >/etc/profile.d/spectre-motd.sh <<'EOF'
+if [ -n "${SSH_CONNECTION:-}" ] && [ -z "${SPECTRE_MOTD_DONE:-}" ]; then
+  SPECTRE_MOTD_DONE=1
+  export SPECTRE_MOTD_DONE
+  command -v spectre-status >/dev/null && spectre-status
+fi
+EOF
+chmod 0644 /etc/profile.d/spectre-motd.sh
 
 bash "${REPO_DIR}/scripts/install-zcode.sh" "${PERSON_USER}"
 install -m 0755 "${REPO_DIR}/scripts/bind-cockpit.sh" /usr/local/bin/spectre-bind-cockpit
@@ -168,6 +195,7 @@ echo
 echo "bootstrap done. reboot, then:"
 echo "  sudo tailscale up --ssh --hostname=spectre"
 echo "  sudo spectre-bind-cockpit"
+echo "  spectre-pull-keys fedora"
 echo "  copy hardened-zai-proxy into /work/hardened-zai-proxy (no node_modules)"
 echo "  systemctl --user enable --now glm-proxy.service"
 echo "  sudo spectre-stealth closed && close the lid"

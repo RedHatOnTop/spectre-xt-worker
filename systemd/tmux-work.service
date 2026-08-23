@@ -1,0 +1,12 @@
+[Unit]
+Description=Persistent tmux session 'work' for phone SSH
+After=default.target
+
+[Service]
+Type=forking
+ExecStart=/usr/bin/tmux new-session -d -s work
+ExecStop=/usr/bin/tmux kill-session -t work
+Restart=on-failure
+
+[Install]
+WantedBy=default.target

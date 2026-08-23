@@ -31,7 +31,13 @@ installs XFCE, ignores the lid, blanks the panel, and puts `warp` on
 ```bash
 sudo tailscale up --ssh --hostname=spectre
 sudo spectre-bind-cockpit
+spectre-pull-keys fedora
 ```
+
+Phone control that still works when Z.ai is down: Tailscale on the
+Fold 7 → Termius → `tmux attach -t work`. Cockpit at
+`https://spectre.tail1fa7c9.ts.net:9090`. ZCode Remote is a view, not
+the control plane. Telegram Bot Channel is the durable agent surface.
 
 On the Zenbook, once:
 

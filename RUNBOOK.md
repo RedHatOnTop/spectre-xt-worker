@@ -129,10 +129,11 @@ If only the 128 GB SATA appears, the 256 GB mSATA is still off in BIOS.
 After first boot the one-click `setup-disks.sh`:
 
 - refuses to touch the disk that holds `/`
-- finds the other disk in the 90–140 GB window
-- empty → GPT, 8 GB swap, rest ext4 labelled `SPECTREWORK` mounted at `/work`
-- already `SPECTREWORK` → just mount
-- some other filesystem → stop and print `lsblk`, no wipe
+- **if you already partitioned the 128 GB SATA, it adopts that layout
+  and does not format.** Swap partitions get `swapon`. The largest
+  ext4/xfs/btrfs on that disk is mounted at `/work` unless the installer
+  already mounted it somewhere (`/home`, etc.) — then it is left alone.
+- empty disk only → GPT, 8 GB swap, rest ext4 labelled `SPECTREWORK`
 
 `/work` is swap, npm-cache, proxy logs, bulky clones. Projects stay on `/`.
 ext4, not btrfs.
@@ -365,52 +366,49 @@ alone is not "perfect control".
 
 ---
 
-## 7. Mobile control (Fold 7)
+## 7. Mobile control (Fold 7) — what is actually reliable
 
-Four layers. All of them, not a menu.
+ZCode Remote Control is a bonus view. It is **not** the control plane.
+It depends on Z.ai's relay, a live Electron window, one phone page at a
+time, and a QR/link that is a capability token. When Z.ai blips, the
+phone goes blind while the box is still up.
 
-### A. Tailscale (network)
+The reliable path does not go through Z.ai.
 
-`z-fold7` is already in the tailnet and currently online. After
-`tailscale up --hostname=spectre`:
+| Rank | What | Survives Z.ai outage | Survives lid closed |
+|---|---|---|---|
+| 1 | Tailscale + Termius → `tmux attach -t work` | yes | yes |
+| 2 | Cockpit `https://spectre.tail1fa7c9.ts.net:9090` | yes | yes |
+| 3 | ntfy push from `worker-health.timer` | yes | yes |
+| 4 | ZCode Telegram Bot Channel | no (ZCode + Z.ai) | yes if ZCode is up |
+| 5 | ZCode Remote Control QR | no | yes if ZCode is up |
 
-- MagicDNS name: `spectre`
-- Tailscale SSH: `tailscale up --ssh` on the Spectre
-- ACL default is fine for a two-node-plus-phone tailnet
+Fold 7 is already in the tailnet as `z-fold7`. After
 
-Install Tailscale on the Fold 7 if the Android client is stale (last
-seen on older Samsungs was years ago; the Fold 7 entry is live).
+```
+sudo tailscale up --ssh --hostname=spectre
+sudo spectre-bind-cockpit
+spectre-pull-keys fedora
+```
 
-### B. Telegram Bot Channel (agent)
+Termius:
 
-ZCode Settings → phone icon → Bot Channel → Telegram. Pair once.
-
-This is how you **start** a task at 01:00 without a QR session. Progress
-and follow-ups land in Telegram. The Spectre window must be up
-(autostart + auto-login + dummy HDMI).
-
-### C. ZCode Remote Control (visual)
-
-Scan when you need the full session view (todos, diffs, fork). The
-Zenbook already has `webRemoteControlExternalRelayDevice` populated, so
-the Z.ai relay path is known to work. Prefer that over punching a hole.
-Do not bind ZCode's relay to `0.0.0.0` on the LAN.
-
-### D. Termius + Cockpit (sysadmin)
-
-You already have `~/.ssh/machismo_phone.pub`. Put it in
-`~/.ssh/authorized_keys` on the Spectre.
-
-Termius profile:
-
-- host: `spectre` (MagicDNS) or the 100.x address
+- host: `spectre` or `spectre.tail1fa7c9.ts.net`
 - user: `person`
-- Remote command: `tmux attach -t work || tmux new -s work`
+- remote command: `tmux attach -t work || tmux new -s work`
 
-Cockpit: `https://spectre.tail1fa7c9.ts.net:9090` in the Fold 7
-browser (self-signed cert warning is expected). Reboot, journal, user
-systemd units, disk. After `tailscale up`, bind the socket to loopback
-plus the Tailscale IP so it is not on LAN/CGNAT:
+SSH keepalive is 15 s. `mosh person@spectre` is there for subway Wi-Fi.
+On login, `spectre-status` prints proxy/zcode/temp/battery.
+
+Also on the Zenbook: `sudo tailscale set --ssh` so Warp can move
+without extra keys.
+
+Telegram Bot Channel is the durable **agent** surface (start a task at
+01:00). Pair once in ZCode → phone icon → Bot Channel. QR Remote is
+only for looking at a live session.
+
+Cockpit: reboot, journal, units, disk. Self-signed cert warning is
+expected. Bind (already in bootstrap if Tailscale is up):
 
 ```
 sudo mkdir -p /etc/systemd/system/cockpit.socket.d
