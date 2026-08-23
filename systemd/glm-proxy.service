@@ -1,0 +1,29 @@
+[Unit]
+Description=hardened-zai-proxy on 127.0.0.1:18088
+Documentation=file:///home/person/Projects/distribution-project/round-robin/hardened-zai-proxy/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+WorkingDirectory=/work/hardened-zai-proxy
+ExecStart=/usr/bin/node index.js
+Environment=NODE_ENV=production
+Environment=PORT=18088
+Environment=HOST=127.0.0.1
+Environment=LOG_LANG=ko
+Restart=always
+RestartSec=5s
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/work/hardened-zai-proxy
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+
+[Install]
+WantedBy=default.target

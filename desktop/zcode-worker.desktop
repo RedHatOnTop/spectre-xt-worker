@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=ZCode worker
+Comment=Autostart ZCode on the Spectre worker box
+Exec=/home/person/.local/share/zcode/zcode --disable-gpu
+X-GNOME-Autostart-enabled=true
+StartupNotify=false
+Terminal=false
+# HD 4000: --disable-gpu forces software rendering. Do not drop it.

@@ -1,0 +1,12 @@
+[Unit]
+Description=Spectre worker health probe every 60s
+
+[Timer]
+OnBootSec=90s
+OnUnitActiveSec=60s
+AccuracySec=5s
+Persistent=true
+Unit=worker-health.service
+
+[Install]
+WantedBy=timers.target

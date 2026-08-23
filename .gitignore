@@ -1,0 +1,7 @@
+.env
+env.json
+health.env
+*.pem
+credentials.json
+node_modules/
+*.log

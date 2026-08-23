@@ -1,0 +1,11 @@
+# After `tailscale up`, copy to
+#   /etc/systemd/system/cockpit.socket.d/override.conf
+# replace the address with `tailscale ip -4`, then:
+#   sudo systemctl daemon-reload
+#   sudo systemctl restart cockpit.socket
+#
+# Empty ListenStream= clears the default 0.0.0.0:9090 / [::]:9090.
+[Socket]
+ListenStream=
+ListenStream=127.0.0.1:9090
+ListenStream=REPLACE_WITH_TAILSCALE_IPV4:9090
