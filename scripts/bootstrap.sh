@@ -19,15 +19,28 @@ if [[ "${ID}" != "debian" ]]; then
   exit 1
 fi
 
+for src in /etc/apt/sources.list.d/debian.sources /etc/apt/sources.list.d/*.sources; do
+  [[ -f "${src}" ]] || continue
+  sed -i -E 's/^Components: .*/Components: main contrib non-free non-free-firmware/' "${src}"
+done
+if [[ -f /etc/apt/sources.list ]]; then
+  sed -i -E '/^deb / { /non-free-firmware/! s/ main([[:space:]]|$)/ main contrib non-free non-free-firmware / }' /etc/apt/sources.list
+fi
+
 apt-get update
 apt-get install -y \
   ca-certificates curl gnupg jq git tmux \
-  tlp thermald lm-sensors intel-microcode \
-  firmware-iwlwifi firmware-linux \
-  cockpit cockpit-pcp \
+  tlp thermald lm-sensors \
+  cockpit \
   unattended-upgrades apt-listchanges \
-  xserver-xorg-video-intel \
-  acpid upower alsa-utils x11-xserver-utils iw
+  acpid upower alsa-utils x11-xserver-utils iw \
+  xfce4 lightdm lightdm-gtk-greeter openssh-server dbus-x11 sudo
+apt-get install -y intel-microcode firmware-iwlwifi firmware-linux cockpit-pcp \
+  xserver-xorg-video-intel || true
+
+systemctl enable --now ssh.service
+systemctl enable lightdm.service
+systemctl set-default graphical.target
 
 apt-get purge -y light-locker xfce4-screensaver 2>/dev/null || true
 
@@ -133,18 +146,19 @@ if [[ -n "${PERSON_HOME}" ]]; then
   install -m 0644 -o "${PERSON_USER}" -g "${PERSON_USER}" \
     "${REPO_DIR}/desktop/stealth-session.desktop" \
     "${PERSON_HOME}/.config/autostart/stealth-session.desktop"
-  install -m 0644 -o "${PERSON_USER}" -g "${PERSON_USER}" \
-    "${REPO_DIR}/desktop/zcode-worker.desktop" \
-    "${PERSON_HOME}/.config/autostart/zcode-worker.desktop"
+fi
+
+bash "${REPO_DIR}/scripts/install-zcode.sh" "${PERSON_USER}"
+install -m 0755 "${REPO_DIR}/scripts/bind-cockpit.sh" /usr/local/bin/spectre-bind-cockpit
+if tailscale ip -4 >/dev/null 2>&1; then
+  bash "${REPO_DIR}/scripts/bind-cockpit.sh" || true
 fi
 
 echo
-echo "bootstrap done."
-echo "next:"
+echo "bootstrap done. reboot, then:"
 echo "  sudo tailscale up --ssh --hostname=spectre"
+echo "  sudo spectre-bind-cockpit"
 echo "  copy hardened-zai-proxy into /work/hardened-zai-proxy (no node_modules)"
 echo "  systemctl --user enable --now glm-proxy.service"
-echo "  bind cockpit: see config/cockpit.socket.d/override.conf.example"
 echo "  sudo spectre-stealth closed && close the lid"
-echo "  verify: cat /sys/firmware/efi/fw_platform_size   # must be 64"
-echo "  verify: systemctl is-active lid-inhibit.service  # active"
+echo "  verify: systemctl is-active lid-inhibit.service"

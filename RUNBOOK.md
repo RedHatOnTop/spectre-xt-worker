@@ -13,8 +13,8 @@ proxy stays down for that whole stretch so the Spectre owns the key pool.
 
 Lid closed is the operating position. Closing it must never suspend.
 A glance at the desk must look like a closed, charging laptop — no panel
-glow, no keyboard light, no HP-logo glow. The front-edge power LED that
-firmware will not release gets electrical tape.
+glow, no keyboard light. The lid HP logo does not light on this chassis.
+Remaining firmware LEDs stay.
 
 Main machine today: Fedora 44 Workstation (`fedora`, Tailscale
 `100.64.11.53`). Phone: Galaxy Z Fold 7 (`z-fold7`, already in the same
@@ -35,11 +35,8 @@ the 24-hour window dies at 3 a.m.
 3. **HDMI dummy plug** (~$5, 1080p EDID). Required, not optional. Electron
    41 needs a display; stealth turns the internal panel **off**. Without
    the dummy, ZCode dies when the lid closes. Dummy plugs emit no light.
-4. **Tape the firmware LEDs.** Spectre XT keeps a front-edge power LED
-   and often an HP lid logo lit while the machine is on. Linux cannot
-   reliably turn those off. Black electrical tape. A closed laptop on a
-   charger with only a tiny amber charge pip looks off; a white power
-   LED looks on.
+4. **LEDs.** The lid HP logo stays dark on this chassis. Remaining
+   power/charge pips are firmware — leave them.
 5. **Always AC.** The replaced battery is a UPS, not a power source. If
    the BIOS has a battery-health / conservation option, enable it. This
    chassis has no Linux `charge_control_end_threshold`.
@@ -72,15 +69,23 @@ on a machine whose job is "stay up".
 | Old Intel | default | works, heavier |
 | Electron / Node | AppImage + Node 22 | already proven on the Zenbook |
 
-Install from the official netinst ISO.
+Install from the official netinst ISO (skip the desktop — the one-click
+script installs XFCE):
+
+https://cdimage.debian.org/debian-cd/current/amd64/iso-cd/debian-13.6.0-amd64-netinst.iso
 
 - Hostname: `spectre`
 - Username: same `person` as the Zenbook (keeps systemd user unit paths)
-- Desktop: **XFCE**, not GNOME. Tick "Debian desktop environment" + XFCE
-  only. No GNOME, no KDE.
+- Desktop: **none**. Do not tick GNOME/KDE/XFCE in the installer.
 - Disk (see §3). Separate `/home` is unnecessary; separate `/work` is.
-- SSH server: yes.
+- SSH server: yes. Non-free firmware: yes.
 - No root password; sudo for `person`.
+
+On first boot:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/RedHatOnTop/spectre-xt-worker/main/install.sh | sudo bash
+```
 
 If the installer cannot see both SSDs, the 120 GB is likely mSATA. Enable
 it in BIOS / Advanced → Device Configuration.
@@ -216,7 +221,7 @@ lid event.
 Power button still shuts down. That is the last on-chassis stop once
 the panel is off.
 
-**Looks-off check, 30 seconds:** dummy in, autologin done, `sudo spectre-stealth closed`, close the lid. From a metre away: no panel glow, no keyboard glow, no HP-logo glow. If a white pip remains on the front edge, that is firmware — tape it. Then from the Zenbook:
+**Looks-off check, 30 seconds:** dummy in, autologin done, `sudo spectre-stealth closed`, close the lid. From a metre away: no panel glow, no keyboard glow. Firmware power/charge pips may remain. Then from the Zenbook:
 
 ```
 ping spectre
@@ -436,8 +441,9 @@ That TUI is SSH-only. Do not expose it.
 The window is already open. Debian install today, stealth+proxy today,
 lid-closed today. Do not save a dress rehearsal for Wednesday.
 
-1. Tape firmware LEDs, dummy HDMI in, AC, elevate. BIOS lid = do nothing.
-2. Debian 13 netinst + XFCE. Reboot. `sudo bash scripts/bootstrap.sh`.
+1. Dummy HDMI in, AC, elevate. BIOS lid = do nothing.
+2. Debian 13 netinst (SSH, no desktop). Reboot. Then:
+   `curl -fsSL https://raw.githubusercontent.com/RedHatOnTop/spectre-xt-worker/main/install.sh | sudo bash`
 3. `sudo tailscale up --ssh --hostname=spectre`.
 4. Copy `hardened-zai-proxy` into `/work/hardened-zai-proxy`, enable
    `glm-proxy.service`, pin ZCode, Bot Channel, ntfy.
