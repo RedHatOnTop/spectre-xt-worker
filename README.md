@@ -1,7 +1,7 @@
 # Spectre XT TouchSmart agent worker
 
 Lid-closed Debian appliance for the idle **HP Spectre XT TouchSmart**
-(13-2000, 2012, i7-3517U, 12 GB, 256 GB + 120 GB). Not a ZBook. Not the
+(13-2000, 2012, i7-3517U, 12 GB, 256 GB mSATA + 128 GB SATA). Not a ZBook. Not the
 15-inch ENVY Spectre XT. The daily driver remains the ASUS Zenbook Duo
 (`fedora`).
 
@@ -9,7 +9,7 @@ Lid-closed Debian appliance for the idle **HP Spectre XT TouchSmart**
 
 **1. Debian 13 netinst** — at Partition disks pick **Guided - use entire
 disk**, then the **256 GB / ~238 GiB** disk, scheme **all files in one
-partition**. Leave the 120 GB unused. SSH on, no desktop. Charge cap
+partition**. Leave the 128 GB SATA unused. SSH on, no desktop. Charge cap
 is 60% if the EC exposes a threshold (2012 HP often does not).
 
 https://cdimage.debian.org/debian-cd/current/amd64/iso-cd/debian-13.6.0-amd64-netinst.iso
@@ -22,7 +22,7 @@ curl -fsSL https://raw.githubusercontent.com/RedHatOnTop/spectre-xt-worker/main/
 
 Direct file: https://raw.githubusercontent.com/RedHatOnTop/spectre-xt-worker/main/install.sh
 
-The script formats the unused 120 GB disk as 8 GB swap + `/work`,
+The script formats the unused 128 GB SATA disk as 8 GB swap + `/work`,
 installs XFCE, ignores the lid, blanks the panel, and puts `warp` on
 `$PATH`.
 

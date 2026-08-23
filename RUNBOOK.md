@@ -1,7 +1,7 @@
 # Spectre XT 24/7 agent worker
 
 Target: HP Spectre XT TouchSmart (13-2000 series, 2012), i7-3517U
-(2C/4T, 17 W), 12 GB, 256 GB + 120 GB SSD, battery replaced years ago.
+(2C/4T, 17 W), 12 GB, 256 GB mSATA + 128 GB SATA, battery replaced years ago.
 Not an HP ZBook. Not the 15-inch ENVY Spectre XT. The machine named
 `fedora` is the ASUS Zenbook Duo, which stays the daily driver.
 
@@ -93,8 +93,8 @@ On first boot:
 curl -fsSL https://raw.githubusercontent.com/RedHatOnTop/spectre-xt-worker/main/install.sh | sudo bash
 ```
 
-If the installer cannot see both SSDs, the 120 GB is likely mSATA. Enable
-it in BIOS / Advanced → Device Configuration.
+If the installer cannot see both SSDs: the missing one is usually the
+256 GB mSATA (BIOS Device Configuration). The 128 GB is SATA.
 
 After first boot, do **not** enable GNOME later. If XFCE feels wrong,
 `openbox` + `lightdm` is the fallback, not GNOME.
@@ -107,24 +107,24 @@ Two SSDs. Identify them by **size**, never by `sda`/`sdb`.
 
 | What the installer shows | This is |
 |---|---|
-| ~238 GiB / 256 GB | OS. Install Debian here. |
-| ~112 GiB / 120 GB | Leave unused. The one-click script takes it. |
+| ~238 GiB / 256 GB | mSATA. OS. Install Debian here. |
+| ~119 GiB / 128 GB | SATA. Leave unused. The one-click script takes it. |
 
-If only one disk appears, the 120 GB mSATA is still off in BIOS.
+If only the 128 GB SATA appears, the 256 GB mSATA is still off in BIOS.
 
 ### Installer screens (Debian 13 netinst)
 
 1. Reach **Partition disks**.
 2. Choose **Guided - use entire disk**.
    Not LVM. Not encrypted. Not "manual" unless you know you need it.
-3. **Select disk to partition** — the **256 GB** one only.
-   The 120 GB line stays untouched.
+3. **Select disk to partition** — the **256 GB mSATA** one only.
+   The 128 GB SATA line stays untouched.
 4. Scheme: **All files in one partition (recommended)**.
    That is ESP + `/`. No separate `/home`. Warp needs
    `/home/person/Projects/...` on this disk, same path as the Zenbook.
 5. **Finish partitioning and write changes to disk** → **Yes**.
-   This wipes the 256 GB disk. It must not mention writing to the 120 GB
-   disk. If it does, go back.
+   This wipes the 256 GB mSATA. It must not mention writing to the 128 GB
+   SATA disk. If it does, go back.
 
 After first boot the one-click `setup-disks.sh`:
 
@@ -146,8 +146,8 @@ On the 256 GB disk only:
 rest    ext4  /
 ```
 
-120 GB: leave as free space. Do not create `/home` or swap there in the
-installer.
+128 GB SATA: leave as free space. Do not create `/home` or swap there in
+the installer.
 
 ---
 
@@ -530,7 +530,7 @@ the lid closes for the week, not after.
 |---|---|
 | CPU | 2C/4T @ 17 W. Agent I/O is fine. `cargo build -j2` of Zetile is not. |
 | RAM | 12 GB. XFCE + ZCode + proxy + one session ≈ 4–6 GB. Two sessions if they stay idle. |
-| Disk | 256 + 120 GB SSD. Clone only the repo being worked. |
+| Disk | 256 GB mSATA + 128 GB SATA. Clone only the repo being worked. |
 | Net | 6235 N-Wi-Fi or USB Ethernet. API traffic is tiny. |
 | Concurrency | 1 ZCode window. Queue (`zcodeInteractionBehavior=queue`), do not fan out. |
 

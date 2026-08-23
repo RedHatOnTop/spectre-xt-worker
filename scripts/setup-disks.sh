@@ -1,6 +1,6 @@
 #!/bin/bash
-# Bind the unused ~120 GB SSD as /work + 8 GB swap. Never touches the disk
-# that holds /. Identifies disks by size, not sda/sdb.
+# Bind the unused ~128 GB SATA SSD as /work + 8 GB swap. Never touches the
+# disk that holds / (that is the 256 GB mSATA). Identify by size, not sda/sdb.
 set -euo pipefail
 
 if [[ ${EUID} -ne 0 ]]; then
@@ -33,7 +33,7 @@ mapfile -t candidates < <(
 )
 
 if (( ${#candidates[@]} == 0 )); then
-  echo "no unused 120 GB disk found. /work not created. root disk is ${root_disk}."
+  echo "no unused 128 GB SATA disk found. /work not created. root disk is ${root_disk}."
   lsblk -o NAME,SIZE,TYPE,FSTYPE,LABEL,MOUNTPOINT
   exit 0
 fi
@@ -69,7 +69,7 @@ if [[ -z "${work_part}" ]]; then
   fstypes="$(lsblk -nr -o FSTYPE "${dev}" | awk 'NF{c++} END{print c+0}')"
   if (( fstypes > 0 )); then
     echo "${dev} already has filesystems and is not labelled SPECTREWORK." >&2
-    echo "leave it alone. wipe it yourself if this really is the 120 GB work disk." >&2
+    echo "leave it alone. wipe it yourself if this really is the 128 GB SATA work disk." >&2
     lsblk -o NAME,SIZE,FSTYPE,LABEL,MOUNTPOINT "${dev}"
     exit 1
   fi
