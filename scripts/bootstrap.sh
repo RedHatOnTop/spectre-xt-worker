@@ -26,7 +26,10 @@ apt-get install -y \
   firmware-iwlwifi firmware-linux \
   cockpit cockpit-pcp \
   unattended-upgrades apt-listchanges \
-  xserver-xorg-video-intel
+  xserver-xorg-video-intel \
+  acpid upower alsa-utils x11-xserver-utils iw
+
+apt-get purge -y light-locker xfce4-screensaver 2>/dev/null || true
 
 # Node 22 — Debian 13 ships 20; the proxy and ZCode tooling expect 22.
 if ! command -v node >/dev/null 2>&1 || ! node -e 'process.exit(Number(process.versions.node.split(".")[0]) < 22)'; then
@@ -39,8 +42,9 @@ if ! command -v tailscale >/dev/null 2>&1; then
   curl -fsSL https://tailscale.com/install.sh | sh
 fi
 
-install -d -m 0755 /etc/systemd/logind.conf.d
+install -d -m 0755 /etc/systemd/logind.conf.d /etc/systemd/sleep.conf.d
 install -m 0644 "${REPO_DIR}/config/logind-ignore-lid.conf" /etc/systemd/logind.conf.d/ignore-lid.conf
+install -m 0644 "${REPO_DIR}/config/no-sleep.conf" /etc/systemd/sleep.conf.d/no-sleep.conf
 
 install -d -m 0755 /etc/sysctl.d
 install -m 0644 "${REPO_DIR}/config/99-worker-sysctl.conf" /etc/sysctl.d/99-worker.conf
@@ -66,6 +70,44 @@ loginctl enable-linger "${PERSON_USER}"
 install -d -m 0755 /work
 install -d -m 0755 -o "${PERSON_USER}" -g "${PERSON_USER}" /work/person /work/logs /work/npm-cache /work/hardened-zai-proxy
 install -m 0755 "${REPO_DIR}/scripts/healthcheck.sh" /usr/local/bin/spectre-healthcheck
+install -m 0755 "${REPO_DIR}/scripts/stealth.sh" /usr/local/bin/spectre-stealth
+install -m 0755 "${REPO_DIR}/scripts/lid-event.sh" /usr/local/bin/spectre-lid-event
+
+install -d -m 0755 /etc/acpi/events
+install -m 0644 "${REPO_DIR}/config/acpi/spectre-lid" /etc/acpi/events/spectre-lid
+# Debian/acpi-support lid handlers suspend. Ours is the only lid action.
+for f in /etc/acpi/events/lidbtn /etc/acpi/events/lid /etc/acpi/lid.sh; do
+  [[ -e "${f}" ]] || continue
+  mv -f "${f}" "${f}.disabled" || true
+done
+
+if [[ -f /etc/UPower/UPower.conf ]]; then
+  if grep -q '^#\?IgnoreLid=' /etc/UPower/UPower.conf; then
+    sed -i 's/^#\?IgnoreLid=.*/IgnoreLid=true/' /etc/UPower/UPower.conf
+  else
+    printf '\nIgnoreLid=true\n' >>/etc/UPower/UPower.conf
+  fi
+fi
+
+install -d -m 0755 /etc/xdg/xfce4/xfconf/xfce-perchannel-xml
+install -m 0644 "${REPO_DIR}/config/xfce4-power-manager.xml" \
+  /etc/xdg/xfce4/xfconf/xfce-perchannel-xml/xfce4-power-manager.xml
+PERSON_HOME="$(getent passwd "${PERSON_USER}" | cut -d: -f6)"
+if [[ -n "${PERSON_HOME}" ]]; then
+  install -d -m 0755 -o "${PERSON_USER}" -g "${PERSON_USER}" \
+    "${PERSON_HOME}/.config/xfce4/xfconf/xfce-perchannel-xml"
+  install -m 0644 -o "${PERSON_USER}" -g "${PERSON_USER}" \
+    "${REPO_DIR}/config/xfce4-power-manager.xml" \
+    "${PERSON_HOME}/.config/xfce4/xfconf/xfce-perchannel-xml/xfce4-power-manager.xml"
+fi
+
+install -m 0644 "${REPO_DIR}/systemd/lid-inhibit.service" /etc/systemd/system/lid-inhibit.service
+install -m 0644 "${REPO_DIR}/systemd/stealth-blank.service" /etc/systemd/system/stealth-blank.service
+systemctl daemon-reload
+systemctl enable --now acpid.service lid-inhibit.service
+systemctl enable stealth-blank.service
+systemctl restart acpid.service || true
+systemctl restart upower.service || true
 
 # Wi-Fi power save off if the 6235 is up.
 if command -v iw >/dev/null 2>&1; then
@@ -84,6 +126,18 @@ autologin-user-timeout=0
 EOF
 fi
 
+PERSON_HOME="$(getent passwd "${PERSON_USER}" | cut -d: -f6)"
+if [[ -n "${PERSON_HOME}" ]]; then
+  install -d -m 0755 -o "${PERSON_USER}" -g "${PERSON_USER}" \
+    "${PERSON_HOME}/.config/autostart"
+  install -m 0644 -o "${PERSON_USER}" -g "${PERSON_USER}" \
+    "${REPO_DIR}/desktop/stealth-session.desktop" \
+    "${PERSON_HOME}/.config/autostart/stealth-session.desktop"
+  install -m 0644 -o "${PERSON_USER}" -g "${PERSON_USER}" \
+    "${REPO_DIR}/desktop/zcode-worker.desktop" \
+    "${PERSON_HOME}/.config/autostart/zcode-worker.desktop"
+fi
+
 echo
 echo "bootstrap done."
 echo "next:"
@@ -91,4 +145,6 @@ echo "  sudo tailscale up --ssh --hostname=spectre"
 echo "  copy hardened-zai-proxy into /work/hardened-zai-proxy (no node_modules)"
 echo "  systemctl --user enable --now glm-proxy.service"
 echo "  bind cockpit: see config/cockpit.socket.d/override.conf.example"
+echo "  sudo spectre-stealth closed && close the lid"
 echo "  verify: cat /sys/firmware/efi/fw_platform_size   # must be 64"
+echo "  verify: systemctl is-active lid-inhibit.service  # active"

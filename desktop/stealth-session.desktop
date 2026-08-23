@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Spectre stealth
+Comment=Lid never sleeps; panel and LEDs off
+Exec=/bin/sh -c "xfconf-query -c xfce4-power-manager -p /xfce4-power-manager/lid-action-on-ac -n -t uint -s 0; xfconf-query -c xfce4-power-manager -p /xfce4-power-manager/lid-action-on-battery -n -t uint -s 0; xfconf-query -c xfce4-power-manager -p /xfce4-power-manager/logind-handle-lid-switch -n -t bool -s false; xfconf-query -c xfce4-power-manager -p /xfce4-power-manager/inactivity-on-ac -n -t uint -s 0; xfconf-query -c xfce4-screensaver -p /saver/enabled -n -t bool -s false; /usr/local/bin/spectre-stealth closed"
+X-GNOME-Autostart-enabled=true
+StartupNotify=false
+Terminal=false
+Hidden=false

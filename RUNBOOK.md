@@ -8,6 +8,14 @@ bottleneck only when a session compiles. Budget **one ZCode window, at most
 two sessions**. Do not build Zetile, do not run GNOME, do not run a second
 Electron app.
 
+**Window: now through Thursday 2026-08-27.** Install today. The Zenbook
+proxy stays down for that whole stretch so the Spectre owns the key pool.
+
+Lid closed is the operating position. Closing it must never suspend.
+A glance at the desk must look like a closed, charging laptop — no panel
+glow, no keyboard light, no HP-logo glow. The front-edge power LED that
+firmware will not release gets electrical tape.
+
 Main machine today: Fedora 44 Workstation (`fedora`, Tailscale
 `100.64.11.53`). Phone: Galaxy Z Fold 7 (`z-fold7`, already in the same
 tailnet). Proxy already exists as
@@ -24,16 +32,21 @@ the 24-hour window dies at 3 a.m.
    similar, even pressure on the i7-3517U + HD 4000 die.
 2. **Elevate.** 2 cm stand or rubber feet so the intake is not on fabric.
    Lid stays closed after install.
-3. **HDMI dummy plug** (~$5, 1080p EDID). Electron 41 will otherwise see
-   "no display" on lid close and stop painting; ZCode Remote Control then
-   dies even though the process is up.
-4. **Always AC.** The replaced battery is a UPS, not a power source. If
+3. **HDMI dummy plug** (~$5, 1080p EDID). Required, not optional. Electron
+   41 needs a display; stealth turns the internal panel **off**. Without
+   the dummy, ZCode dies when the lid closes. Dummy plugs emit no light.
+4. **Tape the firmware LEDs.** Spectre XT keeps a front-edge power LED
+   and often an HP lid logo lit while the machine is on. Linux cannot
+   reliably turn those off. Black electrical tape. A closed laptop on a
+   charger with only a tiny amber charge pip looks off; a white power
+   LED looks on.
+5. **Always AC.** The replaced battery is a UPS, not a power source. If
    the BIOS has a battery-health / conservation option, enable it. This
    chassis has no Linux `charge_control_end_threshold`.
-5. **USB Ethernet** if you have a dongle. Onboard Wi-Fi is Intel Centrino
+6. **USB Ethernet** if you have a dongle. Onboard Wi-Fi is Intel Centrino
    Advanced-N 6235 (802.11n). Fine for API traffic, flaky with power
-   save. Prefer wired for the Thursday window.
-6. **BIOS:** disable Bluetooth, webcam, fingerprint if present, Rapid Start,
+   save. Prefer wired for this window.
+7. **BIOS:** disable Bluetooth, webcam, fingerprint if present, Rapid Start,
    Wake-on-LAN (unless you want it). Enable VT-x. Disable Secure Boot if
    the firmware even has it. Set lid-close to "Do nothing" if the option
    exists. Confirm the firmware is **64-bit UEFI** at the setup screen —
@@ -117,10 +130,13 @@ What it does, in order:
 
 1. Installs Node 22 (NodeSource), `tailscale`, `cockpit`, `tlp`,
    `thermald`, `lm-sensors`, `intel-microcode`, `firmware-iwlwifi`,
-   `tmux`, `git`, `jq`, `curl`, `unattended-upgrades`.
-2. Drops in logind (lid/sleep ignore), sysctl, TLP AC-only profile.
-3. Enables lingering so user systemd survives logout.
-4. Masks sleep/hibernate targets.
+   `acpid`, `upower`, `tmux`, `git`, `jq`, `curl`, `unattended-upgrades`.
+   Purges `light-locker` and `xfce4-screensaver` (both will suspend on lid).
+2. Drops in logind lid-ignore, `sleep.conf.d` AllowSuspend=no, sysctl,
+   TLP quiet-AC, UPower `IgnoreLid=true`, XFCE lid-action=nothing.
+3. Enables `lid-inhibit.service` (`systemd-inhibit` forever), `acpid`
+   lid handler → `spectre-stealth closed`, lingering, autostart stealth.
+4. Masks sleep/hibernate/hybrid-sleep targets.
 5. Creates `/work/person` owned by `person`.
 
 Then, **not** in the script (needs your account):
@@ -157,20 +173,57 @@ User linger (already in bootstrap):
 sudo loginctl enable-linger person
 ```
 
-Disable lock and blanking in XFCE: Settings → Power → "When lid is closed:
-Switch off display" (not suspend). Screensaver off. This is the GUI half
-of `HandleLidSwitch=ignore`.
+Bootstrap already writes XFCE power manager to "lid = do nothing" and
+installs `~/.config/autostart/stealth-session.desktop`. Do not open
+Settings → Power afterwards and pick Suspend. Screensaver and
+light-locker are purged.
 
 ### 4.2 Unattended upgrades, no surprise reboot
 
 Leave security updates on. Turn **automatic reboot off**. A 04:00 reboot
-kills the Thursday window.
+kills the window.
 
 `/etc/apt/apt.conf.d/50unattended-upgrades` must contain:
 
 ```
 Unattended-Upgrade::Automatic-Reboot "false";
 ```
+
+### 4.3 Lid close is ignored, and the box looks off
+
+Four independent layers. Any one failing must still leave the machine
+awake. All four are installed by bootstrap.
+
+| Layer | What it does |
+|---|---|
+| `systemd/sleep.conf.d/no-sleep.conf` | `AllowSuspend=no` and friends |
+| masked `sleep.target` `suspend.target` `hibernate.target` | even `systemctl suspend` refuses |
+| logind `HandleLidSwitch=ignore` + UPower `IgnoreLid=true` + XFCE lid-action 0 | no component treats lid as sleep |
+| `lid-inhibit.service` | `systemd-inhibit --what=handle-lid-switch:sleep:idle` held forever |
+
+On lid close, acpid does **not** sleep. It runs `spectre-stealth closed`:
+
+- every `/sys/class/backlight/*/brightness` → 0
+- every `/sys/class/leds/*/brightness` → 0 (keyboard, capslock, wifi)
+- Master sink muted
+- if HDMI dummy is connected: internal `eDP`/`LVDS` `--off` (no IPS glow through the lid). Dummy stays, so Electron keeps a display
+- Linux console blanked
+
+`stealth-blank.service` and `~/.config/autostart/stealth-session.desktop`
+do the same after autologin, so the box is dark even before the first
+lid event.
+
+Power button still shuts down. That is the last on-chassis stop once
+the panel is off.
+
+**Looks-off check, 30 seconds:** dummy in, autologin done, `sudo spectre-stealth closed`, close the lid. From a metre away: no panel glow, no keyboard glow, no HP-logo glow. If a white pip remains on the front edge, that is firmware — tape it. Then from the Zenbook:
+
+```
+ping spectre
+ssh person@spectre 'curl -fsS http://127.0.0.1:18088/health'
+```
+
+If either fails after the lid click, something still slept. `journalctl -b -u systemd-logind -u acpid -u lid-inhibit` and fix that before leaving the room. Do not "see how it goes overnight".
 
 ---
 
@@ -198,8 +251,8 @@ Bind it to Tailscale, not `0.0.0.0`. The unit already sets
 ZCode **on the Spectre** (the intended path). Do not publish `:18088` to
 LAN or CGNAT.
 
-During the Thursday–Friday window, **stop the Zenbook proxy** so both
-machines do not drain the same key pool:
+From the moment the Spectre proxy is up until Thursday, **stop the
+Zenbook proxy** so both machines do not drain the same key pool:
 
 ```
 # on fedora
@@ -378,32 +431,29 @@ That TUI is SSH-only. Do not expose it.
 
 ---
 
-## 9. Thursday–Friday run protocol
+## 9. Same-day protocol (today → Thursday)
 
-Do this on Wednesday night, not Thursday morning.
+The window is already open. Debian install today, stealth+proxy today,
+lid-closed today. Do not save a dress rehearsal for Wednesday.
 
-1. Spectre on AC, dummy HDMI in, lid closed, XFCE auto-login confirmed
-   (open the lid once: ZCode window visible, proxy `curl` ok).
-2. `systemctl --user status glm-proxy worker-health.timer`
-3. Stop the Zenbook proxy so keys are not double-spent.
-4. ZCode: one workspace, one pinned model, Bot Channel connected,
-   Remote Control scanned once.
-5. `tmux new -s work` with `journalctl --user -fu glm-proxy`.
-6. Phone: Termius attaches, Telegram gets a test prompt, ntfy gets a
-   test fail (stop proxy for 10 s, watch the push, start it again).
-7. Walk away.
+1. Tape firmware LEDs, dummy HDMI in, AC, elevate. BIOS lid = do nothing.
+2. Debian 13 netinst + XFCE. Reboot. `sudo bash scripts/bootstrap.sh`.
+3. `sudo tailscale up --ssh --hostname=spectre`.
+4. Copy `hardened-zai-proxy` into `/work/hardened-zai-proxy`, enable
+   `glm-proxy.service`, pin ZCode, Bot Channel, ntfy.
+5. **Stop the Zenbook proxy now.** It stays down until Thursday.
+6. `sudo spectre-stealth closed`, close the lid. Ping + health from the
+   Fold 7. Looks-off check from a metre away.
+7. Telegram test prompt. ntfy: stop proxy 10 s, confirm push, start it.
+8. Walk away. Lid stays closed until Thursday.
 
-If package temp sits above 80 °C under idle agent load, cap the CPU
-before the window:
-
-```
-# persistent, 2.0 GHz cap on a 1.9/3.0 part
-echo 2000000 | sudo tee /sys/devices/system/cpu/intel_pstate/max_perf_freq
-```
+TLP already caps `CPU_MAX_PERF_ON_AC=55` so the fan stays off under
+agent-idle. If package temp still sits above 80 °C, drop that value,
+do not raise it.
 
 `intel-undervolt` is optional and off by default. If you undervolt,
-start at `-70 mV` on the CPU, reboot, `stress-ng -c 4 -t 120` before
-the window, not during it.
+start at `-70 mV` on the CPU, reboot, `stress-ng -c 4 -t 120` **before**
+the lid closes for the week, not after.
 
 ---
 
@@ -427,7 +477,14 @@ cat /sys/firmware/efi/fw_platform_size          # 64
 
 # sleep is dead
 systemctl status sleep.target                   # masked
-systemd-inhibit --list                          # ZCode listed once keepAwake is on
+systemctl is-active lid-inhibit.service         # active
+systemd-inhibit --list                          # spectre-worker AND ZCode
+grep IgnoreLid /etc/UPower/UPower.conf          # IgnoreLid=true
+
+# looks off (run, then close the lid, then ping from fedora)
+sudo spectre-stealth closed
+# from fedora, after lid close:
+#   ping spectre && ssh person@spectre 'curl -fsS http://127.0.0.1:18088/health'
 
 # proxy
 curl -fsS http://127.0.0.1:18088/health | jq -e '.status=="ok" and .activeKeys>0'

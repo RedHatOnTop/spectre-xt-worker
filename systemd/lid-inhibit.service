@@ -1,0 +1,13 @@
+[Unit]
+Description=Block lid-switch, suspend, idle, and sleep keys
+Documentation=file:///home/person/Projects/distribution-project/remote-agent/RUNBOOK.md
+After=multi-user.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/systemd-inhibit --what=handle-lid-switch:sleep:idle:handle-suspend-key:handle-hibernate-key --who=spectre-worker --why="lid-closed agent worker" --mode=block /bin/sleep infinity
+Restart=always
+RestartSec=2s
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,12 @@
+[Unit]
+Description=Blank internal panel and kill LEDs after GUI login
+After=display-manager.service
+Wants=display-manager.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/spectre-stealth closed
+
+[Install]
+WantedBy=graphical.target

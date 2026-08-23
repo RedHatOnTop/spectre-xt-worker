@@ -1,8 +1,9 @@
 # Spectre XT agent worker
 
-Turn the idle HP Spectre XT into a lid-closed, AC-powered ZCode worker that
-hammers free/rotating endpoints through `hardened-zai-proxy`, steered from
-a phone (Z Fold 7) over Tailscale.
+Turn the idle HP Spectre XT into a lid-closed, looks-off ZCode worker that
+runs **from today through Thursday**, steered from a phone (Z Fold 7) over
+Tailscale. Closing the lid must never sleep it; a glance at the desk must
+not show a running machine.
 
 **Read [RUNBOOK.md](RUNBOOK.md).** That is the install and ops document.
 
