@@ -7,8 +7,10 @@ Lid-closed Debian appliance for the idle **HP Spectre XT TouchSmart**
 
 ## One-click
 
-**1. Debian 13 netinst** — install onto the **256 GB disk only**, SSH
-server on, no desktop:
+**1. Debian 13 netinst** — at Partition disks pick **Guided - use entire
+disk**, then the **256 GB / ~238 GiB** disk, scheme **all files in one
+partition**. Leave the 120 GB unused. SSH on, no desktop. Charge cap
+is 60% if the EC exposes a threshold (2012 HP often does not).
 
 https://cdimage.debian.org/debian-cd/current/amd64/iso-cd/debian-13.6.0-amd64-netinst.iso
 

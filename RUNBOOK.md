@@ -39,9 +39,13 @@ the 24-hour window dies at 3 a.m.
    the dummy, ZCode dies when the lid closes. Dummy plugs emit no light.
 4. **LEDs.** The lid HP logo stays dark on this chassis. Remaining
    power/charge pips are firmware — leave them.
-5. **Always AC.** The replaced battery is a UPS, not a power source. If
-   the BIOS has a battery-health / conservation option, enable it. This
-   chassis has no Linux `charge_control_end_threshold`.
+5. **Always AC, charge cap 60%.** The replaced battery is a UPS. The
+   one-click writes 50/60 into TLP and into
+   `charge_control_end_threshold` if the kernel exposes it. 2012 HP EC
+   often has no such node — then it sits at 100% on AC. If BIOS has
+   Battery Health Manager / Conservation, turn that on too. After
+   bootstrap: `cat /sys/class/power_supply/BAT*/charge_control_end_threshold`
+   — `60` means it took; no such file means firmware will not cap.
 6. **USB Ethernet** if you have a dongle. Onboard Wi-Fi is Intel Centrino
    Advanced-N 6235 (802.11n). Fine for API traffic, flaky with power
    save. Prefer wired for this window.
@@ -97,31 +101,53 @@ After first boot, do **not** enable GNOME later. If XFCE feels wrong,
 
 ---
 
-## 3. Disk layout
+## 3. Disk layout — what you click in the installer
 
-Two SSDs, identified by size, never by `sda`/`sdb` (those swap).
+Two SSDs. Identify them by **size**, never by `sda`/`sdb`.
 
-**Debian installer: use only the 256 GB disk.** Guided — entire disk, LVM
-off, ext4, write the bootloader there. Leave the 120 GB disk unused.
-If the installer lists both, the ~238 GiB one is OS; the ~112 GiB one
-is work. Pick the large one. If only one disk appears, the 120 GB is
-mSATA still disabled in BIOS.
+| What the installer shows | This is |
+|---|---|
+| ~238 GiB / 256 GB | OS. Install Debian here. |
+| ~112 GiB / 120 GB | Leave unused. The one-click script takes it. |
 
-`scripts/setup-disks.sh` (run by the one-click) then:
+If only one disk appears, the 120 GB mSATA is still off in BIOS.
+
+### Installer screens (Debian 13 netinst)
+
+1. Reach **Partition disks**.
+2. Choose **Guided - use entire disk**.
+   Not LVM. Not encrypted. Not "manual" unless you know you need it.
+3. **Select disk to partition** — the **256 GB** one only.
+   The 120 GB line stays untouched.
+4. Scheme: **All files in one partition (recommended)**.
+   That is ESP + `/`. No separate `/home`. Warp needs
+   `/home/person/Projects/...` on this disk, same path as the Zenbook.
+5. **Finish partitioning and write changes to disk** → **Yes**.
+   This wipes the 256 GB disk. It must not mention writing to the 120 GB
+   disk. If it does, go back.
+
+After first boot the one-click `setup-disks.sh`:
 
 - refuses to touch the disk that holds `/`
 - finds the other disk in the 90–140 GB window
-- if it is empty: GPT, 8 GB swap, rest ext4 labelled `SPECTREWORK` → `/work`
-- if it already says `SPECTREWORK`: just mount
-- if it already has some other filesystem: stop and print `lsblk`. It
-  will not wipe a disk that looks used.
+- empty → GPT, 8 GB swap, rest ext4 labelled `SPECTREWORK` mounted at `/work`
+- already `SPECTREWORK` → just mount
+- some other filesystem → stop and print `lsblk`, no wipe
 
-Projects stay at the same absolute path as on the Zenbook,
-`/home/person/Projects/...`, so Warp does not rewrite ZCode session
-paths. `/work` is swap, `npm-cache`, proxy logs, bulky clones. `/` stays
-replaceable.
-
+`/work` is swap, npm-cache, proxy logs, bulky clones. Projects stay on `/`.
 ext4, not btrfs.
+
+### If you already chose Manual
+
+On the 256 GB disk only:
+
+```
+512 MB  ESP   fat32  /boot/efi  bootable
+rest    ext4  /
+```
+
+120 GB: leave as free space. Do not create `/home` or swap there in the
+installer.
 
 ---
 
@@ -521,6 +547,9 @@ systemctl status sleep.target                   # masked
 systemctl is-active lid-inhibit.service         # active
 systemd-inhibit --list                          # spectre-worker AND ZCode
 grep IgnoreLid /etc/UPower/UPower.conf          # IgnoreLid=true
+
+# charge cap — 60 if the EC allows it, missing file if not
+cat /sys/class/power_supply/BAT*/charge_control_end_threshold 2>/dev/null || echo 'no threshold sysfs'
 
 # looks off (run, then close the lid, then ping from fedora)
 sudo spectre-stealth closed

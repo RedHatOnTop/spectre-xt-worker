@@ -118,11 +118,18 @@ fi
 
 install -m 0644 "${REPO_DIR}/systemd/lid-inhibit.service" /etc/systemd/system/lid-inhibit.service
 install -m 0644 "${REPO_DIR}/systemd/stealth-blank.service" /etc/systemd/system/stealth-blank.service
+install -m 0755 "${REPO_DIR}/scripts/charge-limit.sh" /usr/local/bin/spectre-charge-limit
+install -m 0644 "${REPO_DIR}/systemd/charge-limit.service" /etc/systemd/system/charge-limit.service
+install -d -m 0755 /etc/udev/rules.d
+install -m 0644 "${REPO_DIR}/config/99-charge-limit.rules" /etc/udev/rules.d/99-charge-limit.rules
 systemctl daemon-reload
 systemctl enable --now acpid.service lid-inhibit.service
 systemctl enable stealth-blank.service
+systemctl enable --now charge-limit.service || true
 systemctl restart acpid.service || true
 systemctl restart upower.service || true
+udevadm control --reload || true
+/usr/local/bin/spectre-charge-limit || true
 
 # Wi-Fi power save off if the 6235 is up.
 if command -v iw >/dev/null 2>&1; then
@@ -166,3 +173,4 @@ echo "  systemctl --user enable --now glm-proxy.service"
 echo "  sudo spectre-stealth closed && close the lid"
 echo "  warp to fedora / warp from fedora   (same path as on the Zenbook)"
 echo "  verify: systemctl is-active lid-inhibit.service"
+echo "  verify: cat /sys/class/power_supply/BAT*/charge_control_end_threshold   # 60 or no such file"
