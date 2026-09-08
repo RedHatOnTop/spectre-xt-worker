@@ -382,7 +382,9 @@ and DarwinInspection/XNU are not. `mc-atelier` on this disk is a broken
 git worktree (`.../minecraft-server-project/.git/worktrees/mc-atelier`
 missing) — do not launch into it until that pointer is repaired.
 
-Registered Orca repos: `minecraft-server-project`, `orca-rust`. Launch
+Registered Orca repos: `minecraft-server-project`, `orca-rust`,
+`/work/korea-metro-twin` (Daegu Metro L1/L2 **research corpus only**).
+Launch
 from the Spectre runtime:
 
 ```

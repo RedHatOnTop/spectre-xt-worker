@@ -28,10 +28,15 @@ GOALS = {
         "capture, self-check, then immediately start the next. Never stop at a "
         "summary. Stay on Efficient. --turns 9999"
     ),
-    "/home/person/Projects/orca-rust": (
-        "/goal Execute docs/PORT-PLAN.md to completion, currently Stage 2 AT-SPI, "
-        "then every later stage. cargo -j1 only. After each stage, start the next "
-        "immediately. Never stop at a summary. Stay on Efficient. --turns 9999"
+    "/work/korea-metro-twin": (
+        "/goal Research-only corpus for Daegu Metro Line 1 and Line 2. "
+        "Read AGENTS.md. Fill catalog/ for every station, tunnel segment, and "
+        "train class using public GIS, operator docs, CC/Wikimedia, YouTube "
+        "(yt-dlp with rate limits). Do not bulk-scrape Google/Kakao/Naver "
+        "로드뷰 tiles. Log grey sources in catalog/blocked.jsonl instead of "
+        "downloading. Vision-describe stills. No 3D, no Minecraft, no twin "
+        "implementation. After each catalog row, immediately fill the next gap. "
+        "Never stop at a summary. Stay on Efficient. --turns 9999"
     ),
 }
 
