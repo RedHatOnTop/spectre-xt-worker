@@ -16,10 +16,17 @@ LOG = Path("/work/logs/qoder-nudge.log")
 
 GOALS = {
     "/home/person/Projects/minecraft-server-project": (
-        "/goal Keep shipping the next feat/flagship-lobby visual slice forever. "
-        "After each committed slice, immediately start the next (b37 dome, lantern, "
-        "portico, then whatever AGENTS.md/HANDOFF points at). Never stop at a summary. "
-        "Stay on Efficient. Do not wait for the user. --turns 9999"
+        "/goal Completely rebuild 태초마을 (Taecho Village), not the lobby. "
+        "Authoritative docs: TAECHO_VILLAGE.md, SERVER_GAME_REWORK_PLAN.md §1, "
+        "AGENTS.md vision loop (build→deploy→dusk capture→judge ONLY from the image; "
+        "never claim it looks good from memory), existing taecho_*.py / taecho5 if present. "
+        "Joseon coastal 읍성: harbor→town→civic terraces on axis x=150, seed "
+        "-5411652232113409693, center (150,390). Do not flatten the whole site; "
+        "keep 4 terraces and natural grade. Giwa 1:2 stair+slab, single-tone field, "
+        "no empty 12x12 lots, no black-slab roofs, no lobby/flagship palace work. "
+        "Use fill_deploy /fill boxes, not per-block setblock. After each slice, "
+        "capture, self-check, then immediately start the next. Never stop at a "
+        "summary. Stay on Efficient. --turns 9999"
     ),
     "/home/person/Projects/orca-rust": (
         "/goal Execute docs/PORT-PLAN.md to completion, currently Stage 2 AT-SPI, "
