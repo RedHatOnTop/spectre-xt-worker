@@ -28,6 +28,12 @@ else
   echo "zcode    not running"
 fi
 
+if pgrep -x qodercli >/dev/null 2>&1; then
+  echo "qoder    $(pgrep -c -x qodercli) qodercli"
+else
+  echo "qoder    not running"
+fi
+
 if [[ -e /sys/class/power_supply/BAT0/capacity ]]; then
   cap="$(cat /sys/class/power_supply/BAT0/capacity)"
   end="$(cat /sys/class/power_supply/BAT0/charge_control_end_threshold 2>/dev/null || echo none)"

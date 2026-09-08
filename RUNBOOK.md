@@ -364,6 +364,38 @@ From ZCode's own Remote Control docs:
 That is why Telegram Bot Channel + Tailscale SSH exist. Remote Control
 alone is not "perfect control".
 
+### 6.2 Orca + Qoder Efficient (0.0x)
+
+Orca ADE headless (`orca-serve.service`, `:6768`) is the phone control
+plane. Qoder CLI 1.1.47 is signed in as `RedHatOnTop`. While Qoder's
+Efficient promo is live, the billing multiplier is **0.0x** — pin it.
+
+```
+install -m 0755 scripts/qoder-efficient.sh ~/.local/bin/qoder-efficient
+# settings.json "model": "efficient"  (already set on spectre)
+# non-login SSH has no ~/.local/bin on PATH
+~/.local/bin/qoder-efficient -p 'Reply with EFFICIENT_OK' --max-turns 1 --permission-mode dont_ask
+```
+
+Hard cap: **two `qodercli` processes**. Agent I/O is fine; `cargo build`
+and DarwinInspection/XNU are not. `mc-atelier` on this disk is a broken
+git worktree (`.../minecraft-server-project/.git/worktrees/mc-atelier`
+missing) — do not launch into it until that pointer is repaired.
+
+Registered Orca repos: `minecraft-server-project`, `orca-rust`. Launch
+from the Spectre runtime:
+
+```
+orca-ide terminal create \
+  --worktree path:/home/person/Projects/minecraft-server-project \
+  --title "qoder-efficient mc" \
+  --command "qoder-efficient --yolo -i 'Stay on Efficient. Summarize next slice. Do not compile.'"
+```
+
+Phone: Fold 7 Tailscale on, Orca companion already paired, open the
+worktree and type the next instruction. Status bar must read
+`Efficient Model`.
+
 ---
 
 ## 7. Mobile control (Fold 7) — what is actually reliable
@@ -562,6 +594,11 @@ pgrep -a zcode | head
 # setting.json
 jq '.keepAwakeWhileRunning, .desktopChromiumHardwareAccelerationEnabled' ~/.zcode/v2/setting.json
 # expect: true, false
+
+# qoder efficient (optional; skip if Qoder is not on this box)
+test -x ~/.local/bin/qoder-efficient && ~/.local/bin/qoder-efficient -p 'Reply with EFFICIENT_OK' --max-turns 1 --permission-mode dont_ask
+pgrep -a qodercli | head
+# at most two qodercli PIDs on this chassis
 
 # tailscale
 tailscale status | grep -E 'spectre|z-fold7|fedora'
