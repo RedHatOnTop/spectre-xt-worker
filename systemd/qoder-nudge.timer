@@ -1,0 +1,12 @@
+[Unit]
+Description=Nudge idle Qoder Efficient sessions every 3 minutes
+
+[Timer]
+OnBootSec=90s
+OnUnitActiveSec=3min
+AccuracySec=15s
+Persistent=true
+Unit=qoder-nudge.service
+
+[Install]
+WantedBy=timers.target

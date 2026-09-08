@@ -396,6 +396,17 @@ Phone: Fold 7 Tailscale on, Orca companion already paired, open the
 worktree and type the next instruction. Status bar must read
 `Efficient Model`.
 
+Keep-alive: `qoder-nudge.timer` (every 3 min) sends `/goal … --turns 9999`
+into any idle Efficient TUI. Skip a pane that is Thinking or running a
+tool. Install:
+
+```
+install -m 0755 scripts/qoder-nudge.sh ~/.local/bin/qoder-nudge
+cp systemd/qoder-nudge.service systemd/qoder-nudge.timer ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now qoder-nudge.timer
+```
+
 ---
 
 ## 7. Mobile control (Fold 7) — what is actually reliable

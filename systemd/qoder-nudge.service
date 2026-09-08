@@ -1,0 +1,7 @@
+[Unit]
+Description=Nudge idle Qoder Efficient sessions onto /goal
+After=orca-serve.service
+
+[Service]
+Type=oneshot
+ExecStart=/home/person/.local/bin/qoder-nudge
