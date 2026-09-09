@@ -399,8 +399,11 @@ worktree and type the next instruction. Status bar must read
 `Efficient Model`.
 
 Keep-alive: `qoder-nudge.timer` (every 3 min) sends `/goal … --turns 9999`
-into any idle Efficient TUI. Skip a pane that is Thinking or running a
-tool. Install:
+into any Efficient TUI that is not live-busy (`Generating…` / `goal on N`).
+A self-declared `UpdateGoal complete` is **not** a stop — leftover
+`Bash(` in the scrollback is not busy either. The nudge voids that
+verdict, demands a self-critique from disk evidence, and starts the
+next slice. That is the agentic loop. Install:
 
 ```
 install -m 0755 scripts/qoder-nudge.sh ~/.local/bin/qoder-nudge

@@ -1,15 +1,18 @@
 #!/usr/bin/env python3
-"""Nudge idle Spectre Qoder TUI sessions back onto an open-ended /goal.
+"""Nudge Spectre Qoder TUIs back onto an open-ended /goal.
 
-Skip a pane that is already Thinking or running a tool. Idle composer
-gets /goal ... --turns 9999 so Efficient keeps shipping the next slice.
+A self-declared complete is not a stop. History still showing Bash( is
+not busy. Only a live Generating / goal-on footer is busy. Ready panes
+get a critique-and-continue /goal --turns 9999.
 """
 from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 ORCA = "/usr/bin/orca-ide"
@@ -17,9 +20,20 @@ LOG = Path("/work/logs/qoder-nudge.log")
 _STATE = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "remote-agent"
 SENTINEL = _STATE / "qoder-efficient-billed"
 
-GOALS = {
+LOOP = (
+    "You are not allowed to mark this goal complete. UpdateGoal status "
+    "complete, /goal complete, and stopping at a summary are failures. "
+    "This is an open-ended agentic loop. If you just declared complete, "
+    "that verdict is void: self-critique from evidence on disk only "
+    "(captures, catalog rows, git diff — never from memory or the "
+    "summary you just wrote), list the top gaps, then immediately ship "
+    "the next slice. After every slice, verify, then continue. Never "
+    "stop. Stay on Efficient. "
+)
+
+MISSIONS = {
     "/home/person/Projects/minecraft-server-project": (
-        "/goal Completely rebuild 태초마을 (Taecho Village), not the lobby. "
+        "Completely rebuild 태초마을 (Taecho Village), not the lobby. "
         "Authoritative docs: TAECHO_VILLAGE.md, SERVER_GAME_REWORK_PLAN.md §1, "
         "AGENTS.md vision loop (build→deploy→dusk capture→judge ONLY from the image; "
         "never claim it looks good from memory), existing taecho_*.py / taecho5 if present. "
@@ -28,22 +42,52 @@ GOALS = {
         "keep 4 terraces and natural grade. Giwa 1:2 stair+slab, single-tone field, "
         "no empty 12x12 lots, no black-slab roofs, no lobby/flagship palace work. "
         "Use fill_deploy /fill boxes, not per-block setblock. After each slice, "
-        "capture, self-check, then immediately start the next. Never stop at a "
-        "summary. Stay on Efficient. --turns 9999"
+        "capture, self-check, then immediately start the next."
     ),
     "/work/korea-metro-twin": (
-        "/goal Research-only corpus for Daegu Metro Line 1 and Line 2. "
+        "Research-only corpus for Daegu Metro Line 1 and Line 2. "
         "Read AGENTS.md. Fill catalog/ for every station, tunnel segment, and "
         "train class using public GIS, operator docs, CC/Wikimedia, YouTube "
         "(yt-dlp with rate limits). Do not bulk-scrape Google/Kakao/Naver "
         "로드뷰 tiles. Log grey sources in catalog/blocked.jsonl instead of "
         "downloading. Vision-describe stills. No 3D, no Minecraft, no twin "
         "implementation. After each catalog row, immediately fill the next gap. "
-        "Never stop at a summary. Stay on Efficient. --turns 9999"
+        "Never stop at a summary."
     ),
 }
 
-BUSY = ("Thinking", "Bash(", "Read(", "Write(", "Edit(", "Glob(", "Grep(")
+COMPLETE_RE = re.compile(
+    r'UpdateGoal[\s\S]{0,120}complete|"status"\s*:\s*"complete"',
+    re.IGNORECASE,
+)
+LIVE_GENERATING_RE = re.compile(r"Generating\.\.\.|esc to cancel")
+LIVE_GOAL_ON_RE = re.compile(r"goal on \d+")
+FOOTER_LINES = 20
+
+
+def goal_text(path: str) -> str:
+    mission = MISSIONS[path]
+    return f"/goal {LOOP}Standing mission: {mission} --turns 9999"
+
+
+def _footer(text: str) -> str:
+    lines = text.splitlines()
+    return "\n".join(lines[-FOOTER_LINES:])
+
+
+def classify(text: str) -> str:
+    footer = _footer(text)
+    if LIVE_GENERATING_RE.search(footer) or LIVE_GOAL_ON_RE.search(footer):
+        return "busy"
+    if "Efficient Model" not in text and "Type your message" not in text:
+        return "splash"
+    if COMPLETE_RE.search(text):
+        return "complete"
+    return "idle"
+
+
+def should_nudge(text: str) -> bool:
+    return classify(text) in ("idle", "complete")
 
 
 def run(args: list[str]) -> dict:
@@ -59,13 +103,24 @@ def screen_text(handle: str) -> str:
     return str(tail)
 
 
-def idle(text: str) -> bool:
-    if any(marker in text for marker in BUSY):
-        return False
-    return "Type your message" in text
+def clear_composer(handle: str) -> None:
+    run([ORCA, "terminal", "send", "--terminal", handle, "--interrupt", "--json"])
+    run(
+        [
+            ORCA,
+            "terminal",
+            "send",
+            "--terminal",
+            handle,
+            "--text",
+            "\x15",
+            "--json",
+        ]
+    )
 
 
 def send_goal(handle: str, text: str) -> None:
+    clear_composer(handle)
     run(
         [
             ORCA,
@@ -75,10 +130,13 @@ def send_goal(handle: str, text: str) -> None:
             handle,
             "--text",
             text,
-            "--enter",
             "--json",
         ]
     )
+    # Long /goal pastes land in the composer; --enter on the same
+    # send is dropped. Submit after the TUI accepts the text.
+    time.sleep(0.4)
+    run([ORCA, "terminal", "send", "--terminal", handle, "--enter", "--json"])
 
 
 def log(msg: str) -> None:
@@ -88,7 +146,9 @@ def log(msg: str) -> None:
     print(msg)
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
+    args = argv if argv is not None else sys.argv[1:]
+    dry_run = "--dry-run" in args
     if SENTINEL.exists():
         log("skip billed-sentinel")
         return 0
@@ -98,16 +158,20 @@ def main() -> int:
     for term in terminals:
         path = term.get("worktreePath") or ""
         handle = term.get("handle")
-        goal = GOALS.get(path)
-        if not handle or not goal:
+        if not handle or path not in MISSIONS:
             continue
         text = screen_text(handle)
-        if not idle(text):
-            log(f"busy {path}")
+        state = classify(text)
+        if not should_nudge(text):
+            log(f"{state} {path}")
             continue
-        send_goal(handle, goal)
+        if dry_run:
+            log(f"dry-run {state} {path} {handle}")
+            nudged += 1
+            continue
+        send_goal(handle, goal_text(path))
         nudged += 1
-        log(f"nudged {path} {handle}")
+        log(f"nudged {state} {path} {handle}")
     if nudged == 0:
         log("idle-check none")
     return 0
