@@ -1,0 +1,9 @@
+[Unit]
+Description=Stop Qoder if Efficient is no longer 0x
+After=orca-serve.service
+
+[Service]
+Type=oneshot
+ExecStart=/home/person/.local/bin/qoder-efficient-guard check
+EnvironmentFile=-%h/.config/remote-agent/health.env
+LimitCORE=0

@@ -364,6 +364,88 @@ From ZCode's own Remote Control docs:
 That is why Telegram Bot Channel + Tailscale SSH exist. Remote Control
 alone is not "perfect control".
 
+### 6.2 Orca + Qoder Efficient (0.0x)
+
+Orca ADE headless (`orca-serve.service`, `:6768`) is the phone control
+plane. Qoder CLI 1.1.47 is signed in as `RedHatOnTop`. While Qoder's
+Efficient promo is live, the billing multiplier is **0.0x** — pin it.
+
+```
+install -m 0755 scripts/qoder-efficient.sh ~/.local/bin/qoder-efficient
+# settings.json "model": "efficient"  (already set on spectre)
+# non-login SSH has no ~/.local/bin on PATH
+~/.local/bin/qoder-efficient -p 'Reply with EFFICIENT_OK' --max-turns 1 --permission-mode dont_ask
+```
+
+Hard cap: **two `qodercli` processes**. Agent I/O is fine; `cargo build`
+and DarwinInspection/XNU are not. `mc-atelier` on this disk is a broken
+git worktree (`.../minecraft-server-project/.git/worktrees/mc-atelier`
+missing) — do not launch into it until that pointer is repaired.
+
+Registered Orca repos: `minecraft-server-project`, `orca-rust`,
+`/work/korea-metro-twin` (Daegu Metro L1/L2 **research corpus only**).
+Launch
+from the Spectre runtime:
+
+```
+orca-ide terminal create \
+  --worktree path:/home/person/Projects/minecraft-server-project \
+  --title "qoder-efficient mc" \
+  --command "qoder-efficient --yolo -i 'Stay on Efficient. Summarize next slice. Do not compile.'"
+```
+
+Phone: Fold 7 Tailscale on, Orca companion already paired, open the
+worktree and type the next instruction. Status bar must read
+`Efficient Model`.
+
+Keep-alive: `qoder-nudge.timer` (every 3 min) sends `/goal … --turns 9999`
+into any Efficient TUI that is not live-busy (`Generating…` / `goal on N`).
+A self-declared `UpdateGoal complete` is **not** a stop — leftover
+`Bash(` in the scrollback is not busy either. The nudge voids that
+verdict, demands a self-critique from disk evidence, and starts the
+next slice. That is the agentic loop. Install:
+
+```
+install -m 0755 scripts/qoder-nudge.sh ~/.local/bin/qoder-nudge
+cp systemd/qoder-nudge.service systemd/qoder-nudge.timer ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now qoder-nudge.timer
+```
+
+Kill-switch: if Efficient's live `price_factor` leaves **0.0**, stop
+every in-flight Qoder session so the box cannot burn credits. The
+on-disk catalog (`~/.qoder/.models/*/catalog-v6`) is encrypted; the
+guard reads the plaintext object out of `qodercli` RSS (`key=efficient`)
+and does **not** send a chat turn. Confirmed billed (`price_factor > 0` on two consecutive 60s ticks,
+after a fresh `--list-models` confirm if a fleet is already up)
+pauses `/goal`, disables `qoder-nudge.timer`, SIGTERM/KILLs `qodercli`,
+writes `~/.local/state/remote-agent/qoder-efficient-billed`, and ntfy.
+A billed trip does **not** spawn `qodercli` again; `check` skips
+catalog probes while the sentinel exists. The 60s timer fail-opens on
+an unreadable or mixed (stale 0.0 plus live 0.3 in RSS) catalog so a
+heap leftover cannot kill a live 0x fleet. `qoder-efficient` fail-closes
+on start (missing guard, unknown, mixed, or billed → exit 75). Qoder `PreToolUse` / `UserPromptSubmit` / `SessionStart` hooks
+deny once the sentinel exists. Sentinel stays until an explicit clear —
+promo returning does not auto-resume.
+
+```
+install -m 0755 scripts/qoder-efficient-guard.py ~/.local/bin/qoder-efficient-guard
+install -m 0755 scripts/qoder-efficient.sh ~/.local/bin/qoder-efficient
+install -m 0755 scripts/qoder-nudge.sh ~/.local/bin/qoder-nudge
+cp systemd/qoder-efficient-guard.service systemd/qoder-efficient-guard.timer \
+  ~/.config/systemd/user/
+~/.local/bin/qoder-efficient-guard install-hooks
+systemctl --user daemon-reload
+systemctl --user enable --now qoder-efficient-guard.timer
+~/.local/bin/qoder-efficient-guard probe
+# expect: "status": "free", "price_factor": 0.0
+test ! -e ~/.local/state/remote-agent/qoder-efficient-billed
+```
+
+Manual stop: `qoder-efficient-guard stop`. Resume after a billed trip:
+`qoder-efficient-guard clear` (removes the sentinel and re-enables the
+nudge timer). Do not run `stop` just to test — it kills the fleet.
+
 ---
 
 ## 7. Mobile control (Fold 7) — what is actually reliable
@@ -562,6 +644,14 @@ pgrep -a zcode | head
 # setting.json
 jq '.keepAwakeWhileRunning, .desktopChromiumHardwareAccelerationEnabled' ~/.zcode/v2/setting.json
 # expect: true, false
+
+# qoder efficient (optional; skip if Qoder is not on this box)
+test -x ~/.local/bin/qoder-efficient-guard && ~/.local/bin/qoder-efficient-guard probe
+# expect status=free and price_factor=0.0 while the promo holds
+test ! -e ~/.local/state/remote-agent/qoder-efficient-billed
+systemctl --user is-active qoder-efficient-guard.timer
+pgrep -a qodercli | head
+# at most two qodercli PIDs on this chassis (paused rust may be a third)
 
 # tailscale
 tailscale status | grep -E 'spectre|z-fold7|fedora'

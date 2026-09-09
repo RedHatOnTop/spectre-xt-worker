@@ -28,6 +28,18 @@ else
   echo "zcode    not running"
 fi
 
+if pgrep -x qodercli >/dev/null 2>&1; then
+  echo "qoder    $(pgrep -c -x qodercli) qodercli"
+else
+  echo "qoder    not running"
+fi
+if [[ -f "${HOME}/.local/state/remote-agent/qoder-efficient-billed" ]]; then
+  echo "efficient STOPPED billed-sentinel"
+elif [[ -f "${HOME}/.local/state/remote-agent/qoder-efficient-rate.json" ]]; then
+  jq -r '"efficient \(.status) price_factor=\(.price_factor // "unknown")"' \
+    "${HOME}/.local/state/remote-agent/qoder-efficient-rate.json" 2>/dev/null || true
+fi
+
 if [[ -e /sys/class/power_supply/BAT0/capacity ]]; then
   cap="$(cat /sys/class/power_supply/BAT0/capacity)"
   end="$(cat /sys/class/power_supply/BAT0/charge_control_end_threshold 2>/dev/null || echo none)"
