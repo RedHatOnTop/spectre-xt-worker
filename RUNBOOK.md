@@ -409,6 +409,40 @@ systemctl --user daemon-reload
 systemctl --user enable --now qoder-nudge.timer
 ```
 
+Kill-switch: if Efficient's live `price_factor` leaves **0.0**, stop
+every in-flight Qoder session so the box cannot burn credits. The
+on-disk catalog (`~/.qoder/.models/*/catalog-v6`) is encrypted; the
+guard reads the plaintext object out of `qodercli` RSS (`key=efficient`)
+and does **not** send a chat turn. Confirmed billed (`price_factor > 0` on two consecutive 60s ticks,
+after a fresh `--list-models` confirm if a fleet is already up)
+pauses `/goal`, disables `qoder-nudge.timer`, SIGTERM/KILLs `qodercli`,
+writes `~/.local/state/remote-agent/qoder-efficient-billed`, and ntfy.
+A billed trip does **not** spawn `qodercli` again; `check` skips
+catalog probes while the sentinel exists. The 60s timer fail-opens on
+an unreadable or mixed (stale 0.0 plus live 0.3 in RSS) catalog so a
+heap leftover cannot kill a live 0x fleet. `qoder-efficient` fail-closes
+on start (missing guard, unknown, mixed, or billed → exit 75). Qoder `PreToolUse` / `UserPromptSubmit` / `SessionStart` hooks
+deny once the sentinel exists. Sentinel stays until an explicit clear —
+promo returning does not auto-resume.
+
+```
+install -m 0755 scripts/qoder-efficient-guard.py ~/.local/bin/qoder-efficient-guard
+install -m 0755 scripts/qoder-efficient.sh ~/.local/bin/qoder-efficient
+install -m 0755 scripts/qoder-nudge.sh ~/.local/bin/qoder-nudge
+cp systemd/qoder-efficient-guard.service systemd/qoder-efficient-guard.timer \
+  ~/.config/systemd/user/
+~/.local/bin/qoder-efficient-guard install-hooks
+systemctl --user daemon-reload
+systemctl --user enable --now qoder-efficient-guard.timer
+~/.local/bin/qoder-efficient-guard probe
+# expect: "status": "free", "price_factor": 0.0
+test ! -e ~/.local/state/remote-agent/qoder-efficient-billed
+```
+
+Manual stop: `qoder-efficient-guard stop`. Resume after a billed trip:
+`qoder-efficient-guard clear` (removes the sentinel and re-enables the
+nudge timer). Do not run `stop` just to test — it kills the fleet.
+
 ---
 
 ## 7. Mobile control (Fold 7) — what is actually reliable
@@ -609,9 +643,12 @@ jq '.keepAwakeWhileRunning, .desktopChromiumHardwareAccelerationEnabled' ~/.zcod
 # expect: true, false
 
 # qoder efficient (optional; skip if Qoder is not on this box)
-test -x ~/.local/bin/qoder-efficient && ~/.local/bin/qoder-efficient -p 'Reply with EFFICIENT_OK' --max-turns 1 --permission-mode dont_ask
+test -x ~/.local/bin/qoder-efficient-guard && ~/.local/bin/qoder-efficient-guard probe
+# expect status=free and price_factor=0.0 while the promo holds
+test ! -e ~/.local/state/remote-agent/qoder-efficient-billed
+systemctl --user is-active qoder-efficient-guard.timer
 pgrep -a qodercli | head
-# at most two qodercli PIDs on this chassis
+# at most two qodercli PIDs on this chassis (paused rust may be a third)
 
 # tailscale
 tailscale status | grep -E 'spectre|z-fold7|fedora'

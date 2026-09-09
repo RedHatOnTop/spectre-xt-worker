@@ -7,12 +7,15 @@ gets /goal ... --turns 9999 so Efficient keeps shipping the next slice.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
 
 ORCA = "/usr/bin/orca-ide"
 LOG = Path("/work/logs/qoder-nudge.log")
+_STATE = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "remote-agent"
+SENTINEL = _STATE / "qoder-efficient-billed"
 
 GOALS = {
     "/home/person/Projects/minecraft-server-project": (
@@ -86,6 +89,9 @@ def log(msg: str) -> None:
 
 
 def main() -> int:
+    if SENTINEL.exists():
+        log("skip billed-sentinel")
+        return 0
     listing = run([ORCA, "terminal", "list", "--json"])
     terminals = listing.get("result", {}).get("terminals") or []
     nudged = 0

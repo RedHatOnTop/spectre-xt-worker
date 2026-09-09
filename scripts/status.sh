@@ -33,6 +33,12 @@ if pgrep -x qodercli >/dev/null 2>&1; then
 else
   echo "qoder    not running"
 fi
+if [[ -f "${HOME}/.local/state/remote-agent/qoder-efficient-billed" ]]; then
+  echo "efficient STOPPED billed-sentinel"
+elif [[ -f "${HOME}/.local/state/remote-agent/qoder-efficient-rate.json" ]]; then
+  jq -r '"efficient \(.status) price_factor=\(.price_factor // "unknown")"' \
+    "${HOME}/.local/state/remote-agent/qoder-efficient-rate.json" 2>/dev/null || true
+fi
 
 if [[ -e /sys/class/power_supply/BAT0/capacity ]]; then
   cap="$(cat /sys/class/power_supply/BAT0/capacity)"
