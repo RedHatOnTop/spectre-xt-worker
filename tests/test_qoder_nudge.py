@@ -107,6 +107,8 @@ class GoalTextTests(unittest.TestCase):
         self.assertIn("not allowed to mark this goal complete", text.lower())
         self.assertIn("self-critique", text.lower())
         self.assertIn("태초마을", text)
+        self.assertIn("ZERO-DEFECT", text)
+        self.assertIn("Do not flatten", text)
         self.assertNotIn("UpdateGoal complete", text)
 
     def test_metro_mission_stays_in_loop_text(self):
