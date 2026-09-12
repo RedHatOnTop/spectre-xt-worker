@@ -158,6 +158,14 @@ if [[ -f "${slack_env}" ]]; then
     bad "~/.local/bin/qoder-efficient missing — executor runs will fail"
   fi
   check_cmd "executor settings installed (slack-executor-settings.json)" "test -f /usr/local/share/remote-agent/slack-executor-settings.json"
+  # Cost gate: the wrapper refuses (exit 75) when Efficient is not free; its
+  # snapshot records what the runner last saw.
+  rate_json="${TARGET_HOME}/.local/state/remote-agent/qoder-efficient-rate.json"
+  if RUN_AS_USER jq -e '.is_free == true' "${rate_json}" >/dev/null 2>&1; then
+    ok "qoder-efficient cost gate: free at last check"
+  else
+    warn "cost gate snapshot missing/not-free — executor runs may be refused (exit 75)"
+  fi
   check_cmd "slack-bridge.service active (user unit)" "$(declare -f RUN_AS_USER); RUN_AS_USER systemctl --user is-active slack-bridge.service 2>/dev/null | grep -qx active"
   check_cmd "slack-brief.timer enabled (user unit)" "$(declare -f RUN_AS_USER); RUN_AS_USER systemctl --user is-enabled slack-brief.timer 2>/dev/null | grep -qx enabled"
   if command -v spectre-slack-notify >/dev/null 2>&1; then

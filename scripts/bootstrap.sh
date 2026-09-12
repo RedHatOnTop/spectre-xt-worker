@@ -224,14 +224,16 @@ install -m 0755 "${REPO_DIR}/scripts/slack-notify.py" /usr/local/bin/spectre-sla
 install -m 0755 "${REPO_DIR}/scripts/slack-brief.py" /usr/local/bin/spectre-slack-brief
 install -m 0755 "${REPO_DIR}/scripts/slack-bridge.mjs" /usr/local/bin/spectre-slack-bridge
 install -m 0644 "${REPO_DIR}/config/slack-agents.json" /usr/local/share/remote-agent/slack-agents.json
-# Executor settings are operator-tuned once installed: never clobber; union
-# the repo's deny list into the live file so new denies still land.
+# Executor settings: the repo is the source of truth for allow (so
+# tightenings land on installed boxes) and defaultMode; the deny list is
+# unioned so local hardening is never lost. Unknown local keys (a hand-added
+# hooks section, say) are dropped — qodercli does not execute them anyway.
 settings_dest=/usr/local/share/remote-agent/slack-executor-settings.json
 settings_src="${REPO_DIR}/config/slack-executor-settings.example.json"
 if [[ ! -f "${settings_dest}" ]]; then
   install -m 0644 "${settings_src}" "${settings_dest}"
 elif command -v jq >/dev/null 2>&1; then
-  if jq -s '.[0] as $old | .[1] as $new | $old | .permissions.deny = (($old.permissions.deny // []) + ($new.permissions.deny // []) | unique)' \
+  if jq -s '.[0] as $old | .[1] as $new | $new | .permissions.deny = ((($old.permissions.deny // []) + ($new.permissions.deny // [])) | unique)' \
     "${settings_dest}" "${settings_src}" > "${settings_dest}.tmp"; then
     install -m 0644 "${settings_dest}.tmp" "${settings_dest}" \
       || { rm -f "${settings_dest}.tmp"; exit 1; }

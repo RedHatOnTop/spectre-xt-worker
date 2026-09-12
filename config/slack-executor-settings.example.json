@@ -7,14 +7,12 @@
       "Bash(git status)",
       "Bash(git diff)",
       "Bash(git log)",
-      "Bash(journalctl:*)",
       "Bash(systemctl --user is-active:*)",
       "Bash(systemctl --user status:*)",
-      "Bash(pgrep:*)",
       "Bash(ss -tln)",
       "Bash(tmux ls)",
-      "Bash(df:*)",
-      "Bash(free:*)",
+      "Bash(df -h:*)",
+      "Bash(free -h)",
       "Bash(uptime)"
     ],
     "deny": [
@@ -22,6 +20,7 @@
       "Read(**/.env)",
       "Read(**/.env.*)",
       "Read(**/*.env)",
+      "Read(**/*.env*)",
       "Read(**/slack.env)",
       "Read(**/health.env)",
       "Read(**/env.json)",
@@ -34,12 +33,17 @@
       "Read(**/id_ed25519)",
       "Read(**/*.pem)",
       "Read(**/.ssh/**)",
+      "Read(**/.config/remote-agent/**)",
       "Read(**/.qoder/**)",
+      "Read(**/.claude/**)",
+      "Read(**/.claude.json)",
+      "Read(**/.gemini/**)",
       "Read(**/.codexpro/**)",
       "Read(**/.zcode/**)",
+      "Read(**/.bash_history)",
       "Read(/work/hardened-zai-proxy/**)",
-      "Read(/proc/*/environ)",
-      "Read(/proc/**/environ)"
+      "Read(/proc/**)",
+      "Bash(journalctl:*)"
     ],
     "defaultMode": "default"
   }

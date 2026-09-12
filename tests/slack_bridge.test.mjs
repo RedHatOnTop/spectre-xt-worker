@@ -1,6 +1,8 @@
 #!/usr/bin/env node
 // Unit tests for the Slack Socket Mode bridge policy and guards.
 import assert from "node:assert/strict";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import { test } from "node:test";
 
 import {
@@ -85,14 +87,17 @@ test("loadConfig parses the env text and applies defaults", () => {
   assert.equal(cfg.triage, true);
   assert.equal(cfg.maxRunsPerDay, 7);
   assert.equal(cfg.executorModel, "efficient");
-  assert.ok(cfg.executorBin.endsWith("/.local/bin/qoder-efficient"));
-  assert.ok(loadConfig("SLACK_EXECUTOR_BIN=~/bin/x").executorBin.endsWith("/bin/x"));
+  assert.equal(cfg.executorBin, join(homedir(), ".local/bin/qoder-efficient"));
+  assert.equal(loadConfig("SLACK_EXECUTOR_BIN=~/bin/x").executorBin, join(homedir(), "bin/x"));
+  assert.equal(loadConfig("SLACK_EXECUTOR_BIN=~").executorBin, homedir());
   assert.equal(cfg.channels.lobby, "C01LOBBY00");
 });
 
 test("validateConfig reports every missing piece, accepts a full config", () => {
   assert.ok(validateConfig(loadConfig("")).length >= 6);
   assert.deepEqual(validateConfig(goodCfg()), []);
+  const relative = validateConfig(goodCfg({ executorBin: "qoder-efficient" }));
+  assert.ok(relative.some((problem) => problem.includes("SLACK_EXECUTOR_BIN")));
 });
 
 test("classifyMessage: #fleet never triggers anything", () => {
@@ -311,6 +316,10 @@ test("buildExecutorArgs: read-only, isolated, never skips permissions", () => {
   );
   assert.equal(args[args.indexOf("--model") + 1], "efficient");
   assert.equal(args[args.indexOf("--output-format") + 1], "json");
+  assert.equal(args[args.indexOf("--append-system-prompt") + 1], "facts");
+  assert.ok(args.includes("--no-session-persistence"));
+  assert.equal(args.filter((arg) => arg === "-p").length, 1);
+  assert.equal(args.filter((arg) => arg === "--model").length, 1);
   assert.ok(!args.includes("--max-budget-usd"));
   assert.ok(!args.includes("--dangerously-skip-permissions"));
   assert.ok(!args.includes("--yolo"));
@@ -381,6 +390,10 @@ test("parseExecutorResult reads the last JSON envelope (wrapper logs pollute std
   assert.equal(parseExecutorResult("null", 0).ok, false);
   assert.equal(parseExecutorResult('"text"', 0).ok, false);
   assert.equal(parseExecutorResult("[1,2]", 0).ok, false);
+  // a trailing JSON log object (no result/is_error keys) must neither mask
+  // nor spoof the envelope
+  const trailingLog = '{"type":"result","is_error":false,"result":"real"}\n{"level":"info","msg":"bye"}\n';
+  assert.deepEqual(parseExecutorResult(trailingLog, 0), { ok: true, text: "real" });
   // exit 75 is the qoder-efficient wrapper's cost-gate refusal
   assert.deepEqual(parseExecutorResult("", 75), { ok: false, error: "cost_gate_refused" });
 });

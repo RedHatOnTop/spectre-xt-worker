@@ -105,8 +105,8 @@ export function parseEnvText(text) {
 const truthy = (value) =>
   ["1", "true", "yes", "on"].includes(String(value || "").trim().toLowerCase());
 
-// env files are written by hand; a literal "~/" must still resolve
-const expandHome = (path) => (path.startsWith("~/") ? join(homedir(), path.slice(2)) : path);
+// env files are written by hand; a literal "~" or "~/" must still resolve
+const expandHome = (path) => path.replace(/^~(?=$|\/)/, homedir());
 
 function numberOr(value, fallback) {
   const num = Number(value);
@@ -148,6 +148,9 @@ export function validateConfig(cfg) {
   }
   if (!cfg.allowedUsers.length || cfg.allowedUsers.some((u) => !/^U[A-Z0-9]{6,}$/.test(u))) {
     problems.push("SLACK_ALLOWED_USERS must list at least one U... member id");
+  }
+  if (!cfg.executorBin.startsWith("/")) {
+    problems.push("SLACK_EXECUTOR_BIN must be an absolute path");
   }
   return problems;
 }
@@ -508,7 +511,9 @@ function childEnv() {
 
 // The qoder-efficient wrapper prints its allow-start line to stdout before
 // the JSON envelope, so the result is the last parseable JSON line, not the
-// whole output. Exit 75 is the wrapper's cost-gate refusal.
+// whole output — and only a line shaped like the envelope counts, so a
+// trailing JSON log/diagnostic object cannot mask or spoof the result.
+// Exit 75 is the wrapper's cost-gate refusal.
 export function parseExecutorResult(stdout, code) {
   if (code === 75) return { ok: false, error: "cost_gate_refused" };
   const lines = String(stdout || "").split("\n").reverse();
@@ -522,6 +527,7 @@ export function parseExecutorResult(stdout, code) {
       continue;
     }
     if (!payload || typeof payload !== "object" || Array.isArray(payload)) continue;
+    if (!("result" in payload) && !("is_error" in payload)) continue;
     if (payload.is_error) return { ok: false, error: String(payload.subtype || "is_error") };
     const text = String(payload.result || "").trim();
     if (!text) return { ok: false, error: "empty_result" };

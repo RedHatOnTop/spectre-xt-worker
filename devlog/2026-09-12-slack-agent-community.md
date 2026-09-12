@@ -168,6 +168,52 @@ Deploy was targeted only (bridge/brief/doctor binaries, agents registry,
   #alerts triage, and #control reply legs stay unverified (PENDING).
 - ChatGPT-Plus connector test (step D): PENDING (user).
 
+### Review round on the executor swap
+
+Adversarial review (typescript-reviewer on the bridge delta,
+security-reviewer on the settings/deploy delta) against the swap
+commit; findings fixed and redeployed the same day:
+
+- `parseExecutorResult` accepted *any* JSON object as the envelope — a
+  stray JSON log line could be read as a result. Now the last
+  stdout JSON object must carry a `result` or `is_error` key
+  (`num_turns` alone is not enough).
+- `expandHome` only handled a bare `~/` prefix; now `~` at end of
+  string and `~/…` are both expanded (`SLACK_EXECUTOR_BIN=~` no longer
+  silently resolves relative).
+- `validateConfig` never checked `executorBin`; it now requires an
+  absolute path (a relative bin would resolve against `cwd /`).
+- Deny list extended with backup variants and adjacent secrets:
+  `**/.env.*` (`.env.bak` etc.), `**/.gemini/**`, `**/.claude.json`,
+  `**/.bash_history`; `/proc/*/environ` widened to `Read(/proc/**)`.
+- `Bash(journalctl:*)` was an allow entry — a wildcard that bypassed
+  the file deny list (journalctl can read anything journald writes).
+  Removed from allow, added to deny. `pgrep:*` removed and
+  `df:*`/`free:*` tightened to `df -h:*`/`free -h`.
+- `bootstrap.sh` merged only the *deny* list, so allow-list
+  tightenings never landed on an installed box. The merge is now
+  `$new`-based: allow follows the repo, deny is unioned with whatever
+  is on the box.
+- `doctor.sh` now also checks the cost-gate snapshot
+  (`qoder-efficient-rate.json` → `is_free == true`, WARN otherwise).
+- RUNBOOK honesty fixes: the executor is *not* "allowlist-only" for
+  reads (Read/Glob are wholesale-allowed; the deny list is the file
+  gate) and §7.10 now carries a real `Grep` probe (the "Grep is
+  denied" claim previously had no probe re-checking it).
+
+Post-fix redeploy (targeted `install`, then `daemon-reload` + restart):
+the settings refresh landed as designed — allow replaced (journalctl,
+pgrep gone; `df -h:*`, `free -h`), deny **22 → 30** entries. Re-probes
+under the bridge child env:
+
+- Grep probe: `{"num_turns":1,"result":"DENIED"}`, no `xoxb-` in
+  stdout.
+- Secret-read probe (forced attempt, tightened settings):
+  `{"num_turns":2,"result":"DENIED"}`, no token in stdout.
+
+Local `bash verify.sh` green after the fixes (50 python + 20 node
+tests).
+
 ## Honest limits
 
 - The executor boundary is a permission engine plus a narrow read-only
