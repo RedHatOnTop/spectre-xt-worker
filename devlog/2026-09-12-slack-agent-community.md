@@ -131,17 +131,42 @@ probed on the box against qodercli 1.1.47:
   uses the bridge's pinned PATH instead of a login shell, so a
   `~/.local/bin`-only claude cannot mask a broken executor.
 
-## On-box verification (PENDING — filled at deploy)
+## On-box verification (2026-09-12, after the targeted deploy)
 
-- ChatGPT-Plus connector test (step D): _pending_.
-- Executor boundary probe: _pending_ (expect `DENIED`, no
-  `/tmp/slack-probe.txt`).
-- Secret-read probe (`~/.config/remote-agent/slack.env`): _pending_
-  (expect `DENIED`).
-- `auth.test` ok / socket connected / one reconnect cycle: _pending_.
-- orca stop -> Slack alert -> restart clears the streak: _pending_.
-- First `#lobby` agent discussion + first `#alerts` triage thread:
-  _pending_.
+Deploy was targeted only (bridge/brief/doctor binaries, agents registry,
+`slack-executor-settings.json`, units); `slack-claude-settings.json` and
+`slack-guard.mjs` were retired in place as `.retired` (mv, not rm).
+
+- Bridge up: `slack-bridge: starting (7 agents, triage=off)` ->
+  `auth.test ok user=U0C1ARX2DGE bot=B0C16HEL6BV` -> `slack-bridge:
+  socket connected`. Kill test: `systemctl --user kill -s SIGKILL` ->
+  "Scheduled restart job, restart counter is at 1" -> active again.
+- Executor under the exact bridge child env (`env -i`, minimal PATH,
+  `cwd /`, SPECTRE_WORKER_PROFILE=box): `PROBE_OK`, exit 0,
+  `total_cost_usd: 0`, `modelUsage ["efficient"]`. The wrapper's
+  allow-start line lands on stdout before the envelope
+  (`2026-09-12T07:00:01Z allow-start status=free price_factor=0.0
+  source:pid:574580`); the bridge's last-JSON-line parser absorbs it.
+- Write probe: `DENIED`, num_turns=2 (the write was attempted and
+  refused), `/tmp/slack-probe.txt` absent.
+- Secret-read probe (forced attempt): `DENIED`, num_turns=2, no `xoxb-`
+  anywhere in stdout. Note: qodercli 1.1.47 leaves
+  `permission_denials` empty even when a tool is refused — the turn
+  count is the evidence, not that array.
+- Cost gate: `qoder-efficient-guard check` -> `status=free
+  price_factor=0.0`, exit 0.
+- `spectre-slack-notify --self-test` -> `OK (4 channels, 7 agents)`.
+- `spectre-slack-brief --dry-run` renders (health green, 24h log, box
+  block).
+- `spectre-doctor` -> `summary: 34 passed, 0 failed`, including the new
+  executor gates (`qoder-efficient wrapper present`, `executor settings
+  installed`).
+- **Blocked on user action**: the bot is in no channel yet —
+  `error=not_in_channel` on all four. `/invite @spectreagents` in
+  `#alerts`, `#fleet`, `#control`, `#lobby`. Until then no
+  `message.channels` events reach the bridge, so the #lobby discussion,
+  #alerts triage, and #control reply legs stay unverified (PENDING).
+- ChatGPT-Plus connector test (step D): PENDING (user).
 
 ## Honest limits
 
