@@ -26,21 +26,26 @@ tunnel, no inbound firewall change).
   unit, `Restart=always`): Socket Mode listener on Node's global
   WebSocket (zero dependencies). Per-channel policy:
   `#control` = allowlisted member @mention -> builtin or read-only
-  claude run; `#lobby` = registered agent issue -> claude discussion
+  qoder run; `#lobby` = registered agent issue -> qoder discussion
   reply in-thread, single-hop; `#alerts` = healthcheck alert ->
   optional triage (`SLACK_TRIAGE=1`); `#fleet` = posts only.
 - `scripts/slack-brief.py` -> `spectre-slack-brief` + timer: daily
   09:00 deterministic brief to `#lobby` (no LLM).
 - `config/slack-agents.json`: 7 identities (bridge, healthcheck, orca,
   zcode, claude, qoder, spectre).
-- Executor profile `config/slack-claude-settings.example.json`:
+- Executor: **qodercli, Efficient model**, via the box-local
+  `qoder-efficient` wrapper (its `allow-start` cost gate refuses with
+  exit 75 when the promo is no longer free; the bridge audits that as
+  `cost_gate_refused`). Not claude — see the swap section below.
+- Executor profile `config/slack-executor-settings.example.json`:
   allowlist (Read/Glob + narrow read-only Bash, no curl; Grep denied
   wholesale — its pattern semantics against secret files are
   unverifiable and `Grep(pattern)` returns matching lines, a token
   leak channel), secret read deny-list (`slack.env`, `health.env`,
   `env.json`, `http-token`, keys, `/proc/*/environ`,
-  `/work/hardened-zai-proxy/**`), PreToolUse guard hook; phase 1 is
-  read-only.
+  `/work/hardened-zai-proxy/**`); phase 1 is read-only. **No hooks
+  section** — probed: qodercli 1.1.47 does not execute PreToolUse
+  hooks delivered through `--settings`.
 - `scripts/healthcheck.py`: new `probe_orca` (default on —
   `REQUIRE_ORCA=1`) and optional `send_slack` backend alongside ntfy.
 - `scripts/doctor.sh`, `scripts/bootstrap.sh` (fresh installs only),
@@ -51,7 +56,37 @@ Loop/cost guards: single-hop by construction, fail-closed on unknown
 identity, dedupe by `event_id` + `(channel, ts)`, stale > 300 s
 dropped, rate limit 6/10 min per user, per-thread 4 runs/h + daily cap
 30 (persisted across restarts), one executor run at a time, 300 s
-SIGKILL timeout, `--max-budget-usd`.
+SIGKILL timeout, and the wrapper's cost gate (exit 75) as the dollar
+bound — the Efficient model is 0-multiplier, so there is no per-run
+dollar cap to spend.
+
+### Executor swap: claude -> qodercli Efficient (same day)
+
+Claude's upstream auth died mid-build ("Failed to authenticate: OAuth
+session expired and could not be refreshed"), so the executor was
+swapped to qodercli running the Efficient model — 0-multiplier, and
+the box already has the `qoder-efficient` wrapper whose guard
+hard-stops qodercli when the promo price moves. Consequences,
+probed on the box against qodercli 1.1.47:
+
+- The responder identity in Slack is `qoder` (human prefix in
+  `#lobby` is `qoder:`), matching what actually answers.
+- `--max-budget-usd` does not exist in qodercli; the cost bound is
+  the wrapper's `allow-start` gate (exit 75 = refused, audited).
+- Flag-settings PreToolUse hooks are **not executed** (a trivial
+  logging hook never ran), so the `irreversible-guard` hook is not
+  part of this boundary. The executable boundary is the permission
+  engine + the narrow read-only allowlist: writes always require
+  confirmation and are denied headless; compound commands (`;`) and
+  command substitution (`$()`) are denied; the deny list lands as a
+  flagSettings rule (slack.env read denied).
+- The bridge runs the executor with `cwd "/"` (every box path is
+  read-visible to the allowlist) and parses the **last** JSON line of
+  stdout — the wrapper prints its `allow-start` log line before the
+  envelope.
+- `slack-claude-settings.json` on the box was retired
+  (`mv` -> `.retired`) in the same deploy; the bridge reads
+  `slack-executor-settings.json`.
 
 ## Local verification (fedora, before deploy)
 
@@ -110,16 +145,23 @@ SIGKILL timeout, `--max-budget-usd`.
 
 ## Honest limits
 
-- The guard is text-matching, not a sandbox; same-user isolation is
-  imperfect. If claude's permission semantics drift, the negative probe
-  must be re-run after every claude upgrade.
+- The executor boundary is a permission engine plus a narrow read-only
+  allowlist on qodercli 1.1.47 — semantics that are not contractual.
+  Re-run the write/secret probes in RUNBOOK §7.10 after every qodercli
+  upgrade. Same-user isolation is imperfect; the executor runs as the
+  box user.
+- Flag-settings hooks do not execute (probed), so there is no
+  irreversible-guard backstop on this path — the read-only allowlist
+  is the whole Bash boundary. Anything that widens the allowlist also
+  widens this.
 - Bot-post event shape (does `message.channels` carry username/subtype
   for customized posts?) is unverified until the first real post; the
   policy fails closed if identity is unknown, so it cannot loop — but
   `#lobby` automation stays silent in that case until fixed.
-- `--setting-sources ""` / `--permission-mode default` semantics are
-  unverified against claude 2.1.236 until the probe passes; the unit
-  stays disabled until then.
+- The Efficient promo is a 0-multiplier *promo*: the wrapper refuses
+  (exit 75) when the price changes, but a change between the price
+  scan and the run is not defendable — check the guard's state file
+  if runs start failing.
 - Anything holding the user's Slack account can drive the read-only
   executor — intentional and bounded.
 - One executor job at a time on a 2C/4T box; no boot-time services
@@ -127,9 +169,10 @@ SIGKILL timeout, `--max-budget-usd`.
 
 ## Follow-ups
 
-Write-enabled executor phase 2, `qodercli` executor, thread->session
-continuity, Slack interactive buttons, multi-hop threads (v1 is
-single-hop — humans continue them), Orca/zcode as autonomous
-responders (interactive apps — they post via the CLI, they do not
-answer), mirroring box-only `qoder-efficient-guard`/`qoder-nudge`
-into the repo.
+Write-enabled executor phase 2, thread->session continuity, Slack
+interactive buttons, multi-hop threads (v1 is single-hop — humans
+continue them), Orca/zcode as autonomous responders (interactive apps —
+they post via the CLI, they do not answer), mirroring box-only
+`qoder-efficient-guard`/`qoder-nudge` into the repo, removing the
+now-unused claude identity from the registry if claude never comes
+back.

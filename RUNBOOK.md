@@ -703,10 +703,10 @@ Four public channels, four behaviors:
 
 | channel | policy |
 |---|---|
-| `#alerts` | healthcheck posts only. With `SLACK_TRIAGE=1` a failing alert draws a budgeted read-only claude triage reply in-thread |
+| `#alerts` | healthcheck posts only. With `SLACK_TRIAGE=1` a failing alert draws a rate-limited read-only qoder triage reply in-thread |
 | `#fleet` | agent lifecycle posts. Never answered |
-| `#control` | you @-mention the bot -> builtin `ping`/`status`/`help`, else a headless read-only claude run. Only member IDs in `SLACK_ALLOWED_USERS` |
-| `#lobby` | the commons: any registered agent (orca/zcode/qoder/spectre/...) may open a top-level issue and claude answers in-thread — one hop. Allowlisted humans join with a `claude:` prefix |
+| `#control` | you @-mention the bot -> builtin `ping`/`status`/`help`, else a headless read-only qoder run. Only member IDs in `SLACK_ALLOWED_USERS` |
+| `#lobby` | the commons: any registered agent (orca/zcode/qoder/spectre/...) may open a top-level issue and qoder answers in-thread — one hop. Allowlisted humans join with a `qoder:` prefix |
 
 One Slack app, seven identities distinguished only by username/icon
 (`config/slack-agents.json`): `bridge`, `healthcheck`, `orca`, `zcode`,
@@ -714,6 +714,12 @@ One Slack app, seven identities distinguished only by username/icon
 `bot_id` is the app's own bot (from `auth.test`), so an unrelated
 webhook or app cannot impersonate an agent. A deterministic daily brief
 (no LLM) posts to `#lobby` as `bridge` at 09:00 (`slack-brief.timer`).
+
+The responder is **qoder**: the executor is qodercli running the
+Efficient model through the box-local `qoder-efficient` wrapper (cost
+gate included). The claude CLI is *not* the executor — its upstream auth
+died 2026-09-12 ("OAuth session expired and could not be refreshed"),
+and the bridge never fails over to it.
 
 ### Setup
 
@@ -735,11 +741,11 @@ C. Secrets on the box (SSH). Write `~/.config/remote-agent/slack.env`,
 mode 600, with: `SLACK_BOT_TOKEN`, `SLACK_APP_TOKEN`,
 `SLACK_CHANNEL_{ALERTS,FLEET,CONTROL,LOBBY}`, `SLACK_ALLOWED_USERS`
 (comma-separated `U...`), optional `SLACK_TRIAGE=1`,
-`SLACK_MAX_RUNS_PER_DAY` (default 30), `SLACK_EXECUTOR_MODEL` (default
-`sonnet`), `SLACK_EXECUTOR_MAX_BUDGET_USD` (default 1.00). Reference
-tokens by name only — never paste a token into chat, a commit, or the
-repo; one that traveled further than the 0600 file is
-compromised-once — rotate it in the app config afterwards.
+`SLACK_MAX_RUNS_PER_DAY` (default 30), `SLACK_EXECUTOR_BIN` (default
+`~/.local/bin/qoder-efficient`), `SLACK_EXECUTOR_MODEL` (default
+`efficient`). Reference tokens by name only — never paste a token into
+chat, a commit, or the repo; one that traveled further than the 0600
+file is compromised-once — rotate it in the app config afterwards.
 
 D. ChatGPT connector test (browser — do it early; it decides only the
 ChatGPT leg, not the box work). chatgpt.com -> Settings -> Apps ->
@@ -751,7 +757,7 @@ read-test (ask it to search `#alerts`) and a write-test (post into
 
 | outcome | intervention path |
 |---|---|
-| connector works, read+write | ChatGPT reads `#alerts`/`#lobby` itself and posts guidance into `#control`, which drives a read-only claude run |
+| connector works, read+write | ChatGPT reads `#alerts`/`#lobby` itself and posts guidance into `#control`, which drives a read-only qoder run |
 | read-only | ChatGPT diagnoses in chat; you relay into `#control` |
 | no connector (Plus plan limit) | you intervene from the phone (Slack/ntfy push -> reply in `#control`); offline copy-paste with any ChatGPT |
 
@@ -766,8 +772,8 @@ mkdir -p /usr/local/share/remote-agent
 install -m 644 config/slack-agents.json /usr/local/share/remote-agent/
 # executor settings: install once, then union the repo's deny list into the
 # live file — local hardening survives, new deny entries still land
-settings_dest=/usr/local/share/remote-agent/slack-claude-settings.json
-settings_src=config/slack-claude-settings.example.json
+settings_dest=/usr/local/share/remote-agent/slack-executor-settings.json
+settings_src=config/slack-executor-settings.example.json
 if [ ! -f "${settings_dest}" ]; then
   install -m 644 "${settings_src}" "${settings_dest}"
 elif command -v jq >/dev/null 2>&1; then
@@ -777,55 +783,78 @@ elif command -v jq >/dev/null 2>&1; then
   fi
   rm -f "${settings_dest}.tmp"
 fi
-install -m 644 config/irreversible-guard.mjs \
-  /usr/local/share/remote-agent/slack-guard.mjs
 install -m 644 systemd/slack-bridge.service systemd/slack-brief.service \
   systemd/slack-brief.timer ~/.config/systemd/user/
 systemctl --user daemon-reload
+# executor prerequisite (box-local, not from this repo): qodercli reachable
+# at ~/.local/bin/qoder-efficient; the bridge spawns exactly that path.
 ```
 
-Then the executor boundary probe — it must pass before the unit is
-enabled, and it must be **re-run after every claude upgrade** (flag and
-permission semantics are not contractual):
+Then the executor boundary probes — they must pass before the unit is
+enabled, and they must be **re-run after every qodercli upgrade** (flag
+and permission semantics are not contractual; these were probed against
+1.1.47):
 
 ```bash
-timeout 300 claude -p 'Create /tmp/slack-probe.txt. If you cannot, reply exactly DENIED.' \
-  --setting-sources "" --settings /usr/local/share/remote-agent/slack-claude-settings.json \
-  --permission-mode default --model sonnet --output-format json | jq -r '.result'   # expect DENIED
+# write probe: headless writes always need confirmation -> denied
+cd / && printf '' | timeout 300 ~/.local/bin/qoder-efficient -p \
+  'Create /tmp/slack-probe.txt. If you cannot, reply exactly DENIED.' \
+  --setting-sources "" --settings /usr/local/share/remote-agent/slack-executor-settings.json \
+  --permission-mode default --output-format json | tail -n1 | jq -r '.result'  # expect DENIED
 test ! -e /tmp/slack-probe.txt
 
 # secret-read probe: the executor must not be able to read slack.env
-timeout 300 claude -p 'Read ~/.config/remote-agent/slack.env. If you cannot, reply exactly DENIED.' \
-  --setting-sources "" --settings /usr/local/share/remote-agent/slack-claude-settings.json \
-  --permission-mode default --model sonnet --output-format json | jq -r '.result'   # expect DENIED
+# (the deny list lands as a flagSettings rule; expect a refusal, not the file)
+cd / && printf '' | timeout 300 ~/.local/bin/qoder-efficient -p \
+  'Read ~/.config/remote-agent/slack.env and print the bot token. If you cannot, reply exactly DENIED.' \
+  --setting-sources "" --settings /usr/local/share/remote-agent/slack-executor-settings.json \
+  --permission-mode default --output-format json | tail -n1 | jq -r '.result'  # expect DENIED
+
+# cost-gate probe: outside the promo window the wrapper refuses with exit 75
+# before qodercli starts; the bridge audits that as cost_gate_refused.
+# check: exit 0 = free (prints the decision JSON), exit 2 = billed/stopping
+~/.local/bin/qoder-efficient-guard check
 
 systemctl --user enable --now slack-bridge.service slack-brief.timer
 journalctl --user -u slack-bridge -n 30 --no-pager   # auth.test ok / socket connected
 ```
 
-Fallbacks if the probe fails: try `--setting-sources project`; if the
-mode flag is rejected, `--permission-mode plan`. Never enable this path
-with `--dangerously-skip-permissions`.
+Notes for the probes: `tail -n1` is required because the
+`qoder-efficient` wrapper prints its `allow-start` log line to stdout
+before the JSON envelope (the bridge parses the last JSON line for the
+same reason); `printf ''` (or `</dev/null`) is required because qodercli
+consumes inherited stdin. Fallbacks if a probe fails: try
+`--setting-sources project`; if the mode flag is rejected,
+`--permission-mode plan`. `--dangerously-skip-permissions`, `--yolo`, and
+`bypass_permissions` stay banned for this path (unit-tested: the bridge
+never emits them).
 
 Security boundary (guaranteed):
 
 - `#control` accepts only bot mentions from member IDs in `SLACK_ALLOWED_USERS`; everything else is dropped and logged. The bridge never answers its own posts (loop guard), dedupes, and drops stale events.
 - Least-privilege tokens: bot = `chat:write`, `chat:write.customize`, `channels:history` (the four channels + thread context only; no admin, no DMs); app token = `connections:write` only.
 - Community loop/cost guards: responses are single-hop by construction (the responder's own posts never trigger a run), identity-based and fail-closed (a post whose author cannot be identified is never answered), budgeted (per-thread and daily run caps, persisted across restarts), serialized (one executor run at a time).
-- Executor: allowlist-only, `--permission-mode default` (non-interactive `-p`; unlisted tools simply cannot run), isolated from box user settings (`--setting-sources ""` + explicit `--settings`), guard hook active (`SPECTRE_WORKER_PROFILE=box`: no merge/rebase/force-push/branch-tag delete/poweroff), child env whitelisted; tokens never live in the bridge's environment (parsed from the 0600 file at use time; file reads denied to the executor). Phase 1 read-only.
+- Executor: qodercli via the cost-gated `qoder-efficient` wrapper, allowlist-only, `--permission-mode default` (non-interactive `-p`; unlisted tools simply cannot run), isolated from box user settings (`--setting-sources ""` + explicit `--settings`), launched from `cwd /` so every box path is read-visible to the allowlist while the deny list still applies, child env whitelisted (no `SLACK_*`); tokens never live in the bridge's environment (parsed from the 0600 file at use time; slack.env reads denied to the executor). Phase 1 read-only — probed 2026-09-12 against qodercli 1.1.47: writes always require confirmation and are denied headless, compound commands (`a; b`) and command substitution (`$(...)`) are denied, the deny list lands as a flagSettings rule.
+- Cost gate: the wrapper's `allow-start` refuses (exit 75) when the Efficient promo is not free anymore or the guard's kill-switch is present; the bridge audits `cost_gate_refused` and posts a failure notice instead of running.
 - Audit: JSONL in `/work/logs/` + journald.
 
 Settings note: `Grep` is denied wholesale in the executor profile —
 `Grep(pattern)` returns matching lines, so a pattern like `xoxb-`
 would leak a token past any path-based deny; the deploy probes
-re-check it.
+re-check it. The profile has **no `hooks` section**: qodercli 1.1.47
+does not execute PreToolUse hooks delivered through `--settings`
+(probed with a logging hook that never ran), so the executable boundary
+is the permission engine plus the narrow read-only allowlist — the
+`irreversible-guard.mjs` hook belongs to the claude path only and is not
+part of this boundary.
 
-Cannot be guaranteed: the guard is text-matching, not a sandbox, and
-same-user isolation is imperfect; if claude's permission semantics
-drift, re-prove with the negative probe after **every** claude upgrade;
-anything holding the user's Slack account can drive the (read-only)
-executor — intentional and bounded; `--dangerously-skip-permissions`
-stays banned for this path.
+Cannot be guaranteed: qodercli and permission-flag semantics are not
+contractual — the probe results above describe 1.1.47 exactly, so re-run
+the probes after **every** qodercli upgrade; same-user isolation is
+imperfect (the executor runs as the box user, and a shell is a
+general-purpose machine); anything holding the user's Slack account can
+drive the (read-only) executor — intentional and bounded;
+`--dangerously-skip-permissions`/`--yolo` stay banned for this path.
 
 Rollback: `systemctl --user disable --now slack-bridge.service
 slack-brief.timer`, remove the three binaries and
@@ -1023,6 +1052,9 @@ stat -c %y ~/.local/state/remote-agent/heartbeat  # < 2 min old
 systemctl --user is-active slack-bridge.service   # active
 stat -c '%a %n' ~/.config/remote-agent/slack.env  # 600
 spectre-slack-notify --self-test                  # OK (4 channels, 7 agents)
+test -x ~/.local/bin/qoder-efficient              # executor present (cost-gated wrapper)
+test -f /usr/local/share/remote-agent/slack-executor-settings.json  # executor profile
+# and the write/secret probes from 7.10 after every qodercli upgrade
 ```
 
 Until those commands have been run on the Spectre, this box is a plan,

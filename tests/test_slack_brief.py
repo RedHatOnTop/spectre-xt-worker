@@ -64,7 +64,7 @@ class RenderTest(unittest.TestCase):
         brief = slack_brief.render_brief(NOW, {"bits": [], "since": 0}, {}, "")
         self.assertIn("*health*: green (no active failures)", brief)
         self.assertIn("*24h log*: quiet", brief)
-        self.assertIn('reply "claude: ..."', brief)
+        self.assertIn('reply "qoder: ..."', brief)
 
     def test_failing_state_shows_duration(self) -> None:
         health = {"bits": ["proxy_down", "ac_offline"], "since": NOW - 7500}

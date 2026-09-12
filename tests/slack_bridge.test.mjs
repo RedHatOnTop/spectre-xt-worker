@@ -53,8 +53,8 @@ function goodCfg(over = {}) {
     allowedUsers: ["U0PERSON1"],
     triage: true,
     maxRunsPerDay: 30,
-    executorModel: "sonnet",
-    executorMaxBudgetUsd: 1.0,
+    executorBin: "/home/person/.local/bin/qoder-efficient",
+    executorModel: "efficient",
     ...over,
   };
 }
@@ -84,8 +84,9 @@ test("loadConfig parses the env text and applies defaults", () => {
   assert.deepEqual(cfg.allowedUsers, ["U0PERSON1", "U0PERSON2"]);
   assert.equal(cfg.triage, true);
   assert.equal(cfg.maxRunsPerDay, 7);
-  assert.equal(cfg.executorModel, "sonnet");
-  assert.equal(cfg.executorMaxBudgetUsd, 1.0);
+  assert.equal(cfg.executorModel, "efficient");
+  assert.ok(cfg.executorBin.endsWith("/.local/bin/qoder-efficient"));
+  assert.ok(loadConfig("SLACK_EXECUTOR_BIN=~/bin/x").executorBin.endsWith("/bin/x"));
   assert.equal(cfg.channels.lobby, "C01LOBBY00");
 });
 
@@ -209,7 +210,7 @@ test("classifyMessage: #lobby answers agent posts, not its own or unknown bots",
   assert.equal(decision.identity, "orca");
 
   assert.equal(
-    classifyMessage(message({ ...orca, username: "claude" }), cfg, CTX).reason,
+    classifyMessage(message({ ...orca, username: "qoder" }), cfg, CTX).reason,
     "lobby_self",
   );
   assert.equal(
@@ -226,7 +227,7 @@ test("classifyMessage: #lobby answers agent posts, not its own or unknown bots",
   );
 });
 
-test("classifyMessage: #lobby humans need the claude: prefix and the allowlist", () => {
+test("classifyMessage: #lobby humans need the qoder: prefix and the allowlist", () => {
   const cfg = goodCfg();
   const human = message({
     channel: CHANNELS.lobby,
@@ -235,14 +236,14 @@ test("classifyMessage: #lobby humans need the claude: prefix and the allowlist",
     text: "just chatting",
   });
   assert.equal(classifyMessage(human, cfg, CTX).reason, "lobby_human_unprefixed");
-  const prefixed = classifyMessage(message({ ...human, text: "Claude: why is proxy down?" }), cfg, CTX);
+  const prefixed = classifyMessage(message({ ...human, text: "Qoder: why is proxy down?" }), cfg, CTX);
   assert.equal(prefixed.kind, "discussion");
   assert.equal(prefixed.identity, "human");
   assert.equal(prefixed.prompt, "why is proxy down?");
   // A member outside SLACK_ALLOWED_USERS must not drive the executor.
   assert.equal(
     classifyMessage(
-      message({ ...human, user: "U0OTHER", text: "claude: read the proxy env" }),
+      message({ ...human, user: "U0OTHER", text: "qoder: read the proxy env" }),
       cfg,
       CTX,
     ).reason,
@@ -298,20 +299,22 @@ test("buildExecutorArgs: read-only, isolated, never skips permissions", () => {
   const args = buildExecutorArgs({
     prompt: "hello",
     systemPrompt: "facts",
-    settingsPath: "/usr/local/share/remote-agent/slack-claude-settings.json",
-    model: "sonnet",
-    maxBudgetUsd: 1,
+    settingsPath: "/usr/local/share/remote-agent/slack-executor-settings.json",
+    model: "efficient",
   });
   assert.equal(args[args.indexOf("-p") + 1], "hello");
   assert.equal(args[args.indexOf("--permission-mode") + 1], "default");
   assert.equal(args[args.indexOf("--setting-sources") + 1], "");
   assert.equal(
     args[args.indexOf("--settings") + 1],
-    "/usr/local/share/remote-agent/slack-claude-settings.json",
+    "/usr/local/share/remote-agent/slack-executor-settings.json",
   );
-  assert.equal(args[args.indexOf("--model") + 1], "sonnet");
-  assert.equal(args[args.indexOf("--max-budget-usd") + 1], "1.00");
+  assert.equal(args[args.indexOf("--model") + 1], "efficient");
+  assert.equal(args[args.indexOf("--output-format") + 1], "json");
+  assert.ok(!args.includes("--max-budget-usd"));
   assert.ok(!args.includes("--dangerously-skip-permissions"));
+  assert.ok(!args.includes("--yolo"));
+  assert.ok(!args.some((arg) => /bypass|dangerously/i.test(arg)));
 });
 
 test("chunkText respects the limit and keeps content", () => {
@@ -362,16 +365,24 @@ test("clock steps backward never wedge the rate/budget windows", () => {
   assert.equal(budgetCheck(state, where, NOW, goodCfg()).ok, true);
 });
 
-test("parseExecutorResult reads the claude JSON envelope", () => {
+test("parseExecutorResult reads the last JSON envelope (wrapper logs pollute stdout)", () => {
   assert.deepEqual(parseExecutorResult('{"result":"ok text","is_error":false}', 0), {
     ok: true,
     text: "ok text",
   });
-  assert.equal(parseExecutorResult('{"result":"","is_error":true,"subtype":"error_max_budget"}', 1).ok, false);
+  const wrapped =
+    "2026-09-12T06:53:58Z allow-start status=free price_factor=0.0 source:pid:574580\n" +
+    '{"type":"result","subtype":"success","is_error":false,"result":"wrapped ok"}\n';
+  assert.deepEqual(parseExecutorResult(wrapped, 0), { ok: true, text: "wrapped ok" });
+  assert.equal(parseExecutorResult('{"result":"","is_error":true,"subtype":"error_max_turns"}', 1).ok, false);
+  assert.equal(parseExecutorResult('{"result":"","is_error":true,"subtype":"error_max_turns"}', 1).error, "error_max_turns");
   assert.equal(parseExecutorResult("not json", 0).ok, false);
   assert.equal(parseExecutorResult("", 1).ok, false);
   assert.equal(parseExecutorResult("null", 0).ok, false);
   assert.equal(parseExecutorResult('"text"', 0).ok, false);
+  assert.equal(parseExecutorResult("[1,2]", 0).ok, false);
+  // exit 75 is the qoder-efficient wrapper's cost-gate refusal
+  assert.deepEqual(parseExecutorResult("", 75), { ok: false, error: "cost_gate_refused" });
 });
 
 test("formatThreadContext caps size and keeps the newest messages", () => {

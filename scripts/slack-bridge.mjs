@@ -3,16 +3,16 @@
 //
 // Listens on a websocket (outbound only; no tunnel, no inbound firewall
 // change) and applies a per-channel policy to message.channels events:
-//   #control  bot mention from an allowlisted member -> built-in or claude run
-//   #lobby    agent-identity post -> claude discussion reply in-thread
-//             (humans only when allowlisted AND prefixed "claude:")
+//   #control  bot mention from an allowlisted member -> built-in or qoder run
+//   #lobby    agent-identity post -> qoder discussion reply in-thread
+//             (humans only when allowlisted AND prefixed "qoder:")
 //   #alerts   healthcheck post -> optional auto-triage in-thread (SLACK_TRIAGE=1)
 //   #fleet    posts only
 //
 // Replies go out through spectre-slack-notify (single Slack client impl).
 // Credentials are read from the 0600 slack.env by this process itself and are
-// never placed into any child environment; the claude executor gets a
-// whitelisted env only. Audit trail: JSONL in /work/logs/slack-bridge.log.
+// never placed into any child environment; the executor gets a whitelisted
+// env only. Audit trail: JSONL in /work/logs/slack-bridge.log.
 //
 // Deploy notes: RUNBOOK.md §7.10. Exit codes: 0 clean stop, 1 not configured.
 // Pure helpers are exported for tests/slack_bridge.test.mjs.
@@ -35,14 +35,15 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 const DEFAULT_ENV_FILE = join(homedir(), ".config/remote-agent/slack.env");
 const STATE_FILE = join(homedir(), ".local/state/remote-agent/slack-bridge-state.json");
 const AUDIT_LOG = "/work/logs/slack-bridge.log";
-const SETTINGS_PATH = "/usr/local/share/remote-agent/slack-claude-settings.json";
+const SETTINGS_PATH = "/usr/local/share/remote-agent/slack-executor-settings.json";
+const DEFAULT_EXECUTOR_BIN = join(homedir(), ".local/bin/qoder-efficient");
 const BOX_REGISTRY = "/usr/local/share/remote-agent/slack-agents.json";
 const REPO_REGISTRY = join(HERE, "..", "config", "slack-agents.json");
 const SLACK_API = "https://slack.com/api";
 
-export const RESPONDER = "claude"; // identity used for replies
+export const RESPONDER = "qoder"; // identity used for replies
 export const INFRA_IDENTITY = "bridge"; // excluded from #lobby triggers (brief, acks)
-const HUMAN_PREFIX = /^claude:\s*/i;
+const HUMAN_PREFIX = /^qoder:\s*/i;
 const RECOVERY_PREFIX = ":white_check_mark:";
 const ALLOWED_SUBTYPES = ["bot_message", "thread_broadcast"];
 const EVENT_MAX_AGE_SEC = 300;
@@ -60,13 +61,13 @@ const SEEN_MAX = 2000;
 
 const HELP_TEXT =
   "commands: `@spectre-agents ping` | `status` | `help` | any question " +
-  "(claude runs read-only, budgeted, ~1-3 min)";
+  "(qoder runs read-only, rate-limited, ~1-3 min)";
 
 const BOX_FACTS = [
   "Context: you are running headless on the Spectre XT worker box (Debian 13, user person),",
   "inside the Spectre agent community in Slack.",
   "Services: orca-serve (user unit, :6768), hardened-zai-proxy (:18088, optional),",
-  "ZCode (Electron GUI app, cannot run headless), claude CLI.",
+  "ZCode (Electron GUI app, cannot run headless), qodercli (you, via the Efficient model).",
   "Logs: /work/logs/health.log and journald.",
   "You have a read-only tool allowlist; unlisted tools fail closed.",
   "Never ask for or print secrets. Reply in plain text suitable for a Slack message.",
@@ -77,7 +78,7 @@ const PERSONAS = {
     "The operator asked something in #control. Investigate read-only and reply " +
     "with a concise, concrete answer (no more than 2000 characters).",
   discussion:
-    "You are claude in #lobby, the commons where agents share issues and findings. " +
+    "You are qoder in #lobby, the commons where agents share issues and findings. " +
     "Join the thread with a concise, concrete reply (no more than 2000 characters). " +
     "Disagree when the evidence says so; do not pad.",
   triage:
@@ -104,6 +105,9 @@ export function parseEnvText(text) {
 const truthy = (value) =>
   ["1", "true", "yes", "on"].includes(String(value || "").trim().toLowerCase());
 
+// env files are written by hand; a literal "~/" must still resolve
+const expandHome = (path) => (path.startsWith("~/") ? join(homedir(), path.slice(2)) : path);
+
 function numberOr(value, fallback) {
   const num = Number(value);
   return Number.isFinite(num) ? num : fallback;
@@ -126,8 +130,10 @@ export function loadConfig(text) {
       .filter(Boolean),
     triage: truthy(env.SLACK_TRIAGE || "0"),
     maxRunsPerDay: Math.max(1, Math.floor(numberOr(env.SLACK_MAX_RUNS_PER_DAY, 30))),
-    executorModel: (env.SLACK_EXECUTOR_MODEL || "sonnet").trim(),
-    executorMaxBudgetUsd: Math.max(0.05, numberOr(env.SLACK_EXECUTOR_MAX_BUDGET_USD, 1.0)),
+    // qodercli "efficient" is the 0-multiplier model; the wrapper adds the
+    // billing guard (refuses to start, exit 75, if the promo price changed).
+    executorBin: expandHome((env.SLACK_EXECUTOR_BIN || "").trim()) || DEFAULT_EXECUTOR_BIN,
+    executorModel: (env.SLACK_EXECUTOR_MODEL || "efficient").trim(),
   };
 }
 
@@ -246,7 +252,7 @@ export function classifyMessage(msg, cfg, ctx) {
       return { kind: "ignore", reason: "lobby_self" };
     }
     // Single-hop by construction: agent posts only trigger at top level;
-    // humans continue threads with the claude: prefix.
+    // humans continue threads with the qoder: prefix.
     if (msg.threadTs && msg.threadTs !== msg.ts) {
       return { kind: "ignore", reason: "lobby_thread_reply" };
     }
@@ -457,16 +463,18 @@ function markSeen(state, msg) {
 }
 
 // ---------------------------------------------------------------------------
-// executor (claude) — read-only by construction
+// executor (qodercli, Efficient model) — read-only by construction
+//
+// Verified against qodercli 1.1.47 on the box: writes always require
+// confirmation and are denied headless; compound commands and command
+// substitution are denied; `cwd: "/"` puts every read inside the workspace
+// root so the read allowlist applies to box paths. Flag-level PreToolUse
+// hooks are NOT executed by qodercli (probed: a logging hook never ran),
+// so the executable boundary is the permission engine + the narrow
+// read-only allowlist in slack-executor-settings.json, not the guard hook.
 // ---------------------------------------------------------------------------
 
-export function buildExecutorArgs({
-  prompt,
-  systemPrompt,
-  settingsPath,
-  model,
-  maxBudgetUsd,
-}) {
+export function buildExecutorArgs({ prompt, systemPrompt, settingsPath, model }) {
   return [
     "-p",
     prompt,
@@ -483,14 +491,13 @@ export function buildExecutorArgs({
     "default",
     "--model",
     model,
-    "--max-budget-usd",
-    Number(maxBudgetUsd).toFixed(2),
   ];
 }
 
 function childEnv() {
   // Fixed minimal PATH (never inherited): the bridge's own PATH may include
-  // user-writable dirs, and the guard hook runs `node` resolved through this.
+  // user-writable dirs. The qoder-efficient wrapper resolves qodercli by
+  // absolute path, so nothing here depends on ~/.local/bin.
   const env = { PATH: "/usr/local/bin:/usr/bin:/bin" };
   for (const key of ["HOME", "LANG", "TERM", "TZ"]) {
     if (process.env[key]) env[key] = process.env[key];
@@ -499,22 +506,28 @@ function childEnv() {
   return env;
 }
 
+// The qoder-efficient wrapper prints its allow-start line to stdout before
+// the JSON envelope, so the result is the last parseable JSON line, not the
+// whole output. Exit 75 is the wrapper's cost-gate refusal.
 export function parseExecutorResult(stdout, code) {
-  const trimmed = String(stdout || "").trim();
-  if (!trimmed) return { ok: false, error: `exit_${code}_no_output` };
-  let payload;
-  try {
-    payload = JSON.parse(trimmed);
-  } catch {
-    return { ok: false, error: `exit_${code}_bad_json` };
+  if (code === 75) return { ok: false, error: "cost_gate_refused" };
+  const lines = String(stdout || "").split("\n").reverse();
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    let payload;
+    try {
+      payload = JSON.parse(trimmed);
+    } catch {
+      continue;
+    }
+    if (!payload || typeof payload !== "object" || Array.isArray(payload)) continue;
+    if (payload.is_error) return { ok: false, error: String(payload.subtype || "is_error") };
+    const text = String(payload.result || "").trim();
+    if (!text) return { ok: false, error: "empty_result" };
+    return { ok: true, text };
   }
-  if (!payload || typeof payload !== "object") {
-    return { ok: false, error: `exit_${code}_bad_payload` };
-  }
-  if (payload.is_error) return { ok: false, error: String(payload.subtype || "is_error") };
-  const text = String(payload.result || "").trim();
-  if (!text) return { ok: false, error: "empty_result" };
-  return { ok: true, text };
+  return { ok: false, error: `exit_${code}_no_result` };
 }
 
 function runExecutor({ prompt, systemPrompt, cfg }) {
@@ -531,11 +544,10 @@ function runExecutor({ prompt, systemPrompt, cfg }) {
       systemPrompt,
       settingsPath: SETTINGS_PATH,
       model: cfg.executorModel,
-      maxBudgetUsd: cfg.executorMaxBudgetUsd,
     });
-    const child = spawn("claude", args, {
+    const child = spawn(cfg.executorBin, args, {
       env: childEnv(),
-      cwd: homedir(),
+      cwd: "/", // in-workspace reads: all box paths via the read allowlist
       stdio: ["ignore", "pipe", "pipe"],
       detached: true, // own process group: the timeout can kill tool children too
     });
@@ -715,7 +727,7 @@ async function runJob(job) {
       agent: INFRA_IDENTITY,
       channel: job.channel,
       threadTs: job.ts,
-      text: `:warning: claude run failed (${result.error})${suffix}`,
+      text: `:warning: qoder run failed (${result.error})${suffix}`,
     });
     return;
   }
@@ -797,7 +809,7 @@ async function handleControl(msg, decision, ctx) {
       agent: INFRA_IDENTITY,
       channel: msg.channel,
       threadTs: msg.ts,
-      text: `:no_entry: claude budget: ${budget.reason}`,
+      text: `:no_entry: run limit: ${budget.reason}`,
     });
     return;
   }
@@ -806,7 +818,7 @@ async function handleControl(msg, decision, ctx) {
     agent: INFRA_IDENTITY,
     channel: msg.channel,
     threadTs: msg.ts,
-    text: ":hourglass_flowing_sand: on it — claude is running (read-only)",
+    text: ":hourglass_flowing_sand: on it — qoder is running (read-only)",
   });
   enqueue({
     kind: "control",
@@ -829,7 +841,7 @@ async function handleDiscussion(msg, decision, ctx) {
       agent: INFRA_IDENTITY,
       channel: msg.channel,
       threadTs: msg.ts,
-      text: `:no_entry: claude budget: ${budget.reason}`,
+      text: `:no_entry: run limit: ${budget.reason}`,
     });
     return;
   }
@@ -838,7 +850,7 @@ async function handleDiscussion(msg, decision, ctx) {
     agent: INFRA_IDENTITY,
     channel: msg.channel,
     threadTs: msg.ts,
-    text: ":hourglass_flowing_sand: claude is reading the thread",
+    text: ":hourglass_flowing_sand: qoder is reading the thread",
   });
   enqueue({
     kind: "discussion",
@@ -860,7 +872,7 @@ async function handleTriage(msg, decision, ctx) {
       agent: INFRA_IDENTITY,
       channel: msg.channel,
       threadTs: msg.ts,
-      text: `:no_entry: claude triage budget: ${budget.reason}`,
+      text: `:no_entry: triage run limit: ${budget.reason}`,
     });
     return;
   }

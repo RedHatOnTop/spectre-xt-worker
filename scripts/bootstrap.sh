@@ -226,8 +226,8 @@ install -m 0755 "${REPO_DIR}/scripts/slack-bridge.mjs" /usr/local/bin/spectre-sl
 install -m 0644 "${REPO_DIR}/config/slack-agents.json" /usr/local/share/remote-agent/slack-agents.json
 # Executor settings are operator-tuned once installed: never clobber; union
 # the repo's deny list into the live file so new denies still land.
-settings_dest=/usr/local/share/remote-agent/slack-claude-settings.json
-settings_src="${REPO_DIR}/config/slack-claude-settings.example.json"
+settings_dest=/usr/local/share/remote-agent/slack-executor-settings.json
+settings_src="${REPO_DIR}/config/slack-executor-settings.example.json"
 if [[ ! -f "${settings_dest}" ]]; then
   install -m 0644 "${settings_src}" "${settings_dest}"
 elif command -v jq >/dev/null 2>&1; then
@@ -238,7 +238,8 @@ elif command -v jq >/dev/null 2>&1; then
   fi
   rm -f "${settings_dest}.tmp"
 fi
-install -m 0644 "${REPO_DIR}/config/irreversible-guard.mjs" /usr/local/share/remote-agent/slack-guard.mjs
+# The executor itself (qoder-efficient wrapper -> qodercli) is box-local at
+# ~/.local/bin; spectre-doctor reports when it is missing.
 
 # Agent guard: box profile. The worker is a disposable appliance, so the
 # irreversible-guard narrows its block list to true irreversibles (remotes,

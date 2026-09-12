@@ -149,13 +149,15 @@ if [[ -f "${slack_env}" ]]; then
   if grep -qs '^SLACK_BOT_TOKEN=xoxb-' "${slack_env}"; then ok "slack.env bot token shape ok"; else bad "slack.env bot token missing (xoxb-)"; fi
   if grep -qs '^SLACK_APP_TOKEN=xapp-' "${slack_env}"; then ok "slack.env app token shape ok"; else bad "slack.env app token missing (xapp-)"; fi
   if command -v node >/dev/null 2>&1; then ok "node present (bridge runtime)"; else bad "node missing — slack-bridge cannot run"; fi
-  # Mirror the unit's pinned PATH, not a login shell (which would mask a
-  # ~/.local/bin-only claude that the bridge cannot resolve).
-  if RUN_AS_USER env PATH=/usr/local/bin:/usr/bin:/bin bash -c 'command -v claude' >/dev/null 2>&1; then
-    ok "claude present (bridge executor)"
+  # Executor: the box-local qoder-efficient wrapper (qodercli, Efficient
+  # model) with its cost gate. Claude is NOT the executor (upstream auth
+  # dead 2026-09-12); the bridge spawns this absolute path, not $PATH.
+  if RUN_AS_USER test -x "${TARGET_HOME}/.local/bin/qoder-efficient"; then
+    ok "qoder-efficient wrapper present (bridge executor)"
   else
-    warn "claude not on the bridge PATH — runs will fail (spawn_enoent)"
+    bad "~/.local/bin/qoder-efficient missing — executor runs will fail"
   fi
+  check_cmd "executor settings installed (slack-executor-settings.json)" "test -f /usr/local/share/remote-agent/slack-executor-settings.json"
   check_cmd "slack-bridge.service active (user unit)" "$(declare -f RUN_AS_USER); RUN_AS_USER systemctl --user is-active slack-bridge.service 2>/dev/null | grep -qx active"
   check_cmd "slack-brief.timer enabled (user unit)" "$(declare -f RUN_AS_USER); RUN_AS_USER systemctl --user is-enabled slack-brief.timer 2>/dev/null | grep -qx enabled"
   if command -v spectre-slack-notify >/dev/null 2>&1; then

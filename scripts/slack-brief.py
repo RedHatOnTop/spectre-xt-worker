@@ -124,7 +124,7 @@ def render_brief(
     if status_text.strip():
         lines += ["", "*box*", "```", _clip_lines(status_text, STATUS_LINES_MAX, STATUS_CHARS_MAX), "```"]
 
-    lines += ["", '_reply "claude: ..." in-thread to ask claude about this._']
+    lines += ["", '_reply "qoder: ..." in-thread to ask qoder about this._']
     return "\n".join(lines)
 
 
