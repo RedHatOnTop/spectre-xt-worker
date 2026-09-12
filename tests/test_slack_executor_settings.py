@@ -10,6 +10,7 @@ hold, hence the orchestration-tool denies below.
 from __future__ import annotations
 
 import json
+import re
 import unittest
 from pathlib import Path
 
@@ -28,6 +29,8 @@ REQUIRED_DENIES = {
     "Agent",
     "Workflow",
     "CronCreate",
+    "CronList",
+    "CronDelete",
     "ScheduleWakeup",
     "EnterWorktree",
     "ExitWorktree",
@@ -43,16 +46,43 @@ REQUIRED_DENIES = {
     "Read(**/*.env*)",
     "Read(**/slack.env)",
     "Read(**/*token*)",
+    "Read(**/.netrc)",
+    "Read(**/.git-credentials)",
+    "Read(**/.aws/**)",
+    "Read(**/.gnupg/**)",
+    "Read(**/id_ecdsa)",
+    "Read(**/*.key)",
     "Read(**/.ssh/**)",
     "Read(**/.config/remote-agent/**)",
     "Read(**/.qoder/**)",
     "Read(**/.codexpro/**)",
     "Read(**/.zcode/**)",
+    "Read(**/.bash_history*)",
+    "Read(**/.zsh_history*)",
     "Read(/proc/**)",
     "Bash(journalctl:*)",
 }
 
-FORBIDDEN_IN_ALLOW = ("journalctl", "pgrep", "curl", "wget", "sh ", "bash ", "python", "node ")
+FORBIDDEN_IN_ALLOW = (
+    "journalctl",
+    "pgrep",
+    "curl",
+    "wget",
+    "sh ",
+    "bash ",
+    "python",
+    "node ",
+    "sudo",
+    "eval",
+    "rm ",
+    "mv ",
+    "cp ",
+    "xargs",
+    "tee",
+    "dd ",
+    "chmod",
+    "chown",
+)
 
 
 class ExecutorSettingsTest(unittest.TestCase):
@@ -78,9 +108,14 @@ class ExecutorSettingsTest(unittest.TestCase):
                 self.assertNotIn(bad, low, f"allow entry looks dangerous: {entry}")
 
     def test_wildcard_allows_are_reviewed(self) -> None:
+        # the only wildcard form allowed is the reviewed `Bash(pattern:*)`
+        wildcard = re.compile(r"^Bash\(.+:\*\)$")
         for entry in self.allow:
-            if entry.endswith(":*"):
-                self.assertIn(entry, REVIEWED_WILDCARDS, f"unreviewed wildcard: {entry}")
+            if "*" not in entry:
+                continue
+            if not wildcard.match(entry):
+                self.fail(f"wildcard allow must be an explicit reviewed 'pattern:*' rule: {entry}")
+            self.assertIn(entry, REVIEWED_WILDCARDS, f"unreviewed wildcard: {entry}")
 
 
 if __name__ == "__main__":

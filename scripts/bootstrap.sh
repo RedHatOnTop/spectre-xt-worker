@@ -231,7 +231,10 @@ install -m 0644 "${REPO_DIR}/config/slack-agents.json" /usr/local/share/remote-a
 settings_dest=/usr/local/share/remote-agent/slack-executor-settings.json
 settings_src="${REPO_DIR}/config/slack-executor-settings.example.json"
 if [[ ! -f "${settings_dest}" ]]; then
-  install -m 0644 "${settings_src}" "${settings_dest}"
+  # same tmp + mv dance as the merge path below: a partial file must not
+  # "exist" and shadow every future install
+  install -m 0644 "${settings_src}" "${settings_dest}.tmp"
+  mv "${settings_dest}.tmp" "${settings_dest}"
 elif command -v jq >/dev/null 2>&1; then
   # tmp + mv within the same directory: replacing the live file must be
   # atomic — a truncated write would strand the deny floor.

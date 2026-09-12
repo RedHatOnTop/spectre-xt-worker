@@ -282,7 +282,12 @@ Fixes deployed the same day:
   irreversible-guard backstop on this path. With the tool-name denies,
   the executor's tool set is Bash/Read/Glob/Skill + Task/Goal
   metadata; Bash is allowlist-only and file paths are deny-filtered.
-  Anything that widens the allowlist or the tool set also widens this.
+  Note the split: the *file* write tools are rule-denied (gone from the
+  set), but a mutating **Bash** command (`mv`, `tee`, redirects) is
+  blocked only by the headless confirmation default — no rule names it.
+  That default is what the write and compound-smuggling probes
+  re-check. Anything that widens the allowlist or the tool set also
+  widens this.
 - Bot-post event shape (does `message.channels` carry username/subtype
   for customized posts?) is unverified until the first real post; the
   policy fails closed if identity is unknown, so it cannot loop — but

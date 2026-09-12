@@ -775,7 +775,7 @@ install -m 644 config/slack-agents.json /usr/local/share/remote-agent/
 settings_dest=/usr/local/share/remote-agent/slack-executor-settings.json
 settings_src=config/slack-executor-settings.example.json
 if [ ! -f "${settings_dest}" ]; then
-  install -m 644 "${settings_src}" "${settings_dest}"
+  install -m 644 "${settings_src}" "${settings_dest}.tmp" && mv "${settings_dest}.tmp" "${settings_dest}"
 elif command -v jq >/dev/null 2>&1; then
   # tmp + mv in the same directory: the replace must be atomic — a
   # truncated write would strand the deny floor
@@ -896,10 +896,10 @@ Security boundary (guaranteed):
 - Executor: qodercli via the cost-gated `qoder-efficient` wrapper, launched from `cwd /` with a whitelisted child env (no `SLACK_*`). Isolated from box user settings (`--setting-sources ""` + explicit `--settings`), `--permission-mode default` (non-interactive `-p`). Phase 1 read-only by these boundaries, all probed 2026-09-12 against qodercli 1.1.47:
   - **Reads/Glob**: allowlisted, and path access is filtered by the secret deny-list in `slack-executor-settings.json` — the deny list is the file gate, so keep it current (probed: Glob over a deny-listed directory refused, Glob over `/tmp` allowed; the deny list lands as a flagSettings rule). `Grep` is *not in the tool set* — the deny entry is a floor in case a future version adds one.
   - **Bash**: only the narrow allowlist runs (`spectre-status`, exact `git status|diff|log`, `systemctl --user is-active|status`, `ss -tln`, `tmux ls`, `df -h`, `free -h`, `uptime`). The engine splits compound commands (`;`, `&&`, `|`) into segments and checks each independently — every segment must be runnable headless or the whole command is denied (probed: `uptime; uptime` ran, `uptime && journalctl …` and `uptime && touch …` denied, no file); command substitution `$(...)` is denied outright. Note `systemctl --user status` prints a unit's recent journal tail (bounded, accepted).
-  - **Writes**: rule-denied — `Edit`/`Write`/`NotebookEdit` are removed from the tool set by the deny list, and write Bash commands require confirmation → denied headless (probed, no file). Phase 1 does not rely on the confirmation default.
+  - **Writes**: `Edit`/`Write`/`NotebookEdit` are rule-denied (removed from the tool set). Mutating **Bash** commands still rely on the headless confirmation default (denied in `-p` mode) — there is no rule that blocks e.g. `mv`; the write probe and the compound-smuggling probe re-check that default after every upgrade.
   - **In-process escalation**: `Agent`, `Workflow`, cron/schedule, and worktree tools are rule-denied (absent from the tool set) — probed hole 2026-09-12: the `Agent` tool spawned a subagent whose Bash *write* gate did not hold (main-thread denials still applied inside it for reads/allowlist, but `touch` succeeded). Denying the tool is the verified fix; the subagent probe in the deploy list re-checks it.
   - **Egress**: `WebFetch`/`WebSearch`/`ImageSearch`/`ImageGen` and `Monitor` are rule-denied (absent from the tool set); `curl`/`wget` are not on the allowlist.
-  - Mechanism (probed 2026-09-12 via the stream-json init dump): a tool-name deny **removes the tool from the executor's tool set** — 28 tools -> 12 (Bash, Read, Glob, Skill, Task*/Goal metadata). That is why the escalation/egress/write probes come back `num_turns=1` with `DENIED`: the model has no such tool to call.
+  - Mechanism (probed 2026-09-12 via the stream-json init dump): a tool-name deny **removes the tool from the executor's tool set** — 28 tools -> 12 (Bash, Read, Glob, Skill, Task*/Goal metadata). The escalation/egress probes therefore come back `num_turns=1` with `DENIED` — the model has no such tool to call, so that reply is evidence of *absence*, not of a denial firing (the Bash write probe is the opposite case: tool present, attempt made, `num_turns>=2`). Skill's internal reads and Task/Goal inertness have **not** been behaviorally probed.
   - Tokens never live in the bridge's environment (parsed from the 0600 file at use time; slack.env reads denied to the executor).
 - Cost gate: the wrapper's `allow-start` refuses (exit 75) when the Efficient promo is not free anymore or the guard's kill-switch is present; the bridge audits `cost_gate_refused` and posts a failure notice instead of running.
 - Audit: JSONL in `/work/logs/` + journald.

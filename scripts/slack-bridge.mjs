@@ -515,8 +515,10 @@ function childEnv() {
 // the JSON envelope, so the result is the last parseable JSON line, not the
 // whole output. Only a line shaped like the envelope counts — `type` must be
 // "result" (verified against qodercli 1.1.47) and a result/is_error key must
-// be present — so a trailing JSON log/diagnostic object cannot mask the
-// envelope. Exit 75 is the wrapper's cost-gate refusal.
+// be present — so a stray JSON log/diagnostic object cannot mask the
+// envelope. stdout comes from the trusted local wrapper; a deliberately
+// envelope-shaped trailing line would still win. Exit 75 is the wrapper's
+// cost-gate refusal.
 export function parseExecutorResult(stdout, code) {
   if (code === 75) return { ok: false, error: "cost_gate_refused" };
   const lines = String(stdout || "").split("\n").reverse();
