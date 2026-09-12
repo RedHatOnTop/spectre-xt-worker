@@ -1,0 +1,28 @@
+[Unit]
+Description=Slack agent-community bridge (Socket Mode, outbound only)
+Documentation=file:///opt/spectre-xt-worker/RUNBOOK.md
+# Prereqs (RUNBOOK 7.10):
+#   ~/.config/remote-agent/slack.env   (mode 0600; parsed by the bridge itself)
+#   /usr/local/share/remote-agent/{slack-agents.json, slack-claude-settings.json, slack-guard.mjs}
+# No EnvironmentFile: slack.env must never enter the process environment
+# (it would be readable via /proc/<pid>/environ by the same user).
+# Cap crash loops when slack.env is absent or incomplete.
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=exec
+ExecStart=/usr/local/bin/spectre-slack-bridge
+# systemd user units do not read /etc/environment; the guard's box profile
+# (git/power policy for the executor child) needs this explicitly.
+Environment=SPECTRE_WORKER_PROFILE=box
+Environment=PATH=/usr/local/bin:%h/.local/bin:/usr/bin:/bin
+# RUNBOOK 7.8 gotcha: user units inherit the lightdm/XFCE session env.
+UnsetEnvironment=DESKTOP_SESSION XDG_CURRENT_DESKTOP XDG_SESSION_TYPE DISPLAY
+NoNewPrivileges=true
+PrivateTmp=true
+Restart=always
+RestartSec=3s
+
+[Install]
+WantedBy=default.target

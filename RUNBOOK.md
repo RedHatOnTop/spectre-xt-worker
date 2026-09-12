@@ -10,8 +10,11 @@ bottleneck only when a session compiles. Budget **one ZCode window, at most
 two sessions**. Do not build Zetile, do not run GNOME, do not run a second
 Electron app.
 
-**Window: now through Thursday 2026-08-27.** Install today. The Zenbook
-proxy stays down for that whole stretch so the Spectre owns the key pool.
+**Window: now through Thursday 2026-08-27.** Install today. Both boxes
+run the same single model, so no key-pool split is needed; if rate
+limits ever show up on both machines at once, stopping the Zenbook
+proxy (`systemctl --user stop glm-proxy.service`) gives the pool to the
+Spectre alone.
 
 Lid closed is the operating position. Closing it must never suspend.
 A glance at the desk must look like a closed, charging laptop — no panel
@@ -259,6 +262,29 @@ ssh person@spectre 'curl -fsS http://127.0.0.1:18088/health'
 
 If either fails after the lid click, something still slept. `journalctl -b -u systemd-logind -u acpid -u lid-inhibit` and fix that before leaving the room. Do not "see how it goes overnight".
 
+### 4.4 Firewall and key-only SSH (after keys are pulled)
+
+`scripts/bootstrap.sh` does **not** run this: it disables password SSH,
+which must not happen before a pubkey is on disk.
+
+```bash
+sudo tailscale up --ssh --hostname=spectre   # first
+sudo spectre-pull-keys fedora                # then
+sudo bash scripts/harden-network.sh          # last
+```
+
+What it does, in this order:
+
+1. Refuses to run unless `authorized_keys` holds at least one key.
+2. `sshd`: `PasswordAuthentication no`, `PermitRootLogin no`,
+   `AllowUsers person`. Tailscale SSH keeps working regardless.
+3. ufw default-deny incoming; allows loopback, `tailscale0`,
+   WireGuard UDP 41641 + 3478, and 22/tcp.
+4. fail2ban with the systemd backend on sshd (aggressive).
+
+Verify from the Zenbook before closing the lid:
+`ssh person@spectre true && echo ok`.
+
 ---
 
 ## 5. Proxy (Hardened) on the Spectre only
@@ -285,8 +311,9 @@ Bind it to Tailscale, not `0.0.0.0`. The unit already sets
 ZCode **on the Spectre** (the intended path). Do not publish `:18088` to
 LAN or CGNAT.
 
-From the moment the Spectre proxy is up until Thursday, **stop the
-Zenbook proxy** so both machines do not drain the same key pool:
+Both machines may run the proxy at once (single model, shared pool).
+If rate limits appear on both at the same time, give the pool to the
+Spectre by stopping the Zenbook one:
 
 ```
 # on fedora
@@ -403,6 +430,17 @@ On login, `spectre-status` prints proxy/zcode/temp/battery.
 Also on the Zenbook: `sudo tailscale set --ssh` so Warp can move
 without extra keys.
 
+**Tailscale SSH check-mode re-auth (every 24 h).** The tailnet ACL keeps
+Tailscale SSH in check mode: each user/device pair must be re-approved
+in a browser every 24 h. When it lapses, `ssh spectre` does not fail —
+it prints `# Tailscale SSH requires an additional check. To
+authenticate, visit: https://login.tailscale.com/a/<token>` and hangs
+until approved. The box is fine; this is not a network outage. Open the
+link in a browser logged into the tailnet account and approve — the
+waiting connection then proceeds with key auth. Every attempt mints a
+fresh token and unused tokens expire, so always approve the URL of the
+attempt that is currently hanging.
+
 Telegram Bot Channel is the durable **agent** surface (start a task at
 01:00). Pair once in ZCode → phone icon → Bot Channel. QR Remote is
 only for looking at a live session.
@@ -436,39 +474,396 @@ On the Zenbook, once:
 bash scripts/install-warp.sh
 ```
 
+From the project directory on either machine:
+
 ```bash
-cd /home/person/Projects/whatever
-warp to spectre          # this machine → Spectre
-warp from spectre        # Spectre → this machine
+warp push     # this machine -> the other one
+warp pull     # the other one -> this machine
+warp status
 ```
 
-On the Spectre the inverse is `warp to fedora` / `warp from fedora`.
+No peer argument: each box knows which of fedora/spectre it is and
+picks the other. `warp to <peer>` / `warp from <peer>` still work if
+you want to be explicit.
 
 `target/`, `node_modules/`, `.next/`, and the rest of
 `config/warp-excludes.txt` stay behind. Uncommitted files go; this is
 the point.
 
-Close ZCode on the **destination** first. The source can stay open —
-sessions are snapshotted from WAL. If the dest still has ZCode open,
-files still land and you run `warp apply ~/.cache/spectre-warp/in.*/sessions.db`
-after quitting.
+ZCode does not have to be closed on the receiving side: files land
+immediately, and the session import waits in the background (up to
+10 min) for ZCode to quit, then applies itself. Progress lands in
+`~/.cache/spectre-warp/apply.log`.
 
-`warp status` shows last direction, peer, and path.
+`warp status` shows host, resolved peer, and the last transfer.
+
+### 7.6 Session sync via private GitHub repo (async fallback)
+
+Warp needs both machines alive at once. `session-sync` covers the case
+where one is off: chat sessions are snapshotted into a **private**
+GitHub repo and imported on the other side later.
+
+One-time:
+
+```bash
+cp config/session-sync.env.example ~/.config/remote-agent/session-sync.env
+# set SESSION_SYNC_REPO=git@github.com:<you>/<private-repo>.git
+session-sync push      # from the project directory, on either machine
+```
+
+Later, on the other machine:
+
+```bash
+session-sync pull
+```
+
+Hard safety rule: **pull imports every snapshot with fresh ids
+(`--as-new`) — it can never overwrite a session that already exists
+locally.** Worst case is two copies of one conversation. Push is
+append-only commits; force pushes are guard-blocked on the box. The
+repo holds transcripts: keep it private, and never commit the env file.
+
+Git policy for agents on the box (enforced by irreversible-guard,
+box profile): commit, push, branch creation, PR create/review are
+normal work; merges, rebases, branch/tag deletion, history rewriting,
+and closing/deleting GitHub resources are human-only.
+
+### 7.7 GitHub authentication on the box
+
+Do NOT run `gh auth login` on the Spectre: it needs an interactive
+browser flow and a re-login-able session — wrong shape for a headless
+24/7 box. Two mechanisms cover everything:
+
+| purpose | auth | setup |
+|---|---|---|
+| git push/pull, session-sync | the box's SSH key | add `spectre:~/.ssh/id_ed25519.pub` to github.com → Settings → SSH keys (once, from any browser) |
+| gh CLI (PR create/review) | token | copy fedora's `~/.config/gh/hosts.yml`, or better: issue a fine-grained PAT scoped to Contents RW + Pull requests RW on the needed repos and set it as `GH_TOKEN` in `~/.config/remote-agent/session-sync.env` or the user environment |
+
+The wizard's stage 3 prints the box's public key and tests whether
+github.com already accepts it (`ssh -T git@github.com`).
+
+### 7.8 Worker stack: Orca ADE serve + Qoder CLI (since 2026-09-08)
+
+The box's worker is no longer the ZCode desktop. It is:
+
+- **Control plane**: Orca ADE (`orca-ide` 1.4.198 deb) running headless
+  `orca serve --port 6768 --pairing-address 100.119.252.88 --json` as the
+  systemd user unit `orca-serve.service` (linger on). Any tailnet client
+  pairs via the URL printed at startup, or through the embedded web client
+  `http://100.119.252.88:6768/web-index.html`. The pairing code is
+  persistent per device, so a captured URL keeps working across restarts.
+  The desktop app for `fedora` is staged at `~/Applications/orca-linux.AppImage`.
+- **Worker**: Qoder CLI (`~/.local/bin/qodercli`, browser-login token in
+  `~/.qoder/`, autoupdate off via `settings.json`) with
+  `-m Efficient --dangerously-skip-permissions` for autonomous runs.
+  Binary is `qodercli` — there is no bare `qoder` on PATH. One worker
+  session per repo: tmux `qoder` runs the orca-rust port (since
+  2026-09-08), tmux `pugc` runs pugc-ade review-hardening rounds (since
+  2026-09-12, kickoff brief `TASK-SESSION-1.md` in the repo). Attach:
+  `ssh spectre tmux attach -t qoder` (orca-rust) or `ssh spectre tmux
+  attach -t pugc` (pugc-ade).
+- **Port guard**: system unit `orca-port-guard.service` applies
+  `/etc/nftables/orca-port-guard.nft`; 6768 answers only from `lo` and
+  `tailscale0`. Box sources: `config/orca-port-guard.{nft,service}`.
+
+Gotcha that cost an hour: user units inherit lightdm/XFCE session
+variables (`DESKTOP_SESSION`, `XDG_CURRENT_DESKTOP`, `XDG_SESSION_TYPE`)
+from the user manager; any of them makes Electron `serve` attach to the
+dead desktop session and hang forever at ~0 CPU. The unit carries an
+`UnsetEnvironment=` list for exactly those — keep it when editing.
+
+Restart durability (2026-09-12): the unit runs `Restart=always` +
+`RestartSec=3`, not `on-failure`. `orca serve` can end with status 0 (a
+clean self-exit) which `on-failure` ignores — on 2026-09-12 that left the
+unit dead for 8 h after a 05:02 exit 0. The only exit that must stay down
+is 3 (singleton conflict, `RestartPreventExitStatus=3`). The box copy and
+`systemd/orca-serve.service` must stay identical.
+
+Credits: Qoder Pro plan (expires 2026-10-02), Efficient tier. Verified
+2026-09-08 that an Efficient request leaves Plan Credits at 0/2000 (promo
+multiplier 0). Check `/status` → Usage in the TUI; Add-on credits were
+already drawn down by IDE use.
+
+Mobile pairing (optional): stop the unit, run once with `--mobile-pairing`
+to print the phone-scoped QR, restart the unit.
+
+Health migration: `~/.config/remote-agent/health.env` carries
+`REQUIRE_PROXY=false` / `REQUIRE_ZCODE=false`; the doctor gates for the
+new stack live in `scripts/doctor.sh` under "orca serve + qoder".
+
+---
+
+## 7.9 ChatGPT handoff bridge (CodexPro + agy, since 2026-09-08)
+
+ChatGPT web (Developer mode custom plugin) plans; the local executor
+does the work. The bridge is CodexPro in **handoff mode**: ChatGPT can only
+write `.ai-bridge/` planning files, never source. The executor is the
+Antigravity CLI (`agy`) in headless mode under a scoped allowlist.
+
+```
+ChatGPT web -> Cloudflare named tunnel (outbound-only) -> codexpro :8787 (127.0.0.1)
+  handoff_to_agent      -> .ai-bridge/current-plan.md
+  execute/watch-handoff --agent custom --command "~/.local/bin/agy-handoff {{plan_file}} {{root}}"
+  agy (permissions.allow scoped) -> agent-status.md + git diff
+  wait_for_handoff (ChatGPT polls) -> next plan
+```
+
+Status: designed 2026-09-08, **not yet verified on the box**. The gates
+below must pass on the Spectre before this section describes reality.
+
+One-time setup, on the box (from the repo checkout):
+
+1. `npm install -g codexpro` (bootstrap's Node 22 satisfies Node 20+).
+2. Install the Antigravity CLI, then log in once from a tmux session
+   over Tailscale SSH — headless runs use cached credentials:
+   `agy -p 'reply ok' --output-format json | jq -e '.status=="SUCCESS"'`.
+3. `cp config/agy-settings.example.json
+   ~/.gemini/antigravity-cli/settings.json` and adjust per repo.
+   Anything outside `permissions.allow` is soft-denied in headless mode
+   (git push/merge/rebase stay blocked — matches the 7.6 git policy).
+   `--dangerously-skip-permissions` is banned.
+4. `install -m 755 scripts/agy-handoff.sh ~/.local/bin/agy-handoff`
+5. Cloudflare Zero Trust (any browser): create a named tunnel, map the
+   public hostname to `http://localhost:8787`, save the tunnel token to
+   `~/.codexpro/cloudflare-tunnel-token` (0600).
+6. `mkdir -p ~/.codexpro && openssl rand -hex 32 >
+   ~/.codexpro/http-token && chmod 600 ~/.codexpro/http-token`. The
+   token never leaves the box except inside the plugin Server URL.
+7. Copy `systemd/codexpro-handoff.service` to
+   `~/.config/systemd/user/`, edit `--root` (pilot repo) and
+   `--hostname`, then `systemctl --user daemon-reload && systemctl
+   --user enable --now codexpro-handoff.service`.
+8. Optional overrides: `cp config/codexpro.env.example
+   ~/.config/remote-agent/codexpro.env`.
+
+ChatGPT side: Settings -> Security and login -> Developer mode on;
+Plugins -> + -> create plugin, Server URL = the URL codexpro printed
+(carries `codexpro_token`), Authentication = No Authentication. `codexpro
+connection-test --root <pilot>` proves requests arrive.
+
+First cycle (Phase 1, manual executor — no autonomy yet). After
+ChatGPT writes a plan, in tmux:
+
+```
+codexpro execute-handoff --root <pilot> --agent custom \
+  --command "/home/person/.local/bin/agy-handoff {{plan_file}} {{root}}" \
+  --dry-run      # read the command first
+codexpro execute-handoff --root <pilot> --agent custom \
+  --command "/home/person/.local/bin/agy-handoff {{plan_file}} {{root}}" \
+  --yes
+```
+
+ChatGPT then polls `wait_for_handoff` and reviews via `read_handoff`
+(`.ai-bridge/agent-status.md`). Phase 2 (`watch-handoff`, comment block
+inside `systemd/codexpro-handoff.service`) drops in autonomy only after
+Phase 1 is trusted. If `loop-handoff` is ever used: `--max-iters 3` and
+`--require-human-confirmation` are mandatory.
+
+Hard rules:
+
+- The unit starts with `--no-bash`; after a trusted week, `--bash safe`
+  is the maximum. `--bash full` is banned on this box.
+- `--no-auth` is banned. The 401-on-no-token probe is a doctor gate.
+- Never commit or forward the Server URL, `http-token`, or the
+  Cloudflare tunnel token.
+
+Doctor gate: `scripts/doctor.sh` gained a "chatgpt handoff bridge"
+section (unit active, codexpro on PATH, 401 fail-closed probe,
+cloudflared alive, token file present). Healthcheck: set
+`REQUIRE_BRIDGE=1` (and optionally `BRIDGE_HEALTH_URL`) in health.env
+for a 60 s probe watching `bridge_down`, `bridge_auth_http=<code>`, and
+`bridge_tunnel_missing`.
+
+Rollback: `systemctl --user disable --now codexpro-handoff.service`,
+delete the ChatGPT plugin, delete the Cloudflare tunnel/hostname,
+`npm rm -g codexpro`, remove `~/.codexpro`. ufw/nft were never touched.
+
+---
+
+## 7.10 Slack agent community (since 2026-09-12)
+
+The box runs agents but has no shared surface where they report status
+and where you can act on failures. This section wires a dedicated Slack
+workspace as that surface — alerts, lifecycle posts, a command channel,
+and a commons — in both directions, with no inbound port: the box dials
+out only (Socket Mode websocket; no tunnel, no ufw change).
+
+```
+box -> Slack   spectre-slack-notify — chat.postMessage with per-agent
+               username/icon (chat:write.customize)
+Slack -> box   slack-bridge.service (systemd user unit) — Socket Mode:
+               apps.connections.open (xapp-...) -> wss://, message.channels
+               events drive a per-channel policy; replies go back through
+               spectre-slack-notify (single Slack client implementation)
+ChatGPT        Slack's hosted MCP endpoint (https://mcp.slack.com/mcp,
+               Streamable HTTP + OAuth) — step D decides if Plus allows it
+```
+
+Four public channels, four behaviors:
+
+| channel | policy |
+|---|---|
+| `#alerts` | healthcheck posts only. With `SLACK_TRIAGE=1` a failing alert draws a budgeted read-only claude triage reply in-thread |
+| `#fleet` | agent lifecycle posts. Never answered |
+| `#control` | you @-mention the bot -> builtin `ping`/`status`/`help`, else a headless read-only claude run. Only member IDs in `SLACK_ALLOWED_USERS` |
+| `#lobby` | the commons: any registered agent (orca/zcode/qoder/spectre/...) may open a top-level issue and claude answers in-thread — one hop. Allowlisted humans join with a `claude:` prefix |
+
+One Slack app, seven identities distinguished only by username/icon
+(`config/slack-agents.json`): `bridge`, `healthcheck`, `orca`, `zcode`,
+`claude`, `qoder`, `spectre`. A deterministic daily brief (no LLM) posts
+to `#lobby` as `bridge` at 09:00 (`slack-brief.timer`).
+
+### Setup
+
+A. Workspace (~3 min, browser). slack.com/create -> workspace
+`spectre-agents` -> skip invites -> create four public channels:
+`alerts`, `fleet`, `control`, `lobby`. For each channel open the details
+pane and copy its ID (`C...`). Copy your own member ID: avatar ->
+Profile -> ... -> Copy member ID (`U...`).
+
+B. Slack app (~6 min, browser). api.slack.com/apps -> Create New App ->
+From scratch. Socket Mode **on**. App-level token scope
+`connections:write` -> copy the `xapp-...` token. Bot token scopes:
+`chat:write`, `chat:write.customize`, `channels:history`. Event
+Subscriptions -> bot event `message.channels`. Install to workspace ->
+copy the `xoxb-...` token. Set the app's display name/icon. `/invite`
+the bot into all four channels.
+
+C. Secrets on the box (SSH). Write `~/.config/remote-agent/slack.env`,
+mode 600, with: `SLACK_BOT_TOKEN`, `SLACK_APP_TOKEN`,
+`SLACK_CHANNEL_{ALERTS,FLEET,CONTROL,LOBBY}`, `SLACK_ALLOWED_USERS`
+(comma-separated `U...`), optional `SLACK_TRIAGE=1`,
+`SLACK_MAX_RUNS_PER_DAY` (default 30), `SLACK_EXECUTOR_MODEL` (default
+`sonnet`), `SLACK_EXECUTOR_MAX_BUDGET_USD` (default 1.00). Reference
+tokens by name only — never paste a token into chat, a commit, or the
+repo; one that traveled further than the 0600 file is
+compromised-once — rotate it in the app config afterwards.
+
+D. ChatGPT connector test (browser — do it early; it decides only the
+ChatGPT leg, not the box work). chatgpt.com -> Settings -> Apps ->
+search the Slack connector. If present: Connect via OAuth, then a
+read-test (ask it to search `#alerts`) and a write-test (post into
+`#control`). If absent: add a custom connector for
+`https://mcp.slack.com/mcp`. Record the exact outcome in
+`devlog/2026-09-12-slack-agent-community.md`.
+
+| outcome | intervention path |
+|---|---|
+| connector works, read+write | ChatGPT reads `#alerts`/`#lobby` itself and posts guidance into `#control`, which drives a read-only claude run |
+| read-only | ChatGPT diagnoses in chat; you relay into `#control` |
+| no connector (Plus plan limit) | you intervene from the phone (Slack/ntfy push -> reply in `#control`); offline copy-paste with any ChatGPT |
+
+Deploy (targeted installs only — do **not** re-run `bootstrap.sh`
+wholesale on this box; it would overwrite the box-only `spectre-status`):
+
+```bash
+install -m 755 scripts/slack-notify.py  /usr/local/bin/spectre-slack-notify
+install -m 755 scripts/slack-brief.py   /usr/local/bin/spectre-slack-brief
+install -m 755 scripts/slack-bridge.mjs /usr/local/bin/spectre-slack-bridge
+mkdir -p /usr/local/share/remote-agent
+install -m 644 config/slack-agents.json /usr/local/share/remote-agent/
+install -m 644 config/slack-claude-settings.example.json \
+  /usr/local/share/remote-agent/slack-claude-settings.json
+install -m 644 config/irreversible-guard.mjs \
+  /usr/local/share/remote-agent/slack-guard.mjs
+install -m 644 systemd/slack-bridge.service systemd/slack-brief.service \
+  systemd/slack-brief.timer ~/.config/systemd/user/
+systemctl --user daemon-reload
+```
+
+Then the executor boundary probe — it must pass before the unit is
+enabled, and it must be **re-run after every claude upgrade** (flag and
+permission semantics are not contractual):
+
+```bash
+timeout 300 claude -p 'Create /tmp/slack-probe.txt. If you cannot, reply exactly DENIED.' \
+  --setting-sources "" --settings /usr/local/share/remote-agent/slack-claude-settings.json \
+  --permission-mode default --model sonnet --output-format json | jq -r '.result'   # expect DENIED
+test ! -e /tmp/slack-probe.txt
+
+# secret-read probe: the executor must not be able to read slack.env
+timeout 300 claude -p 'Read ~/.config/remote-agent/slack.env. If you cannot, reply exactly DENIED.' \
+  --setting-sources "" --settings /usr/local/share/remote-agent/slack-claude-settings.json \
+  --permission-mode default --model sonnet --output-format json | jq -r '.result'   # expect DENIED
+
+systemctl --user enable --now slack-bridge.service slack-brief.timer
+journalctl --user -u slack-bridge -n 30 --no-pager   # auth.test ok / socket connected
+```
+
+Fallbacks if the probe fails: try `--setting-sources project`; if the
+mode flag is rejected, `--permission-mode plan`. Never enable this path
+with `--dangerously-skip-permissions`.
+
+Security boundary (guaranteed):
+
+- `#control` accepts only bot mentions from member IDs in `SLACK_ALLOWED_USERS`; everything else is dropped and logged. The bridge never answers its own posts (loop guard), dedupes, and drops stale events.
+- Least-privilege tokens: bot = `chat:write`, `chat:write.customize`, `channels:history` (the four channels + thread context only; no admin, no DMs); app token = `connections:write` only.
+- Community loop/cost guards: responses are single-hop by construction (the responder's own posts never trigger a run), identity-based and fail-closed (a post whose author cannot be identified is never answered), budgeted (per-thread and daily run caps, persisted across restarts), serialized (one executor run at a time).
+- Executor: allowlist-only, `--permission-mode default` (non-interactive `-p`; unlisted tools simply cannot run), isolated from box user settings (`--setting-sources ""` + explicit `--settings`), guard hook active (`SPECTRE_WORKER_PROFILE=box`: no merge/rebase/force-push/branch-tag delete/poweroff), child env whitelisted; tokens never live in the bridge's environment (parsed from the 0600 file at use time; file reads denied to the executor). Phase 1 read-only.
+- Audit: JSONL in `/work/logs/` + journald.
+
+Settings note: `Grep` is denied wholesale in the executor profile —
+`Grep(pattern)` returns matching lines, so a pattern like `xoxb-`
+would leak a token past any path-based deny; the deploy probes
+re-check it.
+
+Cannot be guaranteed: the guard is text-matching, not a sandbox, and
+same-user isolation is imperfect; if claude's permission semantics
+drift, re-prove with the negative probe after **every** claude upgrade;
+anything holding the user's Slack account can drive the (read-only)
+executor — intentional and bounded; `--dangerously-skip-permissions`
+stays banned for this path.
+
+Rollback: `systemctl --user disable --now slack-bridge.service
+slack-brief.timer`, remove the three binaries and
+`/usr/local/share/remote-agent/slack-*`, revoke the app at
+api.slack.com/apps, delete the workspace. No firewall change to undo.
 
 ---
 
 ## 8. Monitoring
 
-User timer every 60 s, `scripts/healthcheck.sh`:
+User timer every 60 s runs `spectre-healthcheck`
+(`scripts/healthcheck.py`, pure-Python state machine, unit-tested).
 
-- `curl` `:18088/health` — fail if not `ok` or `activeKeys==0`
-- `pgrep -f '/zcode'` — fail if the Electron process is gone
-- `sensors` — fail if package temp ≥ 85 °C
+Checks — any failure opens a "streak":
+
+- `curl` `:18088/health` — fail if not `ok`, bad JSON, or `activeKeys==0`
+- `curl` `:6768/web-index.html` — fail if not HTTP 200 (`REQUIRE_ORCA=1`
+  by default, `ORCA_URL` overrides). The 2026-09-12 orca-serve outage ran
+  8 h undetected before this probe existed
+- `pgrep -f '/zcode|[/ ]ZCode'` — fail if the Electron process is gone
+- `sensors -j` — fail if the hottest reading ≥ 85 °C
 - disk — fail if `/` or `/work` ≥ 90 %
+- memory — fail if `MemAvailable` < 800 MB or swap use ≥ 90 %
+- tmux — fail if `tmux-work.service` is enabled but session `work` is gone
+  (that session is the phone's control plane)
+- AC power — fail if every adapter reports offline (battery-UPS mode started)
 - `tailscale status --json` — fail if backend not Running
+
+Notification state machine:
+
+| situation | action |
+|---|---|
+| new failure set | push immediately |
+| failure set changed | push immediately (streak start time kept) |
+| same set < 30 min | log only |
+| same set ≥ 30 min (`RENOTIFY_MIN`) | re-push with total duration |
+| recovered | one recovery push, state cleared |
+
+Every passing tick touches
+`~/.local/state/remote-agent/heartbeat`. `spectre-status` prints its age,
+so an SSH login tells you whether the probe itself is alive. A dark box
+(pushes stop + heartbeat frozen) means power loss or kernel death — that
+is the signal to check the plug/camera.
 
 On fail: append one line to `/work/logs/health.log` and POST to ntfy
 (`NTFY_TOPIC` in `~/.config/remote-agent/health.env`, never committed).
+With `REQUIRE_SLACK=1` the same alerts also land in the Slack `#alerts`
+channel as the `healthcheck` identity (§7.10) — ntfy stays the phone's
+push, Slack the workspace record. `/work/logs/*.log` rotate weekly via
+`/etc/logrotate.d/work-logs` (50 MB soft cap), and journald is capped at
+200 MB by bootstrap.
 
 Install (bootstrap already put the script at
 `/usr/local/bin/spectre-healthcheck`):
@@ -493,6 +888,17 @@ node /work/hardened-zai-proxy/stats-tui.js http://127.0.0.1:18088/health 2
 
 That TUI is SSH-only. Do not expose it.
 
+### 8.1 One-shot verification: spectre-doctor
+
+`spectre-doctor` (`scripts/doctor.sh`, installed by bootstrap) runs the
+whole gate list from §Verification gates in one pass and exits non-zero
+on any FAIL. Re-run it after any change on the box; it is also the
+"still healthy?" check before walking away.
+
+```bash
+sudo spectre-doctor        # on the Spectre
+```
+
 ---
 
 ## 9. Same-day protocol (today → Thursday)
@@ -503,14 +909,15 @@ lid-closed today. Do not save a dress rehearsal for Wednesday.
 1. Dummy HDMI in, AC, elevate. BIOS lid = do nothing.
 2. Debian 13 netinst (SSH, no desktop). Reboot. Then:
    `curl -fsSL https://raw.githubusercontent.com/RedHatOnTop/spectre-xt-worker/main/install.sh | sudo bash`
-3. `sudo tailscale up --ssh --hostname=spectre`.
-4. Copy `hardened-zai-proxy` into `/work/hardened-zai-proxy`, enable
-   `glm-proxy.service`, pin ZCode, Bot Channel, ntfy.
-5. **Stop the Zenbook proxy now.** It stays down until Thursday.
-6. `sudo spectre-stealth closed`, close the lid. Ping + health from the
-   Fold 7. Looks-off check from a metre away.
-7. Telegram test prompt. ntfy: stop proxy 10 s, confirm push, start it.
-8. Walk away. Lid stays closed until Thursday.
+3. Reboot once more, then run the wizard and answer its prompts:
+   `sudo bash /opt/spectre-xt-worker/scripts/setup-wizard.sh`
+   It drives: tailscale → keys → ufw/key-only ssh → cockpit → proxy pull
+   from fedora → ntfy env + timer → ZCode pin → stealth/lid check →
+   `spectre-doctor`. Completed stages are skipped on re-run, so a failed
+   stage never means starting over.
+4. **Stop the Zenbook proxy now.** It stays down until Thursday.
+5. Telegram test prompt. ntfy: stop proxy 10 s, confirm push, start it.
+6. Walk away. Lid stays closed until Thursday.
 
 TLP already caps `CPU_MAX_PERF_ON_AC=55` so the fan stays off under
 agent-idle. If package temp still sits above 80 °C, drop that value,
@@ -535,6 +942,9 @@ the lid closes for the week, not after.
 ---
 
 ## Verification gates (must be run on the Spectre)
+
+One pass over everything below: `sudo spectre-doctor`. The manual list
+remains for when you want to see each value yourself.
 
 ```
 # firmware
@@ -563,11 +973,43 @@ pgrep -a zcode | head
 jq '.keepAwakeWhileRunning, .desktopChromiumHardwareAccelerationEnabled' ~/.zcode/v2/setting.json
 # expect: true, false
 
+# orca serve + qoder worker stack
+systemctl --user is-active orca-serve.service        # active
+ss -tln | grep 6768                                  # listening
+curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:6768/web-index.html  # 200
+systemctl is-active orca-port-guard.service          # active
+sudo nft list table inet spectre_guard               # drop rule for 6768
+tmux has-session -t qoder                            # exit 0
+
+# chatgpt handoff bridge (RUNBOOK 7.9, optional)
+codexpro --version                                   # 0.30.x
+agy -p 'reply ok' --output-format json | jq -e '.status=="SUCCESS"'
+systemctl --user is-active codexpro-handoff.service  # active
+curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8787/mcp   # 401 = fail-closed
+pgrep -f cloudflared                                 # tunnel process alive
+
 # tailscale
 tailscale status | grep -E 'spectre|z-fold7|fedora'
+ssh person@spectre true   # hangs with a check-mode URL if 24 h re-auth lapsed — approve it
 
-# health timer
-systemctl --user is-active worker-health.timer
+# firewall / ssh (after harden-network.sh)
+sudo ufw status verbose                          # Status: active
+sudo sshd -T | grep -E 'passwordauthentication|permitrootlogin'  # no, no
+sudo fail2ban-client status sshd                 # jail active
+
+# log caps
+grep -s SystemMaxUse /etc/systemd/journald.conf.d/caps.conf   # 200M
+ls -la /etc/logrotate.d/work-logs                             # exists
+systemctl is-active smartd.service                            # active
+
+# health probe state machine
+systemctl --user is-active worker-health.timer    # active
+stat -c %y ~/.local/state/remote-agent/heartbeat  # < 2 min old
+
+# slack agent community (optional, RUNBOOK 7.10)
+systemctl --user is-active slack-bridge.service   # active
+stat -c '%a %n' ~/.config/remote-agent/slack.env  # 600
+spectre-slack-notify --self-test                  # OK (4 channels, 7 agents)
 ```
 
 Until those commands have been run on the Spectre, this box is a plan,

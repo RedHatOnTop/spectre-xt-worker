@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Spectre worker health probe.
 
-Runs every 60s from a user timer. Checks proxy, ZCode, temperature, disk,
-memory, tmux control session, AC power, and Tailscale. Failures go to
-/work/logs/health.log and ntfy; this process always exits 0 so the timer
-never accumulates failed units.
+Runs every 60s from a user timer. Checks proxy, orca serve, ZCode,
+temperature, disk, memory, tmux control session, AC power, and Tailscale.
+Failures go to /work/logs/health.log, ntfy, and Slack (independent backends);
+this process always exits 0 so the timer never accumulates failed units.
 
 Notification state machine (pure functions, unit-tested):
 - new failure set        -> notify immediately
@@ -40,6 +40,8 @@ DEFAULT_DISK_FAIL_PCT = 90
 DEFAULT_MEM_FLOOR_MB = 800
 DEFAULT_SWAP_FAIL_PCT = 90
 DEFAULT_RENOTIFY_MIN = 30
+DEFAULT_BRIDGE_URL = "http://127.0.0.1:8787/mcp"
+DEFAULT_ORCA_URL = "http://127.0.0.1:6768/web-index.html"
 
 
 def _flag(environ: dict[str, str], key: str, *, default: bool) -> bool:
@@ -62,6 +64,11 @@ class Config:
     require_proxy: bool
     require_zcode: bool
     require_claude: bool
+    require_bridge: bool
+    bridge_health_url: str
+    orca_url: str
+    require_orca: bool
+    require_slack: bool
 
 
 def load_env_file(path: Path) -> dict[str, str]:
@@ -98,6 +105,11 @@ def config_from_env(environ: dict[str, str]) -> Config:
         require_proxy=_flag(environ, "REQUIRE_PROXY", default=True),
         require_zcode=_flag(environ, "REQUIRE_ZCODE", default=True),
         require_claude=_flag(environ, "REQUIRE_CLAUDE", default=False),
+        require_bridge=_flag(environ, "REQUIRE_BRIDGE", default=False),
+        bridge_health_url=get("BRIDGE_HEALTH_URL", DEFAULT_BRIDGE_URL),
+        orca_url=get("ORCA_URL", DEFAULT_ORCA_URL),
+        require_orca=_flag(environ, "REQUIRE_ORCA", default=True),
+        require_slack=_flag(environ, "REQUIRE_SLACK", default=False),
     )
 
 
@@ -145,9 +157,59 @@ def probe_zcode() -> str | None:
     return None if out else "zcode_missing"
 
 
+def _orca_reason(http_code: str) -> str | None:
+    if not http_code:
+        return "orca_down"
+    if http_code != "200":
+        return f"orca_http={http_code}"
+    return None
+
+
+def probe_orca(url: str) -> str | None:
+    code = run(
+        [
+            "curl", "-s", "-o", "/dev/null", "-w", "%{http_code}",
+            "--max-time", "5", url,
+        ]
+    )
+    return _orca_reason(code)
+
+
+def probe_slack() -> str | None:
+    """Shape-check the Slack wiring (no network): self-test must end in OK."""
+    out = run(["spectre-slack-notify", "--self-test"])
+    if not out:
+        return "slack_notify_unavailable"
+    if out.splitlines()[-1].startswith("OK"):
+        return None
+    return "slack_self_test_failed"
+
+
 def probe_claude() -> str | None:
     out = run(["pgrep", "-f", r"/usr/local/bin/claude|/usr/bin/claude"])
     return None if out else "claude_missing"
+
+
+def probe_bridge(url: str) -> str | None:
+    """The local MCP endpoint must answer 401 with no token (fail-closed)."""
+    code = run(
+        [
+            "curl", "-s", "-o", "/dev/null", "-w", "%{http_code}",
+            "--max-time", "5", url,
+        ]
+    )
+    if not code:
+        return "bridge_down"
+    if code != "401":
+        return f"bridge_auth_http={code}"
+    return None
+
+
+def probe_bridge_tunnel() -> str | None:
+    # (^|[/\ ]) covers bare argv[0] (PATH install), absolute paths, and
+    # `sh -c cloudflared` wrappers alike.
+    out = run(["pgrep", "-f", r"(^|[/\ ])cloudflared"])
+    return None if out else "bridge_tunnel_missing"
 
 
 def probe_temp(limit_c: float) -> str | None:
@@ -287,10 +349,17 @@ def collect_failures(cfg: Config) -> list[str]:
     probes: list[str | None] = []
     if cfg.require_proxy:
         probes.append(probe_proxy(cfg.proxy_url))
+    if cfg.require_orca:
+        probes.append(probe_orca(cfg.orca_url))
     if cfg.require_zcode:
         probes.append(probe_zcode())
     if cfg.require_claude:
         probes.append(probe_claude())
+    if cfg.require_slack:
+        probes.append(probe_slack())
+    if cfg.require_bridge:
+        probes.append(probe_bridge(cfg.bridge_health_url))
+        probes.append(probe_bridge_tunnel())
     probes.extend(
         (
             probe_temp(cfg.temp_fail_c),
@@ -409,6 +478,26 @@ def send_ntfy(cfg: Config, body: str, *, recovery: bool = False) -> None:
         append_log(f"NOTIFY_FAILED topic={cfg.ntfy_topic}")
 
 
+def slack_notify_args(body: str, *, recovery: bool = False) -> list[str]:
+    args = [
+        "spectre-slack-notify",
+        "--agent", "healthcheck",
+        "--channel", "alerts",
+        f"--text={body}",
+    ]
+    if recovery:
+        args.append("--recovery")
+    return args
+
+
+def send_slack(cfg: Config, body: str, *, recovery: bool = False) -> None:
+    """Independent Slack backend; the notifier prints 'disabled' and exits 0
+    when slack.env is absent, so this is a no-op before setup."""
+    out = run(slack_notify_args(body, recovery=recovery), timeout=15.0)
+    if not out:
+        append_log("SLACK_NOTIFY_FAILED")
+
+
 def load_state() -> State:
     raw = _read_file(STATE_FILE)
     if not raw:
@@ -474,6 +563,7 @@ def main() -> int:
     body = message_for(action, next_state, now)
     append_log(f"{action.upper()} {body}")
     send_ntfy(cfg, body, recovery=(action == "notify_recover"))
+    send_slack(cfg, body, recovery=(action == "notify_recover"))
     save_state(next_state)
     return 0
 

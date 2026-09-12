@@ -5,6 +5,7 @@ from __future__ import annotations
 import sys
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
@@ -57,6 +58,18 @@ class DecideTest(unittest.TestCase):
         now = 1400
         action, nxt = healthcheck.decide(
             ["proxy_down", "ac_offline"], prev, now=now, renotify_min=30
+        )
+        self.assertEqual(action, "notify_new")
+        self.assertEqual(nxt.since, 1000)
+        self.assertEqual(nxt.count, 2)
+
+    def test_bridge_failure_flap_notifies_on_change(self) -> None:
+        _, st = healthcheck.decide(
+            ["bridge_down"], healthcheck.EMPTY_STATE, now=1000, renotify_min=30
+        )
+        self.assertEqual(st.bits, frozenset({"bridge_down"}))
+        action, nxt = healthcheck.decide(
+            ["bridge_auth_http=200"], st, now=1100, renotify_min=30
         )
         self.assertEqual(action, "notify_new")
         self.assertEqual(nxt.since, 1000)
@@ -131,6 +144,59 @@ class TempExtractTest(unittest.TestCase):
         self.assertEqual(sorted(temps), [44.25, 45.5, 47.0])
 
 
+class OrcaProbeTest(unittest.TestCase):
+    def test_failure_mapping(self) -> None:
+        self.assertEqual(healthcheck._orca_reason(""), "orca_down")
+        self.assertEqual(healthcheck._orca_reason("502"), "orca_http=502")
+        self.assertIsNone(healthcheck._orca_reason("200"))
+
+    def test_collect_failures_gates_orca_on_require_flag(self) -> None:
+        off = healthcheck.config_from_env(
+            {"REQUIRE_PROXY": "0", "REQUIRE_ZCODE": "0", "REQUIRE_ORCA": "0"}
+        )
+        on = healthcheck.config_from_env(
+            {"REQUIRE_PROXY": "0", "REQUIRE_ZCODE": "0", "REQUIRE_ORCA": "1"}
+        )
+        with mock.patch.object(healthcheck, "probe_orca", return_value="orca_down"), \
+                mock.patch.object(healthcheck, "probe_temp", return_value=None), \
+                mock.patch.object(healthcheck, "probe_memory", return_value=None), \
+                mock.patch.object(healthcheck, "probe_tmux", return_value=None), \
+                mock.patch.object(healthcheck, "probe_ac", return_value=None), \
+                mock.patch.object(healthcheck, "probe_tailscale", return_value=None), \
+                mock.patch.object(healthcheck, "probe_disks", return_value=[]):
+            self.assertEqual(healthcheck.collect_failures(off), [])
+            self.assertEqual(healthcheck.collect_failures(on), ["orca_down"])
+
+
+class SlackBackendTest(unittest.TestCase):
+    def test_args_shape(self) -> None:
+        args = healthcheck.slack_notify_args("proxy_down")
+        self.assertEqual(args[0], "spectre-slack-notify")
+        self.assertEqual(args[args.index("--agent") + 1], "healthcheck")
+        self.assertEqual(args[args.index("--channel") + 1], "alerts")
+        self.assertIn("--text=proxy_down", args)
+        self.assertNotIn("--recovery", args)
+
+    def test_recovery_flag_included(self) -> None:
+        args = healthcheck.slack_notify_args("recovered", recovery=True)
+        self.assertIn("--recovery", args)
+        self.assertIn("--text=recovered", args)
+
+    def test_send_slack_logs_failure_on_empty_output(self) -> None:
+        cfg = healthcheck.config_from_env({})
+        with mock.patch.object(healthcheck, "run", return_value=""), \
+                mock.patch.object(healthcheck, "append_log") as log:
+            healthcheck.send_slack(cfg, "proxy_down")
+        log.assert_called_once_with("SLACK_NOTIFY_FAILED")
+
+    def test_send_slack_silent_when_notifier_answers(self) -> None:
+        cfg = healthcheck.config_from_env({})
+        with mock.patch.object(healthcheck, "run", return_value="slack-notify: disabled"), \
+                mock.patch.object(healthcheck, "append_log") as log:
+            healthcheck.send_slack(cfg, "proxy_down")
+        log.assert_not_called()
+
+
 class ConfigTest(unittest.TestCase):
     def test_env_overrides_and_defaults(self) -> None:
         cfg = healthcheck.config_from_env({})
@@ -139,6 +205,11 @@ class ConfigTest(unittest.TestCase):
         self.assertTrue(cfg.require_proxy)
         self.assertTrue(cfg.require_zcode)
         self.assertFalse(cfg.require_claude)
+        self.assertFalse(cfg.require_bridge)
+        self.assertTrue(cfg.require_orca)
+        self.assertEqual(cfg.orca_url, healthcheck.DEFAULT_ORCA_URL)
+        self.assertFalse(cfg.require_slack)
+        self.assertEqual(cfg.bridge_health_url, healthcheck.DEFAULT_BRIDGE_URL)
         cfg = healthcheck.config_from_env({"RENOTIFY_MIN": "15", "NTFY_TOPIC": "t"})
         self.assertEqual(cfg.renotify_min, 15)
         self.assertEqual(cfg.ntfy_topic, "t")
@@ -161,11 +232,15 @@ class ConfigTest(unittest.TestCase):
                 "REQUIRE_PROXY": "0",
                 "REQUIRE_ZCODE": "false",
                 "REQUIRE_CLAUDE": "yes",
+                "REQUIRE_BRIDGE": "1",
+                "BRIDGE_HEALTH_URL": "http://127.0.0.1:9999/mcp",
             }
         )
         self.assertFalse(cfg.require_proxy)
         self.assertFalse(cfg.require_zcode)
         self.assertTrue(cfg.require_claude)
+        self.assertTrue(cfg.require_bridge)
+        self.assertEqual(cfg.bridge_health_url, "http://127.0.0.1:9999/mcp")
 
 
 if __name__ == "__main__":

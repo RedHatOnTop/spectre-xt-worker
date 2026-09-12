@@ -19,5 +19,13 @@ Desktop, GNOME, and a second Electron app do not belong here.
 - Never commit `env.json`, `.env`, API keys, `credentials.json`, or Tailscale
   auth keys. Reference secrets by name only.
 - Prefer systemd user units over shell loops and `nohup`.
+- Agents announce lifecycle events in Slack `#fleet` and open issue
+  threads in `#lobby` via `spectre-slack-notify` under their own identity
+  (registry: `config/slack-agents.json`; RUNBOOK §7.10). Never post
+  secrets or env values to Slack.
+- `ssh spectre` uses Tailscale SSH in check mode: every 24 h a browser
+  re-approval is needed. When it lapses, ssh hangs after printing a
+  `login.tailscale.com/a/<token>` URL — surface that URL to the user
+  instead of treating it as an outage. Details in `RUNBOOK.md` §7.
 - A change is done only when the verification command in `RUNBOOK.md` was
   actually run on the Spectre (or explicitly marked unverified).

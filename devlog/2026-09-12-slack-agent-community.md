@@ -1,0 +1,116 @@
+# 2026-09-12 — Slack agent community (workspace + bridge + ChatGPT intervention)
+
+## Why
+
+The box runs agents (Orca serve :6768, ZCode, claude CLI) but had no
+shared surface where they report status and where the operator can act.
+Alerting existed but was inert: `send_ntfy` in `scripts/healthcheck.py`
+plus an empty `NTFY_TOPIC` meant today's orca-serve outage ran ~8 h
+undetected. The request: give the agents a Slack "community" — not just
+notifications, but a place where agents share issues and claude works
+them in-thread, watchable — and tie ChatGPT in so the operator can
+intervene when something breaks.
+
+## What was built
+
+Direction is outbound-only from the box (Socket Mode websocket; no
+tunnel, no inbound firewall change).
+
+- `scripts/slack-notify.py` -> `spectre-slack-notify`: stdlib-only CLI,
+  posts via chat.postMessage with per-agent username/icon
+  (`chat:write.customize`). Reads tokens from the 0600 env file at use
+  time — no secret ever sits in a process environment. Unconfigured it
+  prints `slack-notify: disabled` and exits 0; `--self-test` does
+  shape-only checks and never prints token values.
+- `scripts/slack-bridge.mjs` -> `slack-bridge.service` (systemd user
+  unit, `Restart=always`): Socket Mode listener on Node's global
+  WebSocket (zero dependencies). Per-channel policy:
+  `#control` = allowlisted member @mention -> builtin or read-only
+  claude run; `#lobby` = registered agent issue -> claude discussion
+  reply in-thread, single-hop; `#alerts` = healthcheck alert ->
+  optional triage (`SLACK_TRIAGE=1`); `#fleet` = posts only.
+- `scripts/slack-brief.py` -> `spectre-slack-brief` + timer: daily
+  09:00 deterministic brief to `#lobby` (no LLM).
+- `config/slack-agents.json`: 7 identities (bridge, healthcheck, orca,
+  zcode, claude, qoder, spectre).
+- Executor profile `config/slack-claude-settings.example.json`:
+  allowlist (Read/Glob + narrow read-only Bash, no curl; Grep denied
+  wholesale — its pattern semantics against secret files are
+  unverifiable and `Grep(pattern)` returns matching lines, a token
+  leak channel), secret read deny-list (`slack.env`, `health.env`,
+  `env.json`, `http-token`, keys, `/proc/*/environ`,
+  `/work/hardened-zai-proxy/**`), PreToolUse guard hook; phase 1 is
+  read-only.
+- `scripts/healthcheck.py`: new `probe_orca` (default on —
+  `REQUIRE_ORCA=1`) and optional `send_slack` backend alongside ntfy.
+- `scripts/doctor.sh`, `scripts/bootstrap.sh` (fresh installs only),
+  `verify.sh` node section, `.gitignore` (`slack.env`), RUNBOOK §7.10,
+  AGENTS.md rule.
+
+Loop/cost guards: single-hop by construction, fail-closed on unknown
+identity, dedupe by `event_id` + `(channel, ts)`, stale > 300 s
+dropped, rate limit 6/10 min per user, per-thread 4 runs/h + daily cap
+30 (persisted across restarts), one executor run at a time, 300 s
+SIGKILL timeout, `--max-budget-usd`.
+
+## Local verification (fedora, before deploy)
+
+- `bash verify.sh` -> `verify: all gates passed` — shell `bash -n` on
+  all scripts, shellcheck SKIP (not installed on fedora), py_compile,
+  **Ran 50 tests … OK** (unittest), `node --check` + 19 node:test cases
+  (`ok slack bridge tests`).
+- Manual passes: `spectre-slack-notify --dry-run` / `--self-test` /
+  disabled-path / unknown-agent error path; `spectre-slack-brief
+  --dry-run` renders.
+- Adversarial review pass (typescript-reviewer on the bridge,
+  security-reviewer on the whole diff) before commit; fixed what it
+  found: the `#lobby` human path now requires `SLACK_ALLOWED_USERS`
+  (previously any workspace member could burn executor budget), the
+  secret deny-list extensions above, `Grep` denied, hello/connect
+  watchdog (half-open socket no longer sits "active but deaf"),
+  settled-guard on replaced sockets, state-file shape validation,
+  visible rate-limit/budget notices, SIGKILL to the executor's process
+  group, post confirmation required from `spectre-slack-notify`
+  (its disabled exit-0 no longer passes as success), clock-step
+  clamps, `null`-payload guard, bounded stderr tail in failure posts,
+  realpath `isMain`, `%h/.local/bin` on the unit PATH, doctor
+  `claude`-presence check, bootstrap no longer clobbers locally
+  hardened executor settings.
+
+## On-box verification (PENDING — filled at deploy)
+
+- ChatGPT-Plus connector test (step D): _pending_.
+- Executor boundary probe: _pending_ (expect `DENIED`, no
+  `/tmp/slack-probe.txt`).
+- Secret-read probe (`~/.config/remote-agent/slack.env`): _pending_
+  (expect `DENIED`).
+- `auth.test` ok / socket connected / one reconnect cycle: _pending_.
+- orca stop -> Slack alert -> restart clears the streak: _pending_.
+- First `#lobby` agent discussion + first `#alerts` triage thread:
+  _pending_.
+
+## Honest limits
+
+- The guard is text-matching, not a sandbox; same-user isolation is
+  imperfect. If claude's permission semantics drift, the negative probe
+  must be re-run after every claude upgrade.
+- Bot-post event shape (does `message.channels` carry username/subtype
+  for customized posts?) is unverified until the first real post; the
+  policy fails closed if identity is unknown, so it cannot loop — but
+  `#lobby` automation stays silent in that case until fixed.
+- `--setting-sources ""` / `--permission-mode default` semantics are
+  unverified against claude 2.1.236 until the probe passes; the unit
+  stays disabled until then.
+- Anything holding the user's Slack account can drive the read-only
+  executor — intentional and bounded.
+- One executor job at a time on a 2C/4T box; no boot-time services
+  added.
+
+## Follow-ups
+
+Write-enabled executor phase 2, `qodercli` executor, thread->session
+continuity, Slack interactive buttons, multi-hop threads (v1 is
+single-hop — humans continue them), Orca/zcode as autonomous
+responders (interactive apps — they post via the CLI, they do not
+answer), mirroring box-only `qoder-efficient-guard`/`qoder-nudge`
+into the repo.
