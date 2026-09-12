@@ -22,7 +22,12 @@ Environment=PATH=/usr/local/bin:/usr/bin:/bin
 # RUNBOOK 7.8 gotcha: user units inherit the lightdm/XFCE session env.
 UnsetEnvironment=DESKTOP_SESSION XDG_CURRENT_DESKTOP XDG_SESSION_TYPE DISPLAY
 NoNewPrivileges=true
-PrivateTmp=true
+# Do NOT add PrivateTmp=true here: it puts the unit in its own mount
+# namespace, and the cost gate (~/.local/bin/qoder-efficient-guard) then
+# cannot readlink /proc/<pid>/exe of the live qodercli processes (EACCES)
+# — the live-pid scan goes blind, allow-start falls back to a flaky
+# ~11 s --list-models memory scan, and the executor run is refused
+# (exit 75, cost_gate_refused). Bisected on the box 2026-09-12.
 Restart=always
 RestartSec=3s
 

@@ -161,12 +161,87 @@ Deploy was targeted only (bridge/brief/doctor binaries, agents registry,
 - `spectre-doctor` -> `summary: 34 passed, 0 failed`, including the new
   executor gates (`qoder-efficient wrapper present`, `executor settings
   installed`).
-- **Blocked on user action**: the bot is in no channel yet —
-  `error=not_in_channel` on all four. `/invite @spectreagents` in
-  `#alerts`, `#fleet`, `#control`, `#lobby`. Until then no
-  `message.channels` events reach the bridge, so the #lobby discussion,
-  #alerts triage, and #control reply legs stay unverified (PENDING).
-- ChatGPT-Plus connector test (step D): PENDING (user).
+- **Resolved (user, same day):** the bot is invited in all four channels
+  (the `not_in_channel` block is gone), and the ChatGPT connector test
+  works on the user's Plus plan. The connector path (official Slack app
+  connector vs custom `mcp.slack.com` endpoint) is to be recorded on the
+  next check.
+
+### End-to-end verification (2026-09-12, after invite + connector test)
+
+Real threads, real executor runs (guard fast path restored, see the
+PrivateTmp section below):
+
+- **#lobby discussion**: `spectre-slack-notify --agent orca --channel
+  lobby` post -> audit `job_queued/job_start kind=discussion`
+  08:44:54Z, `job_done chars=340` 08:45:41Z. Thread, via
+  `conversations.replies`: `orca` issue -> `bridge` ack
+  (`:hourglass_flowing_sand: qoder is reading the thread`) -> `qoder`
+  reply (340 chars) that actually read the health log: "three memory
+  pressure events today around 02:04-02:12 UTC — mem_avail dropped to
+  778M, then 645M, then 424M…suggests OOM or systemd memory limits".
+  The bridge's own ack/reply were ignored (`lobby_self`) — loop guard
+  holds on live events.
+- **#alerts triage**: `systemctl --user stop orca-serve.service` ->
+  health log `NOTIFY_NEW orca_down` 08:47:00Z -> Slack alert as
+  identity `healthcheck` -> audit `job_queued/job_start kind=triage`
+  08:47:01Z -> `qoder` triage reply in-thread (1290 chars: likely
+  cause, evidence from the log, next actions). The triage's own reply
+  was ignored (`alerts_not_healthcheck`). Two `STILL orca_down` lines
+  in the interim were `log_only` — by design they never post. Orca
+  restarted 08:49:16Z; `NOTIFY_RECOVER recovered` 08:50:10Z posted and
+  was ignored by the bridge (`alerts_recovery`).
+- Triage quality note: the reply misread "health.log stopped updating"
+  as "the checker died" — the log records state changes only, not
+  every run. Fixed with a one-line `BOX_FACTS` addition in the bridge
+  ("records state changes only … silence there does not mean the
+  checker died").
+- **#control**: negative probe (a bot-posted mention) -> audit
+  `ignored reason=control_bot` — the authorization gate is
+  fail-closed. The positive leg (a mention from the user's member ID)
+  still needs the user to type it once.
+- `spectre-slack-brief --dry-run` renders (health green, 24h counts,
+  box block). `sudo spectre-doctor` -> `summary: 35 passed, 0 failed`
+  (all Slack gates PASS: env 600, token shapes, node, wrapper,
+  settings, cost gate, unit active, timer, self-test).
+
+### Cost gate: bridge runs refused (`cost_gate_refused`) — root cause
+
+First live runs failed: audit `job_failed cost_gate_refused`, Slack
+`:warning: qoder run failed (cost_gate_refused)`; guard log for those
+allow-starts showed `status=unknown price_factor=None source=` after
+~11 s, while every other context (ssh, `check` timer, transient
+systemd-run) saw `free source=pid:574580` in <1.5 s. The 11 s = the
+guard's fallback path: spawn `qodercli --list-models` and scan its
+memory for the Efficient blob.
+
+Bisect (transient units reading `/proc/<pid>/exe` of a live qodercli,
+probed on the box):
+
+| unit props | `readlink /proc/<pid>/exe` |
+|---|---|
+| none | OK — `/home/person/.qoder/bin/qodercli/qodercli-1.1.47` |
+| `PrivateTmp=true` | **EACCES** |
+| `NoNewPrivileges=true` | OK |
+| both | EACCES |
+
+`comm`/`cmdline` stayed readable in all cases; only `exe` broke.
+Root cause: `PrivateTmp=true` puts the unit in its own mount
+namespace, and the guard's `_is_our_qodercli()` needs `readlink
+/proc/<pid>/exe` (exe basename must start with `qodercli`). With the
+live-pid scan blind, allow-start depends on the fallback memory scan,
+which is flaky — the bridge's own runs landed on `status=unknown` and
+exit 75.
+
+Fix: `PrivateTmp=true` removed from `systemd/slack-bridge.service`
+(repo + box; a comment in the unit records why it must not come back).
+Verification after redeploy: transient unit with the unit's exact
+props -> `allow-start status=free price_factor=0.0 source=pid:574580`
+in 1.4 s; both live e2e runs above then hit the fast path (`guard
+log: allow-start status=free price_factor=0.0 source=pid:574580`).
+Chose this over patching the guard: the guard is box-only (mirroring
+is out of scope) and its pid scan is the load-bearing check; the
+PrivateTmp was defense-in-depth only.
 
 ### Review round on the executor swap
 
@@ -325,10 +400,18 @@ Fixes deployed the same day:
   That default is what the write and compound-smuggling probes
   re-check. Anything that widens the allowlist or the tool set also
   widens this.
-- Bot-post event shape (does `message.channels` carry username/subtype
-  for customized posts?) is unverified until the first real post; the
-  policy fails closed if identity is unknown, so it cannot loop — but
-  `#lobby` automation stays silent in that case until fixed.
+- Bot-post event shape: **verified on the first real posts** —
+  `message.channels` carries `bot_id` + the customized `username` for
+  our posts, so identity resolves (audit reasons on live events:
+  `lobby_self`, `alerts_not_healthcheck`, `alerts_recovery`,
+  `control_bot`). An unresolvable identity still fails closed (no run).
+- The cost gate needs cross-process `/proc` visibility: any unit
+  property that gives a caller its own mount namespace (`PrivateTmp=`)
+  blinds the guard's live-pid scan (readlink `/proc/<pid>/exe` ->
+  EACCES; comm/cmdline stay readable) and runs can be refused with
+  `cost_gate_refused`. The guard log's `source=pid:<n>` vs
+  `status=unknown … source=` is the canary; `slack-bridge.service`
+  stays without `PrivateTmp` (comment in the unit, RUNBOOK §7.10).
 - The Efficient promo is a 0-multiplier *promo*: the wrapper refuses
   (exit 75) when the price changes, but a change between the price
   scan and the run is not defendable — check the guard's state file
