@@ -87,6 +87,14 @@ SIGKILL timeout, `--max-budget-usd`.
   `spectre-slack-notify`; failure posts show the newest stderr tail;
   the RUNBOOK deploy block no longer clobbers live settings on
   redeploy.
+- Third pass (review of the fix commit): `~/.zcode/**` added to the
+  deny floor — `v2/config.json` carries provider keys and
+  `bot-state.v2.json` will hold the Telegram bot token (RUNBOOK 343,
+  367); executor settings on redeploy now get the repo's deny list
+  unioned in via jq (the no-clobber guard alone would have stranded
+  new deny entries on an installed box); doctor's claude check now
+  uses the bridge's pinned PATH instead of a login shell, so a
+  `~/.local/bin`-only claude cannot mask a broken executor.
 
 ## On-box verification (PENDING — filled at deploy)
 

@@ -36,6 +36,7 @@
       "Read(**/.ssh/**)",
       "Read(**/.qoder/**)",
       "Read(**/.codexpro/**)",
+      "Read(**/.zcode/**)",
       "Read(/work/hardened-zai-proxy/**)",
       "Read(/proc/*/environ)",
       "Read(/proc/**/environ)"

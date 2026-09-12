@@ -224,10 +224,18 @@ install -m 0755 "${REPO_DIR}/scripts/slack-notify.py" /usr/local/bin/spectre-sla
 install -m 0755 "${REPO_DIR}/scripts/slack-brief.py" /usr/local/bin/spectre-slack-brief
 install -m 0755 "${REPO_DIR}/scripts/slack-bridge.mjs" /usr/local/bin/spectre-slack-bridge
 install -m 0644 "${REPO_DIR}/config/slack-agents.json" /usr/local/share/remote-agent/slack-agents.json
-# Executor settings may carry local hardening (deny additions); never clobber.
-if [[ ! -f /usr/local/share/remote-agent/slack-claude-settings.json ]]; then
-  install -m 0644 "${REPO_DIR}/config/slack-claude-settings.example.json" \
-    /usr/local/share/remote-agent/slack-claude-settings.json
+# Executor settings are operator-tuned once installed: never clobber; union
+# the repo's deny list into the live file so new denies still land.
+settings_dest=/usr/local/share/remote-agent/slack-claude-settings.json
+settings_src="${REPO_DIR}/config/slack-claude-settings.example.json"
+if [[ ! -f "${settings_dest}" ]]; then
+  install -m 0644 "${settings_src}" "${settings_dest}"
+elif command -v jq >/dev/null 2>&1; then
+  if jq -s '.[0] as $old | .[1] as $new | $old | .permissions.deny = (($old.permissions.deny // []) + ($new.permissions.deny // []) | unique)' \
+    "${settings_dest}" "${settings_src}" > "${settings_dest}.tmp"; then
+    install -m 0644 "${settings_dest}.tmp" "${settings_dest}"
+  fi
+  rm -f "${settings_dest}.tmp"
 fi
 install -m 0644 "${REPO_DIR}/config/irreversible-guard.mjs" /usr/local/share/remote-agent/slack-guard.mjs
 

@@ -764,10 +764,19 @@ install -m 755 scripts/slack-brief.py   /usr/local/bin/spectre-slack-brief
 install -m 755 scripts/slack-bridge.mjs /usr/local/bin/spectre-slack-bridge
 mkdir -p /usr/local/share/remote-agent
 install -m 644 config/slack-agents.json /usr/local/share/remote-agent/
-# never clobber locally hardened executor settings on redeploy
-[ -f /usr/local/share/remote-agent/slack-claude-settings.json ] || \
-  install -m 644 config/slack-claude-settings.example.json \
-  /usr/local/share/remote-agent/slack-claude-settings.json
+# executor settings: install once, then union the repo's deny list into the
+# live file — local hardening survives, new deny entries still land
+settings_dest=/usr/local/share/remote-agent/slack-claude-settings.json
+settings_src=config/slack-claude-settings.example.json
+if [ ! -f "${settings_dest}" ]; then
+  install -m 644 "${settings_src}" "${settings_dest}"
+elif command -v jq >/dev/null 2>&1; then
+  if jq -s '.[0] as $old | .[1] as $new | $old | .permissions.deny = (($old.permissions.deny // []) + ($new.permissions.deny // []) | unique)' \
+    "${settings_dest}" "${settings_src}" > "${settings_dest}.tmp"; then
+    install -m 644 "${settings_dest}.tmp" "${settings_dest}"
+  fi
+  rm -f "${settings_dest}.tmp"
+fi
 install -m 644 config/irreversible-guard.mjs \
   /usr/local/share/remote-agent/slack-guard.mjs
 install -m 644 systemd/slack-bridge.service systemd/slack-brief.service \
