@@ -233,7 +233,8 @@ if [[ ! -f "${settings_dest}" ]]; then
 elif command -v jq >/dev/null 2>&1; then
   if jq -s '.[0] as $old | .[1] as $new | $old | .permissions.deny = (($old.permissions.deny // []) + ($new.permissions.deny // []) | unique)' \
     "${settings_dest}" "${settings_src}" > "${settings_dest}.tmp"; then
-    install -m 0644 "${settings_dest}.tmp" "${settings_dest}"
+    install -m 0644 "${settings_dest}.tmp" "${settings_dest}" \
+      || { rm -f "${settings_dest}.tmp"; exit 1; }
   fi
   rm -f "${settings_dest}.tmp"
 fi
