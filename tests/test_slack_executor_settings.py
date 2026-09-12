@@ -42,10 +42,14 @@ REQUIRED_DENIES = {
     "WebSearch",
     "ImageSearch",
     "ImageGen",
+    "Grep",
     "Read(**/.env)",
     "Read(**/*.env*)",
     "Read(**/slack.env)",
     "Read(**/*token*)",
+    "Read(**/hosts.yml)",
+    "Read(**/id_rsa)",
+    "Read(**/*.pem)",
     "Read(**/.netrc)",
     "Read(**/.git-credentials)",
     "Read(**/.aws/**)",
@@ -64,6 +68,12 @@ REQUIRED_DENIES = {
     "Read(**/.zsh_history*)",
     "Read(/proc/**)",
     "Bash(journalctl:*)",
+    "Bash(cat:*)",
+    "Bash(sed:*)",
+    "Bash(awk:*)",
+    "Bash(cut:*)",
+    "Bash(od:*)",
+    "Bash(base64:*)",
 }
 
 FORBIDDEN_IN_ALLOW = (

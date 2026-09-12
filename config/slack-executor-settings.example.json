@@ -69,7 +69,17 @@
       "Read(**/.zsh_history*)",
       "Read(/work/hardened-zai-proxy/**)",
       "Read(/proc/**)",
-      "Bash(journalctl:*)"
+      "Bash(journalctl:*)",
+      "Bash(cat:*)",
+      "Bash(head:*)",
+      "Bash(tail:*)",
+      "Bash(sed:*)",
+      "Bash(awk:*)",
+      "Bash(cut:*)",
+      "Bash(sort:*)",
+      "Bash(od:*)",
+      "Bash(strings:*)",
+      "Bash(base64:*)"
     ],
     "defaultMode": "default"
   }

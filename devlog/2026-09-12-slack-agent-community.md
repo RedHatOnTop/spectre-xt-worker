@@ -235,11 +235,20 @@ Went after the whole tool surface instead of patching the two claims:
   (session-only, no file). `WebFetch`/`WebSearch`/`ImageSearch`/
   `ImageGen`/`Monitor` were refused.
 - Bash semantics re-probed properly: the engine splits `;`/`&&`/`|`
-  into segments and checks each — `uptime; uptime` and `uptime | wc -l`
-  **ran** (both segments allowlisted), `uptime && journalctl …` and
-  `uptime && touch …` were denied whole (no file), `echo $(uptime)`
-  denied. The earlier "compound commands are denied" line was wrong as
-  written and is corrected here.
+  into segments and checks each — `uptime; uptime` ran;
+  `uptime | wc -l` **also ran**, which exposed that there is a second
+  gate besides the allowlist: an *internal read-only safe list*
+  (confirmed members: `wc`, `ls`; nothing in the profile allowlists
+  them). `uptime && journalctl …` and `uptime && touch …` were denied
+  whole (no file), `echo $(uptime)` denied. The earlier "compound
+  commands are denied" line was wrong as written and is corrected here.
+- The safe list made the content readers the next question: `cat`,
+  `head`, `tail`, `sed`, `awk`, `cut`, `sort`, `od`, `nl` on the
+  0600 slack.env were all refused (attempted, `num_turns=2`, no
+  content; `strings` self-refused) — they are *not* on the safe list
+  and not allowlisted, so the headless confirmation default denies
+  them. They are now deny-listed as a floor too; `ls` on the
+  deny-listed directory prints file *names* only.
 - Glob *is* gated by the deny list (Glob over a deny-listed directory
   refused; over `/tmp` allowed) — so the original claim holds, now with
   a probe.
@@ -264,9 +273,16 @@ Fixes deployed the same day:
   settings file would strand the deny floor) and warns when jq is
   missing; new `tests/test_slack_executor_settings.py` guards the
   profile against wildcard-allows and missing denies.
+- Deny floor extended again after the coherence review: the content
+  readers (`cat`/`head`/`tail`/`sed`/`awk`/`cut`/`sort`/`od`/`strings`/
+  `base64`) plus the missing path/history keys — live settings ended at
+  allow 13 / deny 67 (30 entering the tool audit; 22 before the first
+  review round). `wc`/`ls` remain runnable via the engine's internal
+  read-only safe list; that is documented, not closed.
 - Post-fix probes on the box: subagent `DENIED`, no file; write
-  `DENIED`, no file; egress `DENIED`; `uptime` (positive) ran; secret
-  read `DENIED`, no token; live settings allow 13 / deny 51.
+  `DENIED`, no file; egress `DENIED`; content readers `DENIED`, no
+  token; `uptime` and `spectre-status` (positive) ran; secret read via
+  Read `DENIED`, no token; tool set 12.
 
 ## Honest limits
 
