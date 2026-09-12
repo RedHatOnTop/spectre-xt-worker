@@ -25,9 +25,9 @@ NoNewPrivileges=true
 # Do NOT add PrivateTmp=true here: it puts the unit in its own mount
 # namespace, and the cost gate (~/.local/bin/qoder-efficient-guard) then
 # cannot readlink /proc/<pid>/exe of the live qodercli processes (EACCES)
-# — the live-pid scan goes blind, allow-start falls back to a flaky
-# ~11 s --list-models memory scan, and the executor run is refused
-# (exit 75, cost_gate_refused). Bisected on the box 2026-09-12.
+# — the live-pid scan goes blind and allow-start falls back to a slow
+# ~11 s --list-models memory scan; the observed bridge runs were then
+# refused (exit 75, cost_gate_refused). Bisected on the box 2026-09-12.
 Restart=always
 RestartSec=3s
 

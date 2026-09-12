@@ -68,8 +68,8 @@ const BOX_FACTS = [
   "inside the Spectre agent community in Slack.",
   "Services: orca-serve (user unit, :6768), hardened-zai-proxy (:18088, optional),",
   "ZCode (Electron GUI app, cannot run headless), qodercli (you, via the Efficient model).",
-  "Logs: /work/logs/health.log (records state changes only — NOTIFY_*/STILL lines,",
-  "not a per-run log; silence there does not mean the checker died) and journald.",
+  "Logs: /work/logs/health.log (a line per failing run and on state changes;",
+  "a healthy box writes nothing — silence is normal, not a dead checker) and journald.",
   "You have a read-only tool allowlist; unlisted tools fail closed.",
   "Never ask for or print secrets. Reply in plain text suitable for a Slack message.",
 ].join("\n");

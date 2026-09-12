@@ -944,18 +944,23 @@ cd / && printf '' | timeout 300 ~/.local/bin/qoder-efficient -p \
 # check: exit 0 = free (prints the decision JSON), exit 2 = billed/stopping
 ~/.local/bin/qoder-efficient-guard check
 # the guard reads /proc/<pid>/exe of the live qodercli processes (live-pid
-# scan). A unit property that gives the caller its own mount namespace breaks
-# that read — probed 2026-09-12: with PrivateTmp=true, readlink /proc/<pid>/exe
-# fails EACCES (comm/cmdline stay readable), allow-start falls back to a flaky
-# ~11 s `qodercli --list-models` memory scan and can refuse (exit 75 ->
-# cost_gate_refused in the bridge audit). slack-bridge.service runs WITHOUT
+# scan). PrivateTmp=true puts the caller in its own mount namespace and
+# breaks that read — probed 2026-09-12: readlink /proc/<pid>/exe fails
+# EACCES (comm/cmdline stay readable), allow-start falls back to a slow
+# ~11 s `qodercli --list-models` memory scan, and in the observed runs the
+# result was status=unknown and the run was refused (exit 75 ->
+# cost_gate_refused in the bridge audit). Other namespace-creating unit
+# properties were not probed. slack-bridge.service runs WITHOUT
 # PrivateTmp=true for this reason; do not re-add it.
 
 systemctl --user enable --now slack-bridge.service slack-brief.timer
 journalctl --user -u slack-bridge -n 30 --no-pager   # auth.test ok / socket connected
 # after the first executor run, the guard log must show the fast path — a
-# `source=pid:<n>` line, not `status=unknown ... source=` (the fallback):
-tail -1 /work/logs/qoder-efficient-guard.log
+# `source=pid:<n>` line, not `status=unknown ... source=` (the fallback).
+# The log is shared with the check timer and ssh runs, so pin the
+# executor's own line by correlating it with the bridge audit `job_start`
+# timestamp before reading it as evidence:
+grep allow-start /work/logs/qoder-efficient-guard.log | tail -n1
 ```
 
 Notes for the probes: `tail -n1` is required because the
