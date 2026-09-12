@@ -50,6 +50,9 @@ REQUIRED_DENIES = {
     "Read(**/.git-credentials)",
     "Read(**/.aws/**)",
     "Read(**/.gnupg/**)",
+    "Read(**/.docker/config.json)",
+    "Read(**/.kube/**)",
+    "Read(**/.npmrc)",
     "Read(**/id_ecdsa)",
     "Read(**/*.key)",
     "Read(**/.ssh/**)",
@@ -101,8 +104,11 @@ class ExecutorSettingsTest(unittest.TestCase):
         missing = REQUIRED_DENIES - set(self.deny)
         self.assertEqual(missing, set(), f"missing deny entries: {sorted(missing)}")
 
-    def test_no_dangerous_allow_entries(self) -> None:
+    def test_allow_entries_are_specific(self) -> None:
+        # a bare `Bash` (or `Bash()`) would allow the whole shell
+        allowed = re.compile(r"^(Bash\(.+\)|Read|Glob)$")
         for entry in self.allow:
+            self.assertRegex(entry, allowed, f"allow entry is not a specific tool/command: {entry}")
             low = entry.lower()
             for bad in FORBIDDEN_IN_ALLOW:
                 self.assertNotIn(bad, low, f"allow entry looks dangerous: {entry}")
