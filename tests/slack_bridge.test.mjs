@@ -383,7 +383,7 @@ test("parseExecutorResult reads the last JSON envelope (wrapper logs pollute std
     text: "ok text",
   });
   const wrapped =
-    "2026-09-12T06:53:58Z allow-start status=free price_factor=0.0 source:pid:574580\n" +
+    "2026-09-12T06:53:58Z allow-start status=free price_factor=0.0 source=pid:574580\n" +
     '{"type":"result","subtype":"success","is_error":false,"result":"wrapped ok"}\n';
   assert.deepEqual(parseExecutorResult(wrapped, 0), { ok: true, text: "wrapped ok" });
   assert.equal(parseExecutorResult('{"type":"result","result":"","is_error":true,"subtype":"error_max_turns"}', 1).ok, false);
