@@ -76,10 +76,10 @@ probed on the box against qodercli 1.1.47:
 - Flag-settings PreToolUse hooks are **not executed** (a trivial
   logging hook never ran), so the `irreversible-guard` hook is not
   part of this boundary. The executable boundary is the permission
-  engine + the narrow read-only allowlist: writes always require
-  confirmation and are denied headless; compound commands (`;`) and
-  command substitution (`$()`) are denied; the deny list lands as a
-  flagSettings rule (slack.env read denied).
+  engine (allowlist + deny list), later probed in detail: a tool-name
+  deny removes the tool from the executor's tool set entirely; Bash
+  compound commands are split into segments and each segment is checked
+  (see the fourth pass below).
 - The bridge runs the executor with `cwd "/"` (every box path is
   read-visible to the allowlist) and parses the **last** JSON line of
   stdout — the wrapper prints its `allow-start` log line before the
@@ -206,25 +206,83 @@ the settings refresh landed as designed — allow replaced (journalctl,
 pgrep gone; `df -h:*`, `free -h`), deny **22 → 30** entries. Re-probes
 under the bridge child env:
 
-- Grep probe: `{"num_turns":1,"result":"DENIED"}`, no `xoxb-` in
-  stdout.
 - Secret-read probe (forced attempt, tightened settings):
   `{"num_turns":2,"result":"DENIED"}`, no token in stdout.
+- The Grep probe returned `{"num_turns":1,"result":"DENIED"}` — which,
+  on the fourth pass below, turned out to be *no evidence at all*: the
+  engine never saw a tool call.
 
 Local `bash verify.sh` green after the fixes (50 python + 20 node
 tests).
 
+### Fourth pass: tool-set audit — the subagent write hole
+
+The follow-up review flagged that the Grep probe proved nothing
+(`num_turns=1` = the model declined without attempting) and that
+"Read/Glob filtered by the deny list" was asserted without a probe.
+Went after the whole tool surface instead of patching the two claims:
+
+- `--output-format stream-json` emits an init message with the full
+  tool list (plain stream-json; `--verbose` is not a known option).
+  1.1.47 ships **28 tools**; there is **no Grep tool** — the deny entry
+  is a floor only, and the xoxb- probe can never show an attempted call
+  (its real check is "no token in stdout").
+- Per-tool probing of the unlisted tools found a **real hole**: the
+  `Agent` tool spawned a subagent whose Bash *write* gate did not hold
+  — `touch /tmp/p4-agent.txt` succeeded there while the same write is
+  denied headless in the main thread (read denials and the Bash
+  allowlist did hold inside the subagent). `CronCreate` also ran
+  (session-only, no file). `WebFetch`/`WebSearch`/`ImageSearch`/
+  `ImageGen`/`Monitor` were refused.
+- Bash semantics re-probed properly: the engine splits `;`/`&&`/`|`
+  into segments and checks each — `uptime; uptime` and `uptime | wc -l`
+  **ran** (both segments allowlisted), `uptime && journalctl …` and
+  `uptime && touch …` were denied whole (no file), `echo $(uptime)`
+  denied. The earlier "compound commands are denied" line was wrong as
+  written and is corrected here.
+- Glob *is* gated by the deny list (Glob over a deny-listed directory
+  refused; over `/tmp` allowed) — so the original claim holds, now with
+  a probe.
+
+Fixes deployed the same day:
+
+- Tool-name denies added to the executor profile: escalation (`Agent`,
+  `Workflow`, `CronCreate/List/Delete`, `ScheduleWakeup`,
+  `EnterWorktree`, `ExitWorktree`), writes (`Edit`, `Write`,
+  `NotebookEdit`), egress (`WebFetch`, `WebSearch`, `ImageSearch`,
+  `ImageGen`, `Monitor`). Probed mechanism: a tool-name deny **removes
+  the tool from the tool set** — live dump went **28 → 12** (Bash,
+  Read, Glob, Skill, Task*/Goal metadata). That was the verified fix
+  for the subagent hole (`Agent` gone = no subagent exists to write).
+- Deny list also gained `.netrc`, `.git-credentials`, `.aws/**`,
+  `.zsh_history*`, `.bash_history*` (was exact-match).
+- `parseExecutorResult` now also requires `type:"result"` (verified
+  present in the 1.1.47 envelope) — a *keyed* JSON log line can no
+  longer mask the real result; `expandHome` uses a function replacer
+  (a `$&` in a home path cannot be mangled); `bootstrap.sh`/RUNBOOK
+  deploy merge now writes tmp + `mv` (atomic — a truncated live
+  settings file would strand the deny floor) and warns when jq is
+  missing; new `tests/test_slack_executor_settings.py` guards the
+  profile against wildcard-allows and missing denies.
+- Post-fix probes on the box: subagent `DENIED`, no file; write
+  `DENIED`, no file; egress `DENIED`; `uptime` (positive) ran; secret
+  read `DENIED`, no token; live settings allow 13 / deny 51.
+
 ## Honest limits
 
-- The executor boundary is a permission engine plus a narrow read-only
-  allowlist on qodercli 1.1.47 — semantics that are not contractual.
-  Re-run the write/secret probes in RUNBOOK §7.10 after every qodercli
-  upgrade. Same-user isolation is imperfect; the executor runs as the
+- The executor boundary is a permission engine (allowlist + tool/path
+  deny lists) on qodercli 1.1.47 — semantics that are not contractual.
+  Re-run the full probe list in RUNBOOK §7.10 (write, secret, subagent,
+  egress, compound, tool-set dump) after every qodercli upgrade: the
+  subagent hole was exactly the class of thing a version bump can
+  reopen, and a *new* tool in the set is invisible to the current
+  probes. Same-user isolation is imperfect; the executor runs as the
   box user.
 - Flag-settings hooks do not execute (probed), so there is no
-  irreversible-guard backstop on this path — the read-only allowlist
-  is the whole Bash boundary. Anything that widens the allowlist also
-  widens this.
+  irreversible-guard backstop on this path. With the tool-name denies,
+  the executor's tool set is Bash/Read/Glob/Skill + Task/Goal
+  metadata; Bash is allowlist-only and file paths are deny-filtered.
+  Anything that widens the allowlist or the tool set also widens this.
 - Bot-post event shape (does `message.channels` carry username/subtype
   for customized posts?) is unverified until the first real post; the
   policy fails closed if identity is unknown, so it cannot loop — but

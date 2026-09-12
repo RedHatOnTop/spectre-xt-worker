@@ -105,8 +105,10 @@ export function parseEnvText(text) {
 const truthy = (value) =>
   ["1", "true", "yes", "on"].includes(String(value || "").trim().toLowerCase());
 
-// env files are written by hand; a literal "~" or "~/" must still resolve
-const expandHome = (path) => path.replace(/^~(?=$|\/)/, homedir());
+// env files are written by hand; a literal "~" or "~/" must still resolve.
+// Function replacer: a literal replacement string would read "$&"-style
+// sequences in the home path as patterns.
+const expandHome = (path) => path.replace(/^~(?=$|\/)/, () => homedir());
 
 function numberOr(value, fallback) {
   const num = Number(value);
@@ -511,9 +513,10 @@ function childEnv() {
 
 // The qoder-efficient wrapper prints its allow-start line to stdout before
 // the JSON envelope, so the result is the last parseable JSON line, not the
-// whole output — and only a line shaped like the envelope counts, so a
-// trailing JSON log/diagnostic object cannot mask or spoof the result.
-// Exit 75 is the wrapper's cost-gate refusal.
+// whole output. Only a line shaped like the envelope counts — `type` must be
+// "result" (verified against qodercli 1.1.47) and a result/is_error key must
+// be present — so a trailing JSON log/diagnostic object cannot mask the
+// envelope. Exit 75 is the wrapper's cost-gate refusal.
 export function parseExecutorResult(stdout, code) {
   if (code === 75) return { ok: false, error: "cost_gate_refused" };
   const lines = String(stdout || "").split("\n").reverse();
@@ -527,6 +530,7 @@ export function parseExecutorResult(stdout, code) {
       continue;
     }
     if (!payload || typeof payload !== "object" || Array.isArray(payload)) continue;
+    if (payload.type !== "result") continue;
     if (!("result" in payload) && !("is_error" in payload)) continue;
     if (payload.is_error) return { ok: false, error: String(payload.subtype || "is_error") };
     const text = String(payload.result || "").trim();

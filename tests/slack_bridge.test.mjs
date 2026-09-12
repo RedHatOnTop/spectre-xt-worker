@@ -90,6 +90,9 @@ test("loadConfig parses the env text and applies defaults", () => {
   assert.equal(cfg.executorBin, join(homedir(), ".local/bin/qoder-efficient"));
   assert.equal(loadConfig("SLACK_EXECUTOR_BIN=~/bin/x").executorBin, join(homedir(), "bin/x"));
   assert.equal(loadConfig("SLACK_EXECUTOR_BIN=~").executorBin, homedir());
+  // "~user" and absolute paths must pass through untouched
+  assert.equal(loadConfig("SLACK_EXECUTOR_BIN=~root/bin/x").executorBin, "~root/bin/x");
+  assert.equal(loadConfig("SLACK_EXECUTOR_BIN=/usr/bin/true").executorBin, "/usr/bin/true");
   assert.equal(cfg.channels.lobby, "C01LOBBY00");
 });
 
@@ -375,7 +378,7 @@ test("clock steps backward never wedge the rate/budget windows", () => {
 });
 
 test("parseExecutorResult reads the last JSON envelope (wrapper logs pollute stdout)", () => {
-  assert.deepEqual(parseExecutorResult('{"result":"ok text","is_error":false}', 0), {
+  assert.deepEqual(parseExecutorResult('{"type":"result","result":"ok text","is_error":false}', 0), {
     ok: true,
     text: "ok text",
   });
@@ -383,15 +386,18 @@ test("parseExecutorResult reads the last JSON envelope (wrapper logs pollute std
     "2026-09-12T06:53:58Z allow-start status=free price_factor=0.0 source:pid:574580\n" +
     '{"type":"result","subtype":"success","is_error":false,"result":"wrapped ok"}\n';
   assert.deepEqual(parseExecutorResult(wrapped, 0), { ok: true, text: "wrapped ok" });
-  assert.equal(parseExecutorResult('{"result":"","is_error":true,"subtype":"error_max_turns"}', 1).ok, false);
-  assert.equal(parseExecutorResult('{"result":"","is_error":true,"subtype":"error_max_turns"}', 1).error, "error_max_turns");
+  assert.equal(parseExecutorResult('{"type":"result","result":"","is_error":true,"subtype":"error_max_turns"}', 1).ok, false);
+  assert.equal(parseExecutorResult('{"type":"result","result":"","is_error":true,"subtype":"error_max_turns"}', 1).error, "error_max_turns");
   assert.equal(parseExecutorResult("not json", 0).ok, false);
   assert.equal(parseExecutorResult("", 1).ok, false);
   assert.equal(parseExecutorResult("null", 0).ok, false);
   assert.equal(parseExecutorResult('"text"', 0).ok, false);
   assert.equal(parseExecutorResult("[1,2]", 0).ok, false);
-  // a trailing JSON log object (no result/is_error keys) must neither mask
-  // nor spoof the envelope
+  // a JSON object without type:"result" is not the envelope, even if it
+  // carries a result key — a keyed log line must not mask the real result
+  assert.equal(parseExecutorResult('{"result":"ok text","is_error":false}', 0).ok, false);
+  const keyedLog = '{"type":"result","is_error":false,"result":"real"}\n{"level":"info","result":"fake"}\n';
+  assert.deepEqual(parseExecutorResult(keyedLog, 0), { ok: true, text: "real" });
   const trailingLog = '{"type":"result","is_error":false,"result":"real"}\n{"level":"info","msg":"bye"}\n';
   assert.deepEqual(parseExecutorResult(trailingLog, 0), { ok: true, text: "real" });
   // exit 75 is the qoder-efficient wrapper's cost-gate refusal

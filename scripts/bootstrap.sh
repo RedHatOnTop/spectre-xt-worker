@@ -233,12 +233,18 @@ settings_src="${REPO_DIR}/config/slack-executor-settings.example.json"
 if [[ ! -f "${settings_dest}" ]]; then
   install -m 0644 "${settings_src}" "${settings_dest}"
 elif command -v jq >/dev/null 2>&1; then
+  # tmp + mv within the same directory: replacing the live file must be
+  # atomic — a truncated write would strand the deny floor.
   if jq -s '.[0] as $old | .[1] as $new | $new | .permissions.deny = ((($old.permissions.deny // []) + ($new.permissions.deny // [])) | unique)' \
     "${settings_dest}" "${settings_src}" > "${settings_dest}.tmp"; then
-    install -m 0644 "${settings_dest}.tmp" "${settings_dest}" \
-      || { rm -f "${settings_dest}.tmp"; exit 1; }
+    chmod 0644 "${settings_dest}.tmp"
+    mv "${settings_dest}.tmp" "${settings_dest}"
+  else
+    rm -f "${settings_dest}.tmp"
+    echo "WARN: settings merge failed; ${settings_dest} left unchanged" >&2
   fi
-  rm -f "${settings_dest}.tmp"
+else
+  echo "WARN: jq not found; ${settings_dest} not refreshed from the repo" >&2
 fi
 # The executor itself (qoder-efficient wrapper -> qodercli) is box-local at
 # ~/.local/bin; spectre-doctor reports when it is missing.
