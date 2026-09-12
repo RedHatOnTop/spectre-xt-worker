@@ -105,8 +105,9 @@ class ExecutorSettingsTest(unittest.TestCase):
         self.assertEqual(missing, set(), f"missing deny entries: {sorted(missing)}")
 
     def test_allow_entries_are_specific(self) -> None:
-        # a bare `Bash` (or `Bash()`) would allow the whole shell
-        allowed = re.compile(r"^(Bash\(.+\)|Read|Glob)$")
+        # a bare `Bash`, `Bash()`, or whitespace-only `Bash( )` would
+        # allow the whole shell; \Z rejects a trailing newline too
+        allowed = re.compile(r"^(Bash\(\S.*\)|Read|Glob)\Z")
         for entry in self.allow:
             self.assertRegex(entry, allowed, f"allow entry is not a specific tool/command: {entry}")
             low = entry.lower()
