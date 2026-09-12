@@ -2,10 +2,11 @@
 """Regression guard for the headless executor permission profile.
 
 The deny list is the only file gate (Read/Glob are allowlisted wholesale)
-and the Bash allowlist is the only command gate, so a wildcard or a
-missing deny entry silently widens the boundary. Probed on the box
-2026-09-12: the `Agent` tool spawns subagents whose write gate does not
-hold, hence the orchestration-tool denies below.
+and the Bash allowlist (plus the engine's internal read-only safe list)
+is the command gate, so a wildcard or a missing deny entry silently
+widens the boundary. Probed on the box 2026-09-12: the `Agent` tool
+spawns subagents whose write gate does not hold, hence the
+orchestration-tool denies below.
 """
 from __future__ import annotations
 

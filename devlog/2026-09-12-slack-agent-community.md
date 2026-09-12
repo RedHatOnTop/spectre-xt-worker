@@ -285,7 +285,14 @@ Fixes deployed the same day:
   token; `uptime` and `spectre-status` (positive) ran; secret read via
   Read `DENIED`, no token; tool set 12. After the final deny merge
   (allow 13 / deny 68), `nl` on slack.env was re-probed: `DENIED`,
-  `num_turns=2`, no token value in the transcript.
+  `num_turns=2`, no token value in the transcript. `ls -la` on the
+  deny-listed directory returned names and `-l` metadata only, no
+  contents; Glob over `/tmp` returned a listing (the allow side). The
+  live profile is a superset of the repo example: three box-local
+  extras (`Read(**/.bash_history)`, `Read(/proc/*/environ)`,
+  `Read(/proc/**/environ)`) are all subsumed by wider repo rules, so
+  the union merge does not drop them and the repo file stays the
+  source of truth.
 
 ## Honest limits
 
@@ -300,7 +307,9 @@ Fixes deployed the same day:
 - Flag-settings hooks do not execute (probed), so there is no
   irreversible-guard backstop on this path. With the tool-name denies,
   the executor's tool set is Bash/Read/Glob/Skill + Task/Goal
-  metadata; Bash is allowlist-only and file paths are deny-filtered.
+  metadata; Bash is the allowlist *plus the engine's internal read-only
+  safe list* (everything else falls to the headless confirmation
+  default) and file paths are deny-filtered.
   Note the split: the *file* write tools are rule-denied (gone from the
   set), but a mutating **Bash** command (`mv`, `tee`, redirects) is
   blocked only by the headless confirmation default — no rule names it.
