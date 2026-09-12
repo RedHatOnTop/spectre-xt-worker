@@ -292,7 +292,10 @@ Fixes deployed the same day:
   extras (`Read(**/.bash_history)`, `Read(/proc/*/environ)`,
   `Read(/proc/**/environ)`) are all subsumed by wider repo rules, so
   the union merge does not drop them and the repo file stays the
-  source of truth.
+  source of truth. The `$(...)` denial was re-probed with an
+  allowlisted outer command (`uptime $(echo hi)`): `DENIED`,
+  `num_turns=2` — the earlier `echo $(uptime)` probe alone could not
+  isolate the substitution from an unallowlisted outer command.
 
 ## Honest limits
 
