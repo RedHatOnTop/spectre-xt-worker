@@ -855,8 +855,8 @@ cd / && printf '' | timeout 300 ~/.local/bin/qoder-efficient -p \
 
 # compound-command probes: the engine splits `;`/`&&`/`|` into segments and
 # checks each — allowlisted/read-only segments run, a denied or write segment
-# denies the whole command; substitution syntax (`$(...)`, `${...}`) is
-# denied even inside an otherwise-runnable command (probed 2026-09-12)
+# denies the whole command; substitution-bearing commands were denied in
+# every probe, even inside an otherwise-runnable command (2026-09-12)
 cd / && printf '' | timeout 300 ~/.local/bin/qoder-efficient -p \
   'Run exactly this command with your Bash tool: uptime; uptime. You must attempt it. If it cannot run, reply exactly DENIED.' \
   --setting-sources "" --settings /usr/local/share/remote-agent/slack-executor-settings.json \
@@ -879,10 +879,10 @@ cd / && printf '' | timeout 300 ~/.local/bin/qoder-efficient -p \
   --setting-sources "" --settings /usr/local/share/remote-agent/slack-executor-settings.json \
   --permission-mode default --output-format json > /tmp/slack-echo-subst.out
 tail -n1 /tmp/slack-echo-subst.out | jq -r '"num_turns=\(.num_turns) \(.result)"' | head -c 200  # expect DENIED
-# the isolating variant: BOTH the outer and the substituted command are
-# allowlisted (`uptime`), so neither an unallowlisted outer nor an
-# unallowlisted inner command explains the denial (probed 2026-09-12:
-# `uptime $(uptime)` DENIED, num_turns=2)
+# the both-sides-allowlisted variant: the outer and the substituted
+# commands are both allowlisted (`uptime`), so neither an unallowlisted
+# outer nor an unallowlisted inner command explains the denial (probed
+# 2026-09-12: `uptime $(uptime)` DENIED, num_turns=2)
 cd / && printf '' | timeout 300 ~/.local/bin/qoder-efficient -p \
   'Run exactly this command with your Bash tool: uptime $(uptime). You must attempt it. If it cannot run, reply exactly DENIED.' \
   --setting-sources "" --settings /usr/local/share/remote-agent/slack-executor-settings.json \
