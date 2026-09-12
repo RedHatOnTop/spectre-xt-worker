@@ -292,16 +292,16 @@ Fixes deployed the same day:
   extras (`Read(**/.bash_history)`, `Read(/proc/*/environ)`,
   `Read(/proc/**/environ)`) are all subsumed by wider repo rules, so
   the union merge does not drop them and the repo file stays the
-  source of truth. Substitution syntax was re-probed inside an
-  otherwise-runnable command: `uptime $(uptime)` and `uptime ${x}` both
-  `DENIED` (`num_turns=2`), while the non-substitution control
-  `uptime -p` ran. Two more controls sharpen it: `git log -n 1` was
-  `DENIED` — bare allow rules are exact-match, so a plain argument does
-  not make a run happen — and `${x}` shows parameter expansion is
-  refused alongside `$(...)`. The earlier forms each carried an
-  unallowlisted side (`echo $(uptime)`, `uptime $(echo hi)`), so they
-  could not isolate the substitution from per-segment checking. What
-  blocks is the substitution syntax, not the presence of an argument.
+  source of truth. Substitution-bearing commands were re-probed inside
+  an otherwise-runnable command: `uptime $(uptime)` and `uptime ${x}`
+  both `DENIED` (`num_turns=2`), while the non-substitution control
+  `uptime -p` ran; `git log -n 1` was `DENIED`, so bare allow rules
+  stop matching when given arguments. The honest statement is the
+  operational one: no command containing `$(...)`/`${...}` has run in
+  any probe — whether that is a structural check or simply that
+  `$`-bearing strings match no rule is **not** isolated. The earlier
+  forms each carried an unallowlisted side (`echo $(uptime)`,
+  `uptime $(echo hi)`), which is why they did not count.
 
 ## Honest limits
 

@@ -473,8 +473,10 @@ function markSeen(state, msg) {
 // Verified against qodercli 1.1.47 on the box: writes always require
 // confirmation and are denied headless; compound commands (`;`, `&&`, `|`)
 // are split into segments and each is checked — a denied or write segment
-// denies the whole command; command substitution `$(...)` is denied
-// outright. `cwd: "/"` puts every read inside the workspace root so the
+// denies the whole command; substitution-bearing commands (`$(...)`,
+// `${...}`) were denied in every probe, including inside otherwise-runnable
+// commands (structural check vs. no-rule-match is not isolated). `cwd: "/"`
+// puts every read inside the workspace root so the
 // read/Glob deny list applies to box paths. Flag-level PreToolUse
 // hooks are NOT executed by qodercli (probed: a logging hook never ran),
 // so the executable boundary is the permission engine + the narrow
