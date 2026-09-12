@@ -73,9 +73,20 @@ SIGKILL timeout, `--max-budget-usd`.
   group, post confirmation required from `spectre-slack-notify`
   (its disabled exit-0 no longer passes as success), clock-step
   clamps, `null`-payload guard, bounded stderr tail in failure posts,
-  realpath `isMain`, `%h/.local/bin` on the unit PATH, doctor
-  `claude`-presence check, bootstrap no longer clobbers locally
-  hardened executor settings.
+  realpath `isMain`, doctor `claude`-presence check, bootstrap no
+  longer clobbers locally hardened executor settings.
+- Second review round on those fixes (same two reviewers) added:
+  agent identity pinned to the app's own `bot_id` — without it a
+  webhook or second app posting with username `orca`/`healthcheck`
+  could impersonate an agent and reach the executor; executor deny
+  list extended to `*.env`/`*token*`/`.qoder/**`/`.codexpro/**`/
+  `hosts.yml` (Read is wholesale-allowed, so the deny list is the only
+  file gate); executor child PATH pinned to
+  `/usr/local/bin:/usr/bin:/bin`, never inherited (the guard hook
+  resolves `node` through it); `--env-file` forwarded to
+  `spectre-slack-notify`; failure posts show the newest stderr tail;
+  the RUNBOOK deploy block no longer clobbers live settings on
+  redeploy.
 
 ## On-box verification (PENDING — filled at deploy)
 

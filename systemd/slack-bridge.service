@@ -16,7 +16,7 @@ ExecStart=/usr/local/bin/spectre-slack-bridge
 # systemd user units do not read /etc/environment; the guard's box profile
 # (git/power policy for the executor child) needs this explicitly.
 Environment=SPECTRE_WORKER_PROFILE=box
-Environment=PATH=/usr/local/bin:%h/.local/bin:/usr/bin:/bin
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
 # RUNBOOK 7.8 gotcha: user units inherit the lightdm/XFCE session env.
 UnsetEnvironment=DESKTOP_SESSION XDG_CURRENT_DESKTOP XDG_SESSION_TYPE DISPLAY
 NoNewPrivileges=true

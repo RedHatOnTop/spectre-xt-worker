@@ -182,8 +182,11 @@ export function normalizeEvent(event) {
 }
 
 // Fail closed: a post whose author is not a registered agent is never answered.
-export function agentIdentity(msg, agents) {
-  if (!msg.botId || !msg.username) return null;
+// Identity is pinned to the app's own bot_id, so an unrelated webhook or app
+// posting with username "orca"/"healthcheck" cannot impersonate an agent.
+export function agentIdentity(msg, agents, botId) {
+  if (!msg.botId || !msg.username || !botId) return null;
+  if (msg.botId !== botId) return null;
   return Object.prototype.hasOwnProperty.call(agents, msg.username) ? msg.username : null;
 }
 
@@ -212,7 +215,7 @@ export function classifyMessage(msg, cfg, ctx) {
   }
 
   if (msg.channel === cfg.channels.alerts) {
-    if (agentIdentity(msg, ctx.agents) !== "healthcheck") {
+    if (agentIdentity(msg, ctx.agents, ctx.botId) !== "healthcheck") {
       return { kind: "ignore", reason: "alerts_not_healthcheck" };
     }
     if (isRecoveryText(msg.text)) return { kind: "ignore", reason: "alerts_recovery" };
@@ -237,7 +240,7 @@ export function classifyMessage(msg, cfg, ctx) {
         prompt: msg.text.replace(HUMAN_PREFIX, "").trim().slice(0, PROMPT_MAX),
       };
     }
-    const identity = agentIdentity(msg, ctx.agents);
+    const identity = agentIdentity(msg, ctx.agents, ctx.botId);
     if (!identity) return { kind: "ignore", reason: "lobby_unknown_identity" };
     if (identity === RESPONDER || identity === INFRA_IDENTITY) {
       return { kind: "ignore", reason: "lobby_self" };
@@ -486,8 +489,10 @@ export function buildExecutorArgs({
 }
 
 function childEnv() {
-  const env = {};
-  for (const key of ["PATH", "HOME", "LANG", "TERM", "TZ"]) {
+  // Fixed minimal PATH (never inherited): the bridge's own PATH may include
+  // user-writable dirs, and the guard hook runs `node` resolved through this.
+  const env = { PATH: "/usr/local/bin:/usr/bin:/bin" };
+  for (const key of ["HOME", "LANG", "TERM", "TZ"]) {
     if (process.env[key]) env[key] = process.env[key];
   }
   env.SPECTRE_WORKER_PROFILE = "box";
@@ -610,6 +615,7 @@ function spawnNotify(command, args) {
 async function post(ctx, { agent, channel, threadTs, text }) {
   const args = ["--agent", agent, "--channel", channel, `--text=${text}`];
   if (threadTs) args.push("--thread-ts", threadTs);
+  if (ctx.envFile) args.push("--env-file", ctx.envFile);
   let result = await spawnNotify("spectre-slack-notify", args);
   if (!result.ok && result.missing) {
     result = await spawnNotify("python3", [join(HERE, "slack-notify.py"), ...args]);
@@ -703,7 +709,7 @@ async function runJob(job) {
   });
   if (!result.ok) {
     audit({ evt: "job_failed", kind: job.kind, error: result.error });
-    const tail = String(result.stderr || "").trim().slice(0, 300);
+    const tail = String(result.stderr || "").trim().slice(-300);
     const suffix = tail ? `\n\`\`\`\n${tail}\n\`\`\`` : "";
     await post(ctx, {
       agent: INFRA_IDENTITY,
@@ -1014,7 +1020,7 @@ async function main() {
 
   const agents = loadRegistry();
   const state = loadState();
-  const ctx = { cfg: null, agents, botUserId: "", state };
+  const ctx = { cfg: null, agents, botUserId: "", botId: "", envFile, state };
   const cfg0 = loadConfig(readTextFile(envFile));
   console.log(
     `slack-bridge: starting (${Object.keys(agents).length} agents, triage=${cfg0.triage ? "on" : "off"})`,
@@ -1026,7 +1032,13 @@ async function main() {
     return;
   }
   ctx.botUserId = me.user_id || "";
+  ctx.botId = me.bot_id || "";
   console.log(`slack-bridge: auth.test ok user=${me.user_id} bot=${me.bot_id || "-"}`);
+  if (!ctx.botId) {
+    console.error(
+      "slack-bridge: auth.test returned no bot_id — agent-identity checks fail closed",
+    );
+  }
 
   for (const signal of ["SIGTERM", "SIGINT"]) {
     process.on(signal, () => {

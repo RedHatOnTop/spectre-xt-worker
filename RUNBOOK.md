@@ -710,8 +710,10 @@ Four public channels, four behaviors:
 
 One Slack app, seven identities distinguished only by username/icon
 (`config/slack-agents.json`): `bridge`, `healthcheck`, `orca`, `zcode`,
-`claude`, `qoder`, `spectre`. A deterministic daily brief (no LLM) posts
-to `#lobby` as `bridge` at 09:00 (`slack-brief.timer`).
+`claude`, `qoder`, `spectre`. Agent posts are trusted only when their
+`bot_id` is the app's own bot (from `auth.test`), so an unrelated
+webhook or app cannot impersonate an agent. A deterministic daily brief
+(no LLM) posts to `#lobby` as `bridge` at 09:00 (`slack-brief.timer`).
 
 ### Setup
 
@@ -762,7 +764,9 @@ install -m 755 scripts/slack-brief.py   /usr/local/bin/spectre-slack-brief
 install -m 755 scripts/slack-bridge.mjs /usr/local/bin/spectre-slack-bridge
 mkdir -p /usr/local/share/remote-agent
 install -m 644 config/slack-agents.json /usr/local/share/remote-agent/
-install -m 644 config/slack-claude-settings.example.json \
+# never clobber locally hardened executor settings on redeploy
+[ -f /usr/local/share/remote-agent/slack-claude-settings.json ] || \
+  install -m 644 config/slack-claude-settings.example.json \
   /usr/local/share/remote-agent/slack-claude-settings.json
 install -m 644 config/irreversible-guard.mjs \
   /usr/local/share/remote-agent/slack-guard.mjs

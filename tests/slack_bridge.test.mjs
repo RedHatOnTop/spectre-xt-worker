@@ -68,7 +68,7 @@ const AGENTS = {
   qoder: {},
   spectre: {},
 };
-const CTX = { botUserId: "U0BOT", agents: AGENTS };
+const CTX = { botUserId: "U0BOT", botId: "B1", agents: AGENTS };
 
 function message(over = {}) {
   return Object.assign(normalizeEvent({}), over);
@@ -386,9 +386,12 @@ test("formatThreadContext caps size and keeps the newest messages", () => {
 });
 
 test("agentIdentity and isRecoveryText fail closed", () => {
-  assert.equal(agentIdentity({ botId: "B1", username: "orca" }, AGENTS), "orca");
-  assert.equal(agentIdentity({ botId: "B1", username: "karma-bot" }, AGENTS), null);
-  assert.equal(agentIdentity({ botId: "", username: "orca" }, AGENTS), null);
+  assert.equal(agentIdentity({ botId: "B1", username: "orca" }, AGENTS, "B1"), "orca");
+  assert.equal(agentIdentity({ botId: "B1", username: "karma-bot" }, AGENTS, "B1"), null);
+  assert.equal(agentIdentity({ botId: "", username: "orca" }, AGENTS, "B1"), null);
+  // impersonation: another app/webhook posting with a registered username
+  assert.equal(agentIdentity({ botId: "B9", username: "orca" }, AGENTS, "B1"), null);
+  assert.equal(agentIdentity({ botId: "B1", username: "orca" }, AGENTS, ""), null);
   assert.equal(isRecoveryText(":white_check_mark: recovered"), true);
   assert.equal(isRecoveryText("proxy_down"), false);
 });
