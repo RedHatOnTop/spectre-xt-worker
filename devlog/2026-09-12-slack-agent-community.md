@@ -248,7 +248,7 @@ Went after the whole tool surface instead of patching the two claims:
   content; `strings` self-refused) — they are *not* on the safe list
   and not allowlisted, so the headless confirmation default denies
   them. They are now deny-listed as a floor too; `ls` on the
-  deny-listed directory prints file *names* only.
+  deny-listed directory prints file *names* (and `-l` metadata) only.
 - Glob *is* gated by the deny list (Glob over a deny-listed directory
   refused; over `/tmp` allowed) — so the original claim holds, now with
   a probe.
@@ -292,10 +292,12 @@ Fixes deployed the same day:
   extras (`Read(**/.bash_history)`, `Read(/proc/*/environ)`,
   `Read(/proc/**/environ)`) are all subsumed by wider repo rules, so
   the union merge does not drop them and the repo file stays the
-  source of truth. The `$(...)` denial was re-probed with an
-  allowlisted outer command (`uptime $(echo hi)`): `DENIED`,
-  `num_turns=2` — the earlier `echo $(uptime)` probe alone could not
-  isolate the substitution from an unallowlisted outer command.
+  source of truth. The `$(...)` denial was re-probed with **both** the
+  outer and the substituted command allowlisted (`uptime $(uptime)`):
+  `DENIED`, `num_turns=2`. The earlier forms each carried an
+  unallowlisted side (`echo $(uptime)`, `uptime $(echo hi)`), so they
+  could not isolate the substitution from per-segment checking; the
+  doubly-allowlisted form shows the denial is structural.
 
 ## Honest limits
 
