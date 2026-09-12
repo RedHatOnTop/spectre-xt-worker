@@ -294,10 +294,11 @@ Fixes deployed the same day:
   the union merge does not drop them and the repo file stays the
   source of truth. The `$(...)` denial was re-probed with **both** the
   outer and the substituted command allowlisted (`uptime $(uptime)`):
-  `DENIED`, `num_turns=2`. The earlier forms each carried an
-  unallowlisted side (`echo $(uptime)`, `uptime $(echo hi)`), so they
-  could not isolate the substitution from per-segment checking; the
-  doubly-allowlisted form shows the denial is structural.
+  `DENIED`, `num_turns=2`, with a control — `uptime -p` ran, so the
+  bare `Bash(uptime)` rule tolerating arguments, not the substitution
+  itself, does not explain the denial. The earlier forms each carried
+  an unallowlisted side (`echo $(uptime)`, `uptime $(echo hi)`), so
+  they could not isolate the substitution from per-segment checking.
 
 ## Honest limits
 
