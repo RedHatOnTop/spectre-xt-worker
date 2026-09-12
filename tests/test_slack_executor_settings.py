@@ -69,10 +69,15 @@ REQUIRED_DENIES = {
     "Read(/proc/**)",
     "Bash(journalctl:*)",
     "Bash(cat:*)",
+    "Bash(head:*)",
+    "Bash(tail:*)",
     "Bash(sed:*)",
     "Bash(awk:*)",
     "Bash(cut:*)",
+    "Bash(sort:*)",
     "Bash(od:*)",
+    "Bash(nl:*)",
+    "Bash(strings:*)",
     "Bash(base64:*)",
 }
 

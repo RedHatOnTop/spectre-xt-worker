@@ -78,6 +78,7 @@
       "Bash(cut:*)",
       "Bash(sort:*)",
       "Bash(od:*)",
+      "Bash(nl:*)",
       "Bash(strings:*)",
       "Bash(base64:*)"
     ],

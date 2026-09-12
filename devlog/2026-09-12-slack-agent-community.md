@@ -274,15 +274,18 @@ Fixes deployed the same day:
   missing; new `tests/test_slack_executor_settings.py` guards the
   profile against wildcard-allows and missing denies.
 - Deny floor extended again after the coherence review: the content
-  readers (`cat`/`head`/`tail`/`sed`/`awk`/`cut`/`sort`/`od`/`strings`/
-  `base64`) plus the missing path/history keys — live settings ended at
-  allow 13 / deny 67 (30 entering the tool audit; 22 before the first
-  review round). `wc`/`ls` remain runnable via the engine's internal
-  read-only safe list; that is documented, not closed.
+  readers (`cat`/`head`/`tail`/`sed`/`awk`/`cut`/`sort`/`od`/`nl`/
+  `strings`/`base64`, plus `journalctl`) and the missing path/history
+  keys — live settings ended at allow 13 / deny 68 (30 entering the tool
+  audit; 22 before the first review round). `wc`/`ls` remain runnable via
+  the engine's internal read-only safe list; that is documented, not
+  closed.
 - Post-fix probes on the box: subagent `DENIED`, no file; write
   `DENIED`, no file; egress `DENIED`; content readers `DENIED`, no
   token; `uptime` and `spectre-status` (positive) ran; secret read via
-  Read `DENIED`, no token; tool set 12.
+  Read `DENIED`, no token; tool set 12. After the final deny merge
+  (allow 13 / deny 68), `nl` on slack.env was re-probed: `DENIED`,
+  `num_turns=2`, no token value in the transcript.
 
 ## Honest limits
 
