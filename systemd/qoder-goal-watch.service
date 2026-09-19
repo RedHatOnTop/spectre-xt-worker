@@ -1,0 +1,6 @@
+[Unit]
+Description=Spectre qoder goal-park watcher (posts park/recovery notices to Slack #fleet)
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/spectre-qoder-goal-watch --scan

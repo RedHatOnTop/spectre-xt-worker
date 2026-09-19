@@ -1,0 +1,25 @@
+{
+  "workers": {
+    "qoder": {
+      "cwd": "/home/person/Projects/orca-rust",
+      "tmux": "qoder"
+    },
+    "pugc": {
+      "cwd": "/home/person/Projects/distribution-project/pugc-ade",
+      "tmux": "pugc"
+    },
+    "zzbrush": {
+      "cwd": "/home/person/Projects/zzbrush",
+      "tmux": null
+    },
+    "minecraft": {
+      "cwd": "/home/person/Projects/minecraft-server-project",
+      "tmux": null,
+      "terminal": "term_8e21fb5c-7632-4601-a60f-07d804858886"
+    },
+    "korea-metro-twin": {
+      "cwd": "/work/korea-metro-twin",
+      "tmux": null
+    }
+  }
+}
