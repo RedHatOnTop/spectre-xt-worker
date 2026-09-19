@@ -1,0 +1,96 @@
+# Codex CLI configuration, Spectre worker profile.
+# Installed to ~/.codex/config.toml by scripts/install-codex.sh (only when
+# absent — an existing config on the box is never clobbered).
+#
+# Box deltas from the daily-driver config, on purpose:
+#   - [desktop], [plugins], [marketplaces], mcp_servers.node_repl, [windows]
+#     and the hooks.state trust records belong to the ChatGPT desktop app and
+#     do not apply to a headless box.
+#   - MCP: exa / context7 / sequential-thinking only. github has no token on
+#     the box, filesystem points at a desktop path, node_repl needs the
+#     ChatGPT desktop runtime.
+#   - Project trust lists only paths that exist on the box.
+# Secrets by name only (repo rule): the third-party API key lives at
+# ~/.codex/modes/keys/<provider> (0600) and reaches Codex as
+# CODEX_THIRDPARTY_API_KEY via ~/.codex/modes/env.sh; the two MCP keys below
+# are placeholders that install-codex.sh substitutes when EXA_API_KEY /
+# CONTEXT7_API_KEY are exported in its environment.
+#
+# The [model_providers.thirdparty] block at the bottom is managed by
+# codex-mode (codex-mode:begin/end markers). Do not hand-edit between them.
+
+model = "gpt-6-astra"
+model_provider = "thirdparty"
+model_catalog_json = "/home/person/.codex/modes/thirdparty-catalog.json"
+model_reasoning_effort = "xhigh"
+personality = "pragmatic"
+approval_policy = "never"
+sandbox_mode = "danger-full-access"
+model_instructions_file = "/home/person/.codex/instructions.md"
+service_tier = "default"
+
+[notice]
+hide_rate_limit_model_nudge = true
+
+[features]
+multi_agent = true
+
+# PreToolUse guard: the Codex-shaped irreversible-guard (exit 2 blocks, exit 0
+# allows). Guard posture on the box (changed 2026-09-16 by user decision): only
+# the irreversibility barrier is kept, so the agent has the full working surface
+# — no read-guard, no size/secret read limits. Approvals are off and the sandbox
+# is full-access, so this hook is the only barrier between an instruction and an
+# action that cannot be undone; read-only mistakes are recoverable, irreversible
+# ones are not. Codex-shaped files matter here too: a Claude-shaped guard under
+# ~/.codex matches no Codex tool name and would be silently inert.
+#
+# The override window is `touch ~/.codex/.allow-irreversible` (10 minutes, class
+# 1 only). Class 2 (writing this config, the hooks dir, re-entering Codex with
+# the guard off) stays blocked — that is a human action by design.
+[[hooks.PreToolUse]]
+command = "node /home/person/.codex/hooks/irreversible-guard.mjs"
+
+[mcp_servers.exa]
+command = "npx"
+args = ["-y", "exa-mcp-server"]
+
+[mcp_servers.exa.env]
+EXA_API_KEY = "<exa-api-key>"
+
+[mcp_servers.context7]
+command = "npx"
+args = ["-y", "@upstash/context7-mcp", "--api-key", "<context7-api-key>"]
+
+[mcp_servers.sequential-thinking]
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-sequential-thinking"]
+
+[projects."/home/person"]
+trust_level = "trusted"
+
+[projects."/home/person/Projects"]
+trust_level = "trusted"
+
+[projects."/home/person/Projects/distribution-project"]
+trust_level = "trusted"
+
+[projects."/home/person/Projects/distribution-project/remote-agent"]
+trust_level = "trusted"
+
+[projects."/home/person/.codex"]
+trust_level = "trusted"
+
+[projects."/work"]
+trust_level = "trusted"
+
+[projects."/tmp"]
+trust_level = "trusted"
+
+# codex-mode:begin
+[model_providers.thirdparty]
+name = "Third-party API"
+base_url = "https://anyrouter.top/v1"
+wire_api = "responses"
+env_key = "CODEX_THIRDPARTY_API_KEY"
+requires_openai_auth = false
+# codex-mode:end
