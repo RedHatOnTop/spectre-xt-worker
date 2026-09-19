@@ -57,10 +57,20 @@ class IdentityTest(unittest.TestCase):
     def setUp(self) -> None:
         self.agents = slack_notify.load_registry(ROOT / "config" / "slack-agents.json")
 
-    def test_registry_has_the_seven_agents(self) -> None:
+    def test_registry_has_the_nine_agents(self) -> None:
         self.assertEqual(
             sorted(self.agents),
-            ["bridge", "claude", "healthcheck", "orca", "qoder", "spectre", "zcode"],
+            [
+                "antigravity",
+                "bridge",
+                "claude",
+                "grok",
+                "healthcheck",
+                "orca",
+                "qoder",
+                "spectre",
+                "zcode",
+            ],
         )
 
     def test_known_agent_lookup(self) -> None:
@@ -184,7 +194,7 @@ class CliSubprocessTest(unittest.TestCase):
             env_file.chmod(0o600)
             proc = self.run_cli("--self-test", "--env-file", str(env_file))
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertIn("OK (4 channels, 7 agents)", proc.stdout)
+        self.assertIn("OK (4 channels, 9 agents)", proc.stdout)
         self.assertNotIn(FAKE_TOKEN, proc.stdout)
 
 

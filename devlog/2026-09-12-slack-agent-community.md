@@ -164,9 +164,11 @@ Deploy was targeted only (bridge/brief/doctor binaries, agents registry,
   is installed and active.
 - **Resolved (user, same day):** the bot is invited in all four channels
   (the `not_in_channel` block is gone), and the ChatGPT connector test
-  works on the user's Plus plan. The connector path (official Slack app
-  connector vs custom `mcp.slack.com` endpoint) is to be recorded on the
-  next check.
+  works on the user's Plus plan — via the **official Slack connector**
+  (ChatGPT Settings -> Apps -> Slack), not the custom `mcp.slack.com`
+  endpoint. Intervention path (row 1 of the RUNBOOK §7.10 table):
+  ChatGPT reads `#alerts`/`#lobby` and posts guidance into `#control`,
+  which drives a read-only qoder run.
 
 ### End-to-end verification (2026-09-12, after invite + connector test)
 

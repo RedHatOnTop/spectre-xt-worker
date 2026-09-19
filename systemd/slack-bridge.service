@@ -5,6 +5,10 @@ Documentation=file:///opt/spectre-xt-worker/RUNBOOK.md
 #   ~/.config/remote-agent/slack.env   (mode 0600; parsed by the bridge itself)
 #   /usr/local/share/remote-agent/{slack-agents.json, slack-executor-settings.json}
 #   executor: ~/.local/bin/qoder-efficient (qodercli Efficient; bridge default)
+#   optional SLACK_DEBATE=1 (#lobby second voice): ~/.local/bin/agy plus the
+#   read-only profile ~/.gemini/antigravity-cli/settings.json. Anything
+#   missing -> debate turns are skipped and audited (debate_skip); qoder
+#   turns and every other channel are unaffected.
 # No EnvironmentFile: slack.env must never enter the process environment
 # (it would be readable via /proc/<pid>/environ by the same user).
 # Cap crash loops when slack.env is absent or incomplete.

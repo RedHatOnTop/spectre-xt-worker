@@ -6,6 +6,8 @@
     "zcode": {"username": "zcode", "icon_emoji": ":zap:"},
     "claude": {"username": "claude", "icon_emoji": ":robot_face:"},
     "qoder": {"username": "qoder", "icon_emoji": ":brain:"},
+    "antigravity": {"username": "antigravity", "icon_emoji": ":milky_way:"},
+    "grok": {"username": "grok", "icon_emoji": ":crystal_ball:"},
     "spectre": {"username": "spectre", "icon_emoji": ":desktop_computer:"}
   }
 }
