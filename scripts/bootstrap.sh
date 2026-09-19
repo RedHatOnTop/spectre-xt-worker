@@ -169,10 +169,18 @@ if [[ -n "${PERSON_HOME}" ]]; then
   install -m 0644 -o "${PERSON_USER}" -g "${PERSON_USER}" \
     "${REPO_DIR}/systemd/tmux-work.service" \
     "${PERSON_HOME}/.config/systemd/user/tmux-work.service"
+  install -m 0644 -o "${PERSON_USER}" -g "${PERSON_USER}" \
+    "${REPO_DIR}/systemd/spectre-worker-state.service" \
+    "${PERSON_HOME}/.config/systemd/user/spectre-worker-state.service"
   sudo -u "${PERSON_USER}" XDG_RUNTIME_DIR="/run/user/$(id -u "${PERSON_USER}")" \
-    systemctl --user enable tmux-work.service 2>/dev/null || true
+    systemctl --user enable tmux-work.service spectre-worker-state.service 2>/dev/null || true
 fi
 
+install -d -m 0755 /usr/local/lib/spectre-worker-state/worker_state
+install -m 0644 "${REPO_DIR}/scripts/worker_state/"*.py \
+  "${REPO_DIR}/scripts/worker_state/schema.sql" \
+  /usr/local/lib/spectre-worker-state/worker_state/
+install -m 0755 "${REPO_DIR}/scripts/spectre-state.py" /usr/local/bin/spectre-state
 install -m 0755 "${REPO_DIR}/scripts/status.sh" /usr/local/bin/spectre-status
 install -m 0755 "${REPO_DIR}/scripts/pull-operator-keys.sh" /usr/local/bin/spectre-pull-keys
 cat >/etc/profile.d/spectre-motd.sh <<'EOF'

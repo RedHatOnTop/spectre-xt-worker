@@ -457,6 +457,43 @@ after quitting.
 
 ---
 
+## 7.6 Authoritative worker-state (shadow, since 2026-09-19)
+
+A last-record classifier (age of the newest session-jsonl line) is a
+bad occupancy signal: a `model.request.started` older than 600 s looks
+idle while a tool is still running. `spectre-state` is the single
+resolver. **Shadow only until cutover** — nothing is typed from a new
+snapshot.
+
+- Daemon: user unit `spectre-worker-state.service`, Unix socket
+  `$XDG_RUNTIME_DIR/spectre-worker-state.sock`, SQLite WAL at
+  `~/.local/state/remote-agent/worker-state.sqlite`.
+- CLI is a client: `spectre-state get pugc`, `health`, `reconcile pugc`,
+  `ingest`.
+- Policy: unseen workers are IDLE (`can_dispatch_goal`); API-down is
+  UNKNOWN and fail-closed. PARKED carries `park_reason` (`goal_budget`
+  allows resume, `plan_gate` does not). Tmux/orca pane targeting stays
+  out of the resolver.
+- Adapter tails qoder session jsonl as evidence, not as a classifier.
+  Shadow comparison against a last-record probe (when present) logs to
+  `/work/logs/worker-state-shadow.jsonl`.
+
+```bash
+install -d -m 755 /usr/local/lib/spectre-worker-state/worker_state
+install -m 644 scripts/worker_state/*.py scripts/worker_state/schema.sql \
+  /usr/local/lib/spectre-worker-state/worker_state/
+install -m 755 scripts/spectre-state.py /usr/local/bin/spectre-state
+install -m 644 systemd/spectre-worker-state.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now spectre-worker-state.service
+python3 -m unittest discover -s tests -p 'test_worker_state*.py'
+spectre-state health
+```
+
+Spectre enablement is unverified until the unit is started on the box.
+
+---
+
 ## 8. Monitoring
 
 User timer every 60 s, `scripts/healthcheck.sh`:
