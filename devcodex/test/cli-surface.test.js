@@ -1,0 +1,20 @@
+const assert = require('node:assert/strict')
+const test = require('node:test')
+
+const { usage } = require('../src/cli')
+
+test('CLI surface stays focused on the single-agent workspace runtime', () => {
+  const text = usage()
+  assert.doesNotMatch(text, /devcodex providers/)
+  assert.doesNotMatch(text, /devcodex agent-(?:plan|start|poll|runs|stop|batch)/)
+  assert.doesNotMatch(text, /devcodex snapshot/)
+  assert.doesNotMatch(text, /devcodex handoff-/)
+  assert.doesNotMatch(text, /devcodex (?:goal-|queue-|bg-)/)
+  assert.doesNotMatch(text, /devcodex session-(?:start|status|timeline|steer|fork|rollback)/)
+  assert.match(text, /devcodex bootstrap .*--session ID.*--resume-latest/)
+  assert.match(text, /devcodex session-note/)
+  assert.match(text, /devcodex complete/)
+  assert.match(text, /devcodex write <path>/)
+  assert.match(text, /devcodex edit <path>/)
+  assert.match(text, /devcodex run <command/)
+})

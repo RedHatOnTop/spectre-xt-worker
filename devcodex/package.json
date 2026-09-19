@@ -1,0 +1,23 @@
+{
+  "name": "devcodex",
+  "version": "1.0.0-rc.1",
+  "private": true,
+  "description": "A compact single-agent workspace runtime for DevSpace with durable task context and evidence-backed completion.",
+  "bin": {
+    "devcodex": "src/cli.js"
+  },
+  "files": [
+    "src/",
+    "docs/",
+    "README.md"
+  ],
+  "scripts": {
+    "test": "node --test test/*.test.js",
+    "test:coverage": "node --test --experimental-test-coverage test/*.test.js",
+    "check": "npm test && npm run test:coverage",
+    "mcp": "node src/cli.js mcp"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
