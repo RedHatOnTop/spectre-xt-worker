@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "command(regex:git (status|diff|log|show|add|commit))",
+      "command(regex:npm run (test|lint|build|typecheck|check))",
+      "command(regex:npm test)",
+      "command(regex:python3? -m pytest)",
+      "command(regex:pytest)",
+      "write_file(src/)"
+    ]
+  }
+}
