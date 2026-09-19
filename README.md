@@ -34,6 +34,9 @@ sudo spectre-bind-cockpit
 spectre-pull-keys fedora
 ```
 
+Worker occupancy is being centralized in `spectre-state` (UDS JSON API +
+SQLite journal, RUNBOOK §7.6). The daemon is **shadow-only** until cutover.
+
 Phone control that still works when Z.ai is down: Tailscale on the
 Fold 7 → Termius → `tmux attach -t work`. Cockpit at
 `https://spectre.tail1fa7c9.ts.net:9090`. ZCode Remote is a view, not
