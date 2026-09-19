@@ -194,17 +194,52 @@ if [[ -n "${PERSON_HOME}" ]]; then
     "${REPO_DIR}/systemd/slack-bridge.service" \
     "${REPO_DIR}/systemd/slack-brief.service" \
     "${REPO_DIR}/systemd/slack-brief.timer" \
+    "${REPO_DIR}/systemd/devspace.service" \
+    "${REPO_DIR}/systemd/goal-supervisor.service" \
+    "${REPO_DIR}/systemd/goal-supervisor.timer" \
+    "${REPO_DIR}/systemd/spectre-worker-state.service" \
+    "${REPO_DIR}/systemd/spectre-continuity.service" \
+    "${REPO_DIR}/systemd/spectre-continuity.timer" \
+    "${REPO_DIR}/systemd/qoder-goal-watch.service" \
+    "${REPO_DIR}/systemd/qoder-goal-watch.timer" \
     "${PERSON_HOME}/.config/systemd/user/"
   USER_UID="$(id -u "${PERSON_USER}")"
   install -d -m 0700 -o "${PERSON_USER}" -g "${PERSON_USER}" "/run/user/${USER_UID}"
   sudo -u "${PERSON_USER}" XDG_RUNTIME_DIR="/run/user/${USER_UID}" \
     systemctl --user daemon-reload 2>/dev/null || true
   sudo -u "${PERSON_USER}" XDG_RUNTIME_DIR="/run/user/${USER_UID}" \
-    systemctl --user enable tmux-work.service worker-health.timer 2>/dev/null || true
+    systemctl --user enable tmux-work.service worker-health.timer \
+      spectre-worker-state.service spectre-continuity.timer \
+      qoder-goal-watch.timer 2>/dev/null || true
+  # Retired consumer paths (RUNBOOK 7.17): after the worker-state cutover these
+  # classify worker occupancy from session jsonl or TUI screen text on their own
+  # and could type a second, contradictory /goal or resume. A box that predates
+  # the cutover still has them enabled; a fresh bootstrap never installs them.
+  for legacy in qoder-nudge.timer qoder-continuity.timer \
+                codex-goal-healer.timer grokbot-goal-event.timer \
+                grokbot-goal-event.path; do
+    sudo -u "${PERSON_USER}" XDG_RUNTIME_DIR="/run/user/${USER_UID}" \
+      systemctl --user disable --now "${legacy}" 2>/dev/null || true
+  done
   # Slack community units: only once slack.env was written (RUNBOOK 7.10 C).
   if [[ -f "${PERSON_HOME}/.config/remote-agent/slack.env" ]]; then
     sudo -u "${PERSON_USER}" XDG_RUNTIME_DIR="/run/user/${USER_UID}" \
       systemctl --user enable slack-bridge.service slack-brief.timer 2>/dev/null || true
+  fi
+  # devspace connector unit: enable only once the binary is actually
+  # installed (RUNBOOK 7.14) — a unit that cannot exec is boot noise.
+  if command -v devspace >/dev/null 2>&1; then
+    sudo -u "${PERSON_USER}" XDG_RUNTIME_DIR="/run/user/${USER_UID}" \
+      systemctl --user enable devspace.service 2>/dev/null || true
+  fi
+  # Goal supervisor (RUNBOOK 7.15): enabled only when the reviewer can actually
+  # run — grok present AND its isolated GROK_HOME profile installed. Otherwise
+  # every tick would fail closed for nothing; the timer stays installed-off and
+  # the RUNBOOK enable step is the switch.
+  if [[ -x "${PERSON_HOME}/.local/bin/grok" && \
+        -f "${PERSON_HOME}/.local/share/remote-agent/grok-supervisor/config.toml" ]]; then
+    sudo -u "${PERSON_USER}" XDG_RUNTIME_DIR="/run/user/${USER_UID}" \
+      systemctl --user enable goal-supervisor.timer 2>/dev/null || true
   fi
   # If the user bus was not up yet (fresh boot), start the timer on next login.
   if command -v loginctl >/dev/null 2>&1; then
@@ -215,7 +250,16 @@ fi
 install -m 0755 "${REPO_DIR}/scripts/status.sh" /usr/local/bin/spectre-status
 install -m 0755 "${REPO_DIR}/scripts/pull-operator-keys.sh" /usr/local/bin/spectre-pull-keys
 install -m 0755 "${REPO_DIR}/scripts/doctor.sh" /usr/local/bin/spectre-doctor
+# DevSpace tilde-path patch (RUNBOOK 7.14): `npm install -g @waishnav/devspace`
+# overwrites dist/, so the box keeps the re-apply tool beside the doctor.
+install -m 0755 "${REPO_DIR}/scripts/patch-devspace-tilde.sh" /usr/local/bin/spectre-patch-devspace-tilde
 install -m 0755 "${REPO_DIR}/scripts/session-sync.sh" /usr/local/bin/session-sync
+# Codex session handoff (RUNBOOK 7.15): the CLI for the user, the rollout
+# helper where codex-handoff.sh and its remote helper lookup expect it.
+install -m 0755 "${REPO_DIR}/scripts/codex-handoff.sh" /usr/local/bin/codex-handoff
+install -d -m 0755 /usr/local/lib/spectre-codex
+install -m 0644 "${REPO_DIR}/scripts/codex_rollout.py" \
+  /usr/local/lib/spectre-codex/codex_rollout.py
 
 # Slack agent community (RUNBOOK 7.10). Install only; the bridge unit is
 # enabled below once ~/.config/remote-agent/slack.env exists.
@@ -223,13 +267,63 @@ install -d -m 0755 /usr/local/share/remote-agent
 install -m 0755 "${REPO_DIR}/scripts/slack-notify.py" /usr/local/bin/spectre-slack-notify
 install -m 0755 "${REPO_DIR}/scripts/slack-brief.py" /usr/local/bin/spectre-slack-brief
 install -m 0755 "${REPO_DIR}/scripts/slack-bridge.mjs" /usr/local/bin/spectre-slack-bridge
+install -m 0755 "${REPO_DIR}/scripts/worker-state-client.mjs" /usr/local/bin/worker-state-client.mjs
 install -m 0644 "${REPO_DIR}/config/slack-agents.json" /usr/local/share/remote-agent/slack-agents.json
+# Goal supervisor (RUNBOOK 7.15): the Grokbot reviewer. Installed off — the
+# timer is enabled above only once grok and its isolated profile exist.
+install -m 0755 "${REPO_DIR}/scripts/goal-supervisor.py" /usr/local/bin/spectre-goal-supervisor
+# Authoritative worker-state daemon (RUNBOOK 7.17): the single resolver every
+# consumer asks. Package lives next to the CLI so `serve` and the client share
+# one resolver.
+install -d -m 0755 /usr/local/lib/spectre-worker-state/worker_state
+install -m 0644 "${REPO_DIR}/scripts/worker_state/"*.py \
+  "${REPO_DIR}/scripts/worker_state/schema.sql" \
+  /usr/local/lib/spectre-worker-state/worker_state/
+install -m 0755 "${REPO_DIR}/scripts/spectre-state.py" /usr/local/bin/spectre-state
+install -m 0755 "${REPO_DIR}/scripts/spectre-continuity.py" /usr/local/bin/spectre-continuity
+install -m 0644 "${REPO_DIR}/config/goal-supervisor-prompt.md" \
+  /usr/local/share/remote-agent/goal-supervisor-prompt.md
+# The reviewer's isolated GROK_HOME profile: without it the grok CLI would scan
+# vendor MCP/config sources and the read-only floor would leak (a live probe
+# caught the model reaching for an MCP write tool).
+# Marker-based, not "if absent": an empty GROK_HOME self-initializes on the first
+# grok run and writes its own stub config.toml (probed 2026-09-15 — a 2-line
+# [marketplace] block), which would otherwise shadow this profile forever. A file
+# that already carries the marker is left alone, with a backup taken first.
+if [[ -n "${PERSON_HOME}" ]]; then
+  grok_profile_dir="${PERSON_HOME}/.local/share/remote-agent/grok-supervisor"
+  install -d -m 0755 -o "${PERSON_USER}" -g "${PERSON_USER}" "${grok_profile_dir}"
+  if ! grep -qs '^disabled_mcp_servers' "${grok_profile_dir}/config.toml" 2>/dev/null; then
+    if [[ -f "${grok_profile_dir}/config.toml" ]]; then
+      cp -a "${grok_profile_dir}/config.toml" \
+        "${grok_profile_dir}/config.toml.bak-$(date -u +%Y%m%dT%H%M%SZ)"
+    fi
+    install -m 0644 -o "${PERSON_USER}" -g "${PERSON_USER}" \
+      "${REPO_DIR}/config/grok-supervisor/config.toml" \
+      "${grok_profile_dir}/config.toml.incoming"
+    mv "${grok_profile_dir}/config.toml.incoming" "${grok_profile_dir}/config.toml"
+  fi
+fi
+# The reviewer credential example (RUNBOOK 7.16 auth): reference only. The real
+# ~/.config/remote-agent/grok.env is user-owned, written by hand, mode 0600 and
+# never committed — nothing here writes it.
+install -m 0644 "${REPO_DIR}/config/grok.env.example" \
+  /usr/local/share/remote-agent/grok.env.example
+# #lobby debate (RUNBOOK 7.10): the example read-only agy profile. Installed
+# to the share dir only — the live path ~/.gemini/antigravity-cli/settings.json
+# is user-owned and hand-installed; nothing here ever writes ~/.gemini.
+install -m 0644 "${REPO_DIR}/config/agy-slack-settings.example.json" \
+  /usr/local/share/remote-agent/agy-slack-settings.example.json
 # Executor settings: the repo is the source of truth for allow (so
 # tightenings land on installed boxes) and defaultMode; the deny list is
 # unioned so local hardening is never lost. Unknown local keys (a hand-added
 # hooks section, say) are dropped — qodercli does not execute them anyway.
 settings_dest=/usr/local/share/remote-agent/slack-executor-settings.json
 settings_src="${REPO_DIR}/config/slack-executor-settings.example.json"
+# The merge below only ever ADDS deny entries, so it can tighten but never
+# widen — a repo deny removal does not reach an existing live file. The
+# 2026-09-16 widened posture was applied by replacing the live file from the
+# repo by hand; from then on the union is idempotent (RUNBOOK 7.10).
 if [[ ! -f "${settings_dest}" ]]; then
   # same tmp + mv dance as the merge path below: a partial file must not
   # "exist" and shadow every future install
@@ -291,6 +385,27 @@ fi
 install -m 0755 "${REPO_DIR}/scripts/pin-zcode-settings.sh" /usr/local/bin/spectre-pin-zcode
 install -m 0755 "${REPO_DIR}/scripts/bind-cockpit.sh" /usr/local/bin/spectre-bind-cockpit
 bash "${REPO_DIR}/scripts/install-warp.sh"
+
+# Codex CLI (RUNBOOK 7.11). npm failure must not abort the rest of the
+# bootstrap; the provider key is transferred from the daily driver later.
+if ! bash "${REPO_DIR}/scripts/install-codex.sh" "${PERSON_USER}"; then
+  echo "WARNING: install-codex.sh failed. Re-run it later:" >&2
+  echo "  sudo bash ${REPO_DIR}/scripts/install-codex.sh ${PERSON_USER}" >&2
+fi
+
+# Headless browser for every agent (RUNBOOK 7.12). Needs the network for the
+# release tarball; a CDN failure must not abort the rest of the bootstrap.
+if ! bash "${REPO_DIR}/scripts/install-obscura.sh" "${PERSON_USER}"; then
+  echo "WARNING: install-obscura.sh failed. Re-run it later:" >&2
+  echo "  sudo bash ${REPO_DIR}/scripts/install-obscura.sh ${PERSON_USER}" >&2
+fi
+
+# Workspace companion for the agents (RUNBOOK 7.13). Vendored tree, no network;
+# a failure must not abort the rest of the bootstrap.
+if ! bash "${REPO_DIR}/scripts/install-devcodex.sh" "${PERSON_USER}"; then
+  echo "WARNING: install-devcodex.sh failed. Re-run it later:" >&2
+  echo "  sudo bash ${REPO_DIR}/scripts/install-devcodex.sh ${PERSON_USER}" >&2
+fi
 if tailscale ip -4 >/dev/null 2>&1; then
   bash "${REPO_DIR}/scripts/bind-cockpit.sh" || true
 fi
@@ -309,6 +424,7 @@ echo "  sudo spectre-bind-cockpit"
 echo "  spectre-pin-zcode   # after starting ZCode once (creates setting.json)"
 echo "  copy hardened-zai-proxy into /work/hardened-zai-proxy (no node_modules)"
 echo "  systemctl --user enable --now glm-proxy.service"
+echo "  transfer codex provider registry + key from fedora (RUNBOOK 7.11)"
 echo "  fill NTFY_TOPIC:  cp config/health.env.example ~/.config/remote-agent/health.env"
 echo "  sudo spectre-stealth closed && close the lid"
 echo "  warp to fedora / warp from fedora   (same path as on the Zenbook)"

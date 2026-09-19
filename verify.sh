@@ -31,7 +31,7 @@ else
 fi
 
 section "python compile"
-if python3 -m py_compile scripts/*.py; then
+if python3 -m py_compile scripts/*.py scripts/worker_state/*.py; then
   echo "ok    py_compile"
 else
   echo "FAIL  py_compile"
@@ -57,6 +57,21 @@ if command -v node >/dev/null 2>&1; then
   fi
 else
   echo "SKIP  node not installed (bridge runtime)"
+fi
+
+section "node (devcodex, vendored)"
+if command -v node >/dev/null 2>&1; then
+  dcx_out="$(node --test devcodex/test/*.test.js 2>&1)"
+  rc=$?
+  echo "${dcx_out}" | tail -3
+  if [[ ${rc} -ne 0 ]]; then
+    echo "FAIL  devcodex tests"
+    failed=1
+  else
+    echo "ok    devcodex tests"
+  fi
+else
+  echo "SKIP  node not installed (devcodex runtime)"
 fi
 
 section "unit tests"
