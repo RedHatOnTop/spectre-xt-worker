@@ -1,0 +1,36 @@
+[Unit]
+Description=Spectre goal supervisor (Grokbot: review a stopped /goal unit, dispatch the next one)
+Documentation=file:///opt/spectre-xt-worker/RUNBOOK.md
+# Prereqs (RUNBOOK 7.16):
+#   ~/.local/bin/grok, logged in with GROK_HOME=~/.local/share/remote-agent/grok-supervisor
+#     (headless auth: `GROK_HOME=... grok login --device-auth`; auth.json stays 0600)
+#   ~/.local/share/remote-agent/grok-supervisor/config.toml (repo: config/grok-supervisor/)
+#   /usr/local/bin/spectre-qoder-goal-watch   (park probe)
+#   /usr/local/bin/spectre-slack-bridge       (guarded dispatch: --dispatch)
+#   /usr/local/bin/spectre-slack-notify       (reports; reads slack.env itself)
+# A missing piece is reported, not guessed: without grok the review fails closed
+# and the stop stays unhandled for the next tick (RUNBOOK 7.16).
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=oneshot
+# The kill switch. Delete this line (or set it to 0/empty) and the unit becomes a
+# no-op that only prints "disabled" — the installed-off default.
+Environment=SPECTRE_GOAL_SUPERVISOR=1
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+# HOME for Path.home(): grok state, the state file, the neutral review cwd.
+Environment=HOME=%h
+# RUNBOOK 7.8 gotcha: user units inherit the lightdm/XFCE session env.
+UnsetEnvironment=DESKTOP_SESSION XDG_CURRENT_DESKTOP XDG_SESSION_TYPE DISPLAY
+NoNewPrivileges=true
+# No PrivateTmp=true: the supervisor reads worker session jsonl under /home and
+# /work, and its own log path is /work/logs — a private tmp namespace would hide
+# the very evidence it reviews (the slack-bridge unit learned this the hard way
+# for /proc).
+# No EnvironmentFile: slack.env must never enter this process environment. The
+# reviewer's child env is whitelisted by the script itself, so a secret in the
+# unit environment could not reach the model call either.
+ExecStart=/usr/local/bin/spectre-goal-supervisor --scan
+# One grok call per stop (300 s timeout inside the script) plus probe/git work.
+TimeoutStartSec=600

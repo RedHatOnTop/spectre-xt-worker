@@ -1,0 +1,70 @@
+# Isolated GROK_HOME for the goal supervisor (Grokbot, RUNBOOK 7.16).
+#
+# Why a separate home: the reviewer's read-only floor comes from flags, but the
+# `--tools` allowlist only covers *built-in* tools — MCP servers stay reachable.
+# A live probe on the daily driver caught the model trying
+# `gateway__filesystem_1mcp_write_file` instead of a built-in write tool
+# (2026-09-15), so the supervisor's `--deny` rules are the second layer, not the
+# first. This home is the first: no MCP server is declared here and vendor
+# config scanning is off, so there is nothing to reach.
+#
+# bootstrap.sh installs this to
+#   ~/.local/share/remote-agent/grok-supervisor/config.toml
+# (user-owned: `grok login --device-auth` run with GROK_HOME pointing here has
+# to write auth.json, mode 0600, next to it — never committed, never copied).
+#
+# Every key below is documented in the grok user guide; an unknown key is a
+# startup risk, so keep this file minimal.
+#
+# TOML note: bare keys must come before the first table header, or they land
+# inside that table (this file's `disabled_mcp_servers` did exactly that once).
+# Belt: any server that some vendor scan or a stray file still declares is
+# skipped by name. Add names here rather than trusting the compat switches.
+disabled_mcp_servers = []
+
+[cli]
+# The supervisor is a oneshot unit; an update check is dead weight and noise.
+auto_update = false
+
+# [auth]
+# Authentication default: NONE of this table. Run the device-code login once
+#   GROK_HOME=<this dir> grok login --device-auth
+# and grok writes auth.json here (0600), then refreshes the token by itself. One
+# browser approval, and nothing to rotate or copy — this is the recommended path.
+#
+# The commented pin below is the no-login alternative (XAI_API_KEY in
+# ~/.config/remote-agent/grok.env, 0600, names only: config/grok.env.example).
+# It is REQUIRED for that path: verified on grok 1.0.30 (2026-09-15), a
+# well-formed XAI_API_KEY in an isolated home is otherwise refused with
+# "Not signed in … set the XAI_API_KEY environment variable"; with the pin the
+# key is used (a shape-valid dummy reached the API: "400 … Incorrect API key
+# provided"). It is a pin with no fallthrough, so a session token would then be
+# ignored — comment it out again to go back to the browser login.
+# preferred_method = "api_key"
+
+[ui]
+# The supervisor never shares a TUI, but pin the mode anyway: the reviewer runs
+# with --always-approve plus the deny floor, and a stray config could only
+# widen that.
+permission_mode = "always-approve"
+yolo = false
+
+[compat.claude]
+# Do not pick up ~/.claude MCP servers, hooks, rules, skills or agents: none of
+# them belong to a reviewer that must stay hermetic.
+mcps = false
+hooks = false
+rules = false
+skills = false
+agents = false
+
+[compat.cursor]
+mcps = false
+hooks = false
+rules = false
+skills = false
+agents = false
+
+[compat.codex]
+hooks = false
+skills = false
