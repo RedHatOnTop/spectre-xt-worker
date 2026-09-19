@@ -26,12 +26,18 @@ fi
 
 proxy_status="down"
 proxy_keys="0"
-if curl -fsS --max-time 2 http://127.0.0.1:18088/health >/tmp/spectre-health.json 2>/dev/null; then
-  proxy_status="$(jq -r '.status // "unknown"' /tmp/spectre-health.json)"
-  proxy_keys="$(jq -r '.activeKeys // 0' /tmp/spectre-health.json)"
+if [[ -d /work/hardened-zai-proxy || -e "${HOME}/.config/systemd/user/glm-proxy.service" ]]; then
+  if curl -fsS --max-time 2 http://127.0.0.1:18088/health >/tmp/spectre-health.json 2>/dev/null; then
+    proxy_status="$(jq -r '.status // "unknown"' /tmp/spectre-health.json)"
+    proxy_keys="$(jq -r '.activeKeys // 0' /tmp/spectre-health.json)"
+  fi
+else
+  proxy_status="retired"
 fi
 
-if pgrep -f '/zcode|[/ ]ZCode' >/dev/null 2>&1; then
+if [[ ! -e /opt/ZCode && ! -e "${HOME}/.zcode" ]]; then
+  zcode_state="retired"
+elif pgrep -f '/zcode|[/ ]ZCode' >/dev/null 2>&1; then
   zcode_state="running"
 else
   zcode_state="not_running"

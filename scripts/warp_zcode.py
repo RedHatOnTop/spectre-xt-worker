@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import sqlite3
+import uuid
 from pathlib import Path
 
 TABLES = (
@@ -132,7 +133,21 @@ def export_sessions(src_db: Path, directory: str, bundle: Path) -> dict[str, int
     return _aliased(counts)
 
 
-def import_sessions(bundle: Path, dest_db: Path) -> dict[str, int]:
+def _fresh_id(old_id: str, taken: set[str]) -> str:
+    """Generate a new session id derived from old_id, unique vs taken."""
+    candidate = f"{old_id[:8]}-replay-{uuid.uuid4().hex[:12]}"
+    while candidate in taken:
+        candidate = f"{old_id[:8]}-replay-{uuid.uuid4().hex[:12]}"
+    return candidate
+
+
+def import_sessions(
+    bundle: Path, dest_db: Path, *, as_new: bool = False
+) -> dict[str, int]:
+    """Import a bundle. With as_new=True (the safe default for pulling
+    sessions onto a machine that may already hold them), every imported
+    session gets a fresh id so nothing already on this machine is ever
+    overwritten — the incoming history appears as new sessions."""
     if not dest_db.exists():
         raise FileNotFoundError(
             f"destination ZCode db missing: {dest_db} (open ZCode once on this machine first)"
@@ -142,6 +157,19 @@ def import_sessions(bundle: Path, dest_db: Path) -> dict[str, int]:
     dest.execute("PRAGMA foreign_keys=OFF")
     counts: dict[str, int] = {}
     try:
+        id_map: dict[str, str] = {}
+        if as_new and _table_exists(src, "session"):
+            taken = {r[0] for r in dest.execute("SELECT id FROM session")}
+            for row in src.execute("SELECT DISTINCT id FROM session").fetchall():
+                old = row[0]
+                id_map[old] = _fresh_id(old, taken | set(id_map.values()))
+            # Message ids live in their own namespace but parts reference
+            # them; remap them too so cross-references stay consistent.
+            if _table_exists(src, "message"):
+                for row in src.execute("SELECT DISTINCT id FROM message").fetchall():
+                    old = row[0]
+                    id_map.setdefault(old, f"{old}-r{uuid.uuid4().hex[:8]}")
+
         for table in TABLES:
             if not _table_exists(src, table) or not _table_exists(dest, table):
                 continue
@@ -153,11 +181,22 @@ def import_sessions(bundle: Path, dest_db: Path) -> dict[str, int]:
             col_sql = ", ".join(cols)
             placeholders = ", ".join("?" for _ in cols)
             rows = src.execute(f"SELECT {col_sql} FROM {table}").fetchall()
+            transformed: list[tuple] = []
+            for r in rows:
+                record = [r[c] for c in cols]
+                if id_map:
+                    for ref_col in ("id", "session_id", "message_id"):
+                        if ref_col in cols:
+                            idx = cols.index(ref_col)
+                            value = record[idx]
+                            if isinstance(value, str):
+                                record[idx] = id_map.get(value, value)
+                transformed.append(tuple(record))
             dest.executemany(
                 f"INSERT OR REPLACE INTO {table} ({col_sql}) VALUES ({placeholders})",
-                [tuple(r[c] for c in cols) for r in rows],
+                transformed,
             )
-            counts[table] = len(rows)
+            counts[table] = len(transformed)
         dest.commit()
     finally:
         dest.close()
@@ -177,13 +216,18 @@ def main() -> int:
     p_im = sub.add_parser("import")
     p_im.add_argument("--db", type=Path, required=True)
     p_im.add_argument("--from", dest="bundle", type=Path, required=True)
+    p_im.add_argument(
+        "--as-new",
+        action="store_true",
+        help="assign fresh ids so nothing existing is overwritten",
+    )
 
     args = parser.parse_args()
     if args.cmd == "export":
         summary = export_sessions(args.db, args.directory, args.out)
         print(summary)
         return 0 if summary["sessions"] else 1
-    summary = import_sessions(args.bundle, args.db)
+    summary = import_sessions(args.bundle, args.db, as_new=args.as_new)
     print(summary)
     return 0
 

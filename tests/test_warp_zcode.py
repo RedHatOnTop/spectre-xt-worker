@@ -157,6 +157,46 @@ class WarpZcodeTest(unittest.TestCase):
             self.assertEqual(check.execute("SELECT count(*) FROM todo").fetchone()[0], 1)
             check.close()
 
+    def test_import_as_new_never_overwrites_existing_sessions(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / "src.db"
+            bundle = Path(tmp) / "bundle.db"
+            dest = Path(tmp) / "dest.db"
+            path = "/ws"
+
+            s = _open(src)
+            _session(s, "sess-a", path)
+            s.commit()
+            s.close()
+
+            d = _open(dest)
+            _session(d, "sess-a", path)
+            # local copy has newer data that MUST survive the import
+            d.execute("UPDATE message SET data='{\"local\":true}' WHERE id='msg-sess-a'")
+            d.commit()
+            d.close()
+
+            warp_zcode.export_sessions(src, path, bundle)
+            summary = warp_zcode.import_sessions(bundle, dest, as_new=True)
+
+            check = sqlite3.connect(dest)
+            ids = sorted(r[0] for r in check.execute("SELECT id FROM session"))
+            # original untouched + one fresh replay session
+            self.assertEqual(ids[0], "sess-a")
+            self.assertEqual(len(ids), 2)
+            self.assertTrue(all(i.startswith("sess-a") for i in ids))
+            self.assertIn("replay", ids[1])
+            data = check.execute(
+                "SELECT data FROM message WHERE id='msg-sess-a'"
+            ).fetchone()[0]
+            self.assertIn('"local":true', data)  # not overwritten
+            imported_msgs = check.execute(
+                "SELECT count(*) FROM message WHERE id LIKE 'msg-sess-a-r%'"
+            ).fetchone()[0]
+            self.assertEqual(imported_msgs, 1)  # arrived under a new id
+            check.close()
+            self.assertEqual(summary["sessions"], 1)
+
     def test_import_replaces_same_session(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             src = Path(tmp) / "src.db"

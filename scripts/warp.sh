@@ -1,8 +1,13 @@
 #!/bin/bash
 # Move a live project + its ZCode sessions between fedora and spectre.
-# Same absolute path on both machines. Push-oriented:
-#   warp to spectre [path]
-#   warp from spectre [path]
+# Same absolute path on both machines.
+#
+#   warp push     this project -> the other machine
+#   warp pull     the other machine's project -> here
+#   warp status
+#
+# No peer argument: exactly two machines exist, so the peer is the
+# machine this one is not. "to/from spectre|fedora" still work.
 set -euo pipefail
 
 SOURCE="${BASH_SOURCE[0]}"
@@ -26,15 +31,19 @@ ZCODE_AGENTS="${HOME}/.zcode/cli/agents"
 
 usage() {
   cat <<'EOF'
-warp to <peer> [path]     send this workspace to the other machine
-warp from <peer> [path]   pull that workspace onto this machine
+warp push      send this project + its ZCode sessions to the other machine
+warp pull      bring the other machine's project + sessions here
 warp status
 
-Peers are Tailscale MagicDNS names. fedora <-> spectre.
+No arguments needed: the peer is whichever of fedora/spectre this box
+is not. Run inside the project directory; both machines must use the
+same absolute path (/home/person/Projects/...). Build dirs (target,
+node_modules) are skipped.
 
-Path defaults to the current directory. Keep the same absolute path on
-both machines (/home/person/Projects/...). Build dirs (target, node_modules)
-are skipped. Close ZCode on the destination before a receive.
+Sessions move only when the receiving machine still runs ZCode (the
+box retired it 2026-09-15): there, files land immediately and the
+session import waits in the background for ZCode to quit (10 min),
+then applies itself.
 EOF
 }
 
@@ -42,19 +51,43 @@ zcode_running() {
   pgrep -f '/zcode|[/ ]ZCode' >/dev/null 2>&1
 }
 
+this_host() {
+  hostname -s | tr '[:upper:]' '[:lower:]'
+}
+
+# The peer is the other machine. Accept legacy explicit peers too.
 resolve_peer() {
-  local peer="$1"
+  local peer="${1:-}"
   case "${peer}" in
-    spectre|Spectre|SPECTRE) peer=spectre ;;
-    fedora|Fedora|FEDORA|zenbook|duo) peer=fedora ;;
+    spectre|Spectre|SPECTRE|fedora|Fedora|FEDORA|zenbook|duo) ;;
+    "") ;;
+    *) echo "unknown peer '${peer}' (use fedora or spectre)" >&2; return 1 ;;
   esac
+  if [[ -z "${peer}" ]]; then
+    case "$(this_host)" in
+      spectre*) peer=fedora ;;
+      fedora*|zenbook*|duo*) peer=spectre ;;
+      *)
+        echo "hostname '$(this_host)' is neither fedora nor spectre;" >&2
+        echo "pass it explicitly: warp push fedora" >&2
+        return 1
+        ;;
+    esac
+  fi
+  case "${peer}" in
+    zenbook|duo) peer=fedora ;;
+  esac
+  if [[ "${peer}" == "$(this_host)" ]]; then
+    echo "peer resolves to this machine (${peer}); nothing to do" >&2
+    return 1
+  fi
   if command -v tailscale >/dev/null 2>&1; then
     if ! tailscale status --json 2>/dev/null | jq -e --arg h "${peer}" '
           .Peer[]? | select(.HostName==$h or .DNSName==($h+".") or (.DNSName|startswith($h+".")))
         ' >/dev/null; then
       echo "peer '${peer}' is not in this tailnet. tailscale status:" >&2
       tailscale status >&2 || true
-      exit 1
+      return 1
     fi
   fi
   printf '%s\n' "${peer}"
@@ -71,7 +104,10 @@ resolve_path() {
 ssh_peer() {
   local peer="$1"
   shift
-  ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=8 "${USER_NAME}@${peer}" "$@"
+  # Non-login ssh shells often miss ~/.local/bin, where install-warp.sh
+  # puts the binary on user installs (fedora). Prefix PATH explicitly.
+  ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=8 \
+    "${USER_NAME}@${peer}" "PATH=\"\${HOME}/.local/bin:\${PATH}\"; export PATH; $*"
 }
 
 rsync_to() {
@@ -82,12 +118,23 @@ rsync_to() {
     "${src%/}/" "${USER_NAME}@${peer}:${dest%/}/"
 }
 
+# The Spectre retired ZCode on 2026-09-15; a peer without its db gets
+# files only, no session bundle and no import scheduling.
+peer_has_zcode() {
+  ssh_peer "$1" "test -f '${ZCODE_DB}'" >/dev/null 2>&1
+}
+
 session_ids_from_bundle() {
   sqlite3 "$1" 'SELECT id FROM session' 2>/dev/null || true
 }
 
 cmd_status() {
-  echo "host:     $(hostname -s)"
+  echo "host:     $(this_host)"
+  if peer="$(resolve_peer 2>/dev/null)"; then
+    echo "peer:     ${peer}"
+  else
+    echo "peer:     unavailable (other machine not in the tailnet yet?)"
+  fi
   echo "user:     ${USER_NAME}"
   echo "cwd:      $(pwd -P)"
   if command -v tailscale >/dev/null 2>&1; then
@@ -136,16 +183,30 @@ apply_sessions() {
   if [[ ! -f "${bundle}" ]]; then
     return 0
   fi
-  if zcode_running; then
-    echo "ZCode is running here. Quit it, then: warp apply ${bundle}" >&2
-    echo "files already arrived. sessions are waiting in ${bundle}" >&2
-    return 2
-  fi
   if [[ ! -f "${ZCODE_DB}" ]]; then
     echo "open ZCode once on this machine so ${ZCODE_DB} exists, then rerun warp apply" >&2
     return 2
   fi
   python3 "${PY}" import --db "${ZCODE_DB}" --from "${bundle}"
+}
+
+# Schedule the session import on the receiving machine: wait for ZCode
+# to quit (max 10 min), then apply. Runs detached so the ssh session
+# can close. The sender never needs to think about it.
+schedule_remote_apply() {
+  local peer="$1" bundle="$2" path="$3"
+  ssh_peer "${peer}" "nohup sh -c '
+    for i in \$(seq 1 60); do
+      pgrep -f \"/zcode|[/ ]ZCode\" >/dev/null 2>&1 || break
+      sleep 10
+    done
+    if pgrep -f \"/zcode|[/ ]ZCode\" >/dev/null 2>&1; then
+      echo \"\$(date -u +%FT%TZ) zcode still open after 10m; bundle kept at ${bundle}\" >>\${HOME}/.cache/spectre-warp/apply.log
+    else
+      PATH=\${HOME}/.local/bin:\$PATH warp apply \"${bundle}\" \"${path}\" >>\${HOME}/.cache/spectre-warp/apply.log 2>&1 \
+        && echo \"\$(date -u +%FT%TZ) applied ${bundle}\" >>\${HOME}/.cache/spectre-warp/apply.log
+    fi
+  ' >/dev/null 2>&1 &"
 }
 
 write_last() {
@@ -164,24 +225,25 @@ write_last() {
   fi
 }
 
-cmd_to() {
+cmd_push() {
   local peer path remote_tmp
-  peer="$(resolve_peer "$1")"
+  peer="$(resolve_peer "${1:-}")"
   path="$(resolve_path "${2:-}")"
   [[ -d "${path}" ]] || { echo "not a directory: ${path}" >&2; exit 1; }
-  echo "warp to ${peer}: ${path}"
-  ssh_peer "${peer}" "mkdir -p '${path}' '${HOME}/.zcode/cli/artifacts' '${HOME}/.zcode/cli/agents' '${HOME}/.cache/spectre-warp'"
+  echo "warp push: $(this_host) -> ${peer}   ${path}"
+  ssh_peer "${peer}" "mkdir -p '${path}' '${HOME}/.cache/spectre-warp'"
   rsync_to "${peer}" "${path}" "${path}"
-  remote_tmp="$(ssh_peer "${peer}" 'mktemp -d ${HOME}/.cache/spectre-warp/in.XXXXXX')"
-  send_sessions "${peer}" "${path}" "${remote_tmp}"
-  local rc=0
-  ssh_peer "${peer}" "warp apply '${remote_tmp}/sessions.db' '${path}'" || rc=$?
-  write_last "to" "${peer}" "${path}"
-  if [[ ${rc} -eq 2 ]]; then
-    echo "files are on ${peer}. close ZCode there and run: warp apply ${remote_tmp}/sessions.db"
-    return 0
+  if peer_has_zcode "${peer}"; then
+    ssh_peer "${peer}" "mkdir -p '${HOME}/.zcode/cli/artifacts' '${HOME}/.zcode/cli/agents'"
+    remote_tmp="$(ssh_peer "${peer}" "mktemp -d '${HOME}/.cache/spectre-warp/in.XXXXXX'")"
+    send_sessions "${peer}" "${path}" "${remote_tmp}"
+    schedule_remote_apply "${peer}" "${remote_tmp}/sessions.db" "${path}"
+    write_last "push" "${peer}" "${path}"
+    echo "pushed. sessions import on ${peer} as soon as ZCode there is closed."
+  else
+    write_last "push" "${peer}" "${path}"
+    echo "pushed (files only). ${peer} has no ZCode — sessions skipped."
   fi
-  echo "warp to ${peer} done"
 }
 
 cmd_export_bundle() {
@@ -197,37 +259,67 @@ cmd_export_bundle() {
   printf '%s\n' "${out}"
 }
 
-cmd_from() {
+cmd_pull() {
   local peer path remote_bundle local_bundle id
-  peer="$(resolve_peer "$1")"
+  peer="$(resolve_peer "${1:-}")"
   path="$(resolve_path "${2:-}")"
-  echo "warp from ${peer}: ${path}"
-  mkdir -p "${path}" "${ZCODE_ARTIFACTS}" "${ZCODE_AGENTS}"
+  echo "warp pull: ${peer} -> $(this_host)   ${path}"
+  mkdir -p "${path}" "${STATE_DIR}"
   rsync -aH --partial --info=stats2 \
     --exclude-from="${EXCLUDES}" \
     -e "ssh -o StrictHostKeyChecking=accept-new" \
     "${USER_NAME}@${peer}:${path%/}/" "${path%/}/"
-  remote_bundle="$(ssh_peer "${peer}" "warp export-bundle '${path}'")"
   local_bundle="${STATE_DIR}/from-sessions.db"
-  mkdir -p "${STATE_DIR}"
-  if [[ -n "${remote_bundle}" ]]; then
-    scp -o StrictHostKeyChecking=accept-new "${USER_NAME}@${peer}:${remote_bundle}" "${local_bundle}" || true
+  remote_bundle=""
+  if [[ ! -f "${ZCODE_DB}" ]]; then
+    echo "files only — no ZCode on this machine (retired), sessions not pulled"
+  elif ! peer_has_zcode "${peer}"; then
+    echo "files only — ${peer} has no ZCode, nothing to pull"
+  else
+    remote_bundle="$(ssh_peer "${peer}" "warp export-bundle '${path}'")"
+    if [[ -n "${remote_bundle}" ]]; then
+      scp -o StrictHostKeyChecking=accept-new "${USER_NAME}@${peer}:${remote_bundle}" "${local_bundle}" || true
+    fi
+    if [[ -s "${local_bundle}" ]]; then
+      while read -r id; do
+        [[ -z "${id}" ]] && continue
+        mkdir -p "${ZCODE_ARTIFACTS}/${id}" "${ZCODE_AGENTS}/${id}"
+        rsync -a -e "ssh -o StrictHostKeyChecking=accept-new" \
+          "${USER_NAME}@${peer}:${HOME}/.zcode/cli/artifacts/${id}/" \
+          "${ZCODE_ARTIFACTS}/${id}/" 2>/dev/null || true
+        rsync -a -e "ssh -o StrictHostKeyChecking=accept-new" \
+          "${USER_NAME}@${peer}:${HOME}/.zcode/cli/agents/${id}/" \
+          "${ZCODE_AGENTS}/${id}/" 2>/dev/null || true
+      done < <(session_ids_from_bundle "${local_bundle}")
+      if zcode_running; then
+        # Same deal as push: files are here; import when ZCode quits.
+        schedule_local_apply "${local_bundle}" "${path}"
+        echo "pulled. ZCode is open here — sessions import automatically when it quits."
+      else
+        apply_sessions "${local_bundle}" || true
+      fi
+    fi
   fi
-  if [[ -s "${local_bundle}" ]]; then
-    while read -r id; do
-      [[ -z "${id}" ]] && continue
-      mkdir -p "${ZCODE_ARTIFACTS}/${id}" "${ZCODE_AGENTS}/${id}"
-      rsync -a -e "ssh -o StrictHostKeyChecking=accept-new" \
-        "${USER_NAME}@${peer}:${HOME}/.zcode/cli/artifacts/${id}/" \
-        "${ZCODE_ARTIFACTS}/${id}/" 2>/dev/null || true
-      rsync -a -e "ssh -o StrictHostKeyChecking=accept-new" \
-        "${USER_NAME}@${peer}:${HOME}/.zcode/cli/agents/${id}/" \
-        "${ZCODE_AGENTS}/${id}/" 2>/dev/null || true
-    done < <(session_ids_from_bundle "${local_bundle}")
-    apply_sessions "${local_bundle}" || true
-  fi
-  write_last "from" "${peer}" "${path}"
-  echo "warp from ${peer} done"
+  write_last "pull" "${peer}" "${path}"
+  echo "pull done"
+}
+
+schedule_local_apply() {
+  local bundle="$1" path="$2"
+  mkdir -p "${HOME}/.cache/spectre-warp"
+  nohup sh -c "
+    for i in \$(seq 1 60); do
+      pgrep -f '/zcode|[/ ]ZCode' >/dev/null 2>&1 || break
+      sleep 10
+    done
+    if pgrep -f '/zcode|[/ ]ZCode' >/dev/null 2>&1; then
+      echo \"\$(date -u +%FT%TZ) zcode still open after 10m; bundle kept at ${bundle}\" >>${HOME}/.cache/spectre-warp/apply.log
+    else
+      PATH=${HOME}/.local/bin:\$PATH warp apply \"${bundle}\" \"${path}\" >>${HOME}/.cache/spectre-warp/apply.log 2>&1 \
+        && echo \"\$(date -u +%FT%TZ) applied ${bundle}\" >>${HOME}/.cache/spectre-warp/apply.log
+    fi
+  " >/dev/null 2>&1 &
+  disown || true
 }
 
 cmd_apply() {
@@ -241,13 +333,11 @@ main() {
   case "$1" in
     -h|--help|help) usage ;;
     status) cmd_status ;;
-    to)
-      [[ $# -ge 2 ]] || { usage; exit 2; }
-      cmd_to "$2" "${3:-}"
+    push|to)
+      cmd_push "${2:-}"
       ;;
-    from)
-      [[ $# -ge 2 ]] || { usage; exit 2; }
-      cmd_from "$2" "${3:-}"
+    pull|from)
+      cmd_pull "${2:-}"
       ;;
     apply)
       cmd_apply "${2:-}"
