@@ -65,6 +65,59 @@ class MapRecordTest(unittest.TestCase):
         path = Path("/tmp/seg.jsonl")
         self.assertEqual(event_id_for(path, rec), event_id_for(path, rec))
 
+    def test_session_phase_finished_is_not_a_turn_boundary(self):
+        # phase=input.attachments.collect happens inside a live /goal loop.
+        mapped = map_record(
+            record("session.phase.finished", ts_at(NOW), phase="input.attachments.collect")
+        )
+        self.assertIsNone(mapped)
+
+
+class LoopIterationTest(unittest.TestCase):
+    """A live /goal loop must never read IDLE between iterations.
+
+    Regression for the 2026-09-19 shadow rows: zzbrush's raw stream is
+    loop.iteration.started -> model.request.started -> tool.requested ->
+    hook.finished -> session.phase.finished (input.attachments.collect) ->
+    loop.iteration.finished -> ... The phase record was mapped to turn.ended,
+    so the resolver reported IDLE with can_dispatch_goal=true while the loop
+    was still running.
+    """
+
+    def _snapshot_from(self, records):
+        store = Store(Path(tempfile.mkdtemp()) / "db.sqlite")
+        try:
+            snap = None
+            for rec in records:
+                mapped = map_record(rec)
+                if mapped is None:
+                    continue
+                item = {"event_id": f"e{len(records)}-{rec['type']}-{rec['ts']}", "worker": "zzbrush", **mapped}
+                snap = store.ingest(item, NOW)
+            return snap
+        finally:
+            store.close()
+
+    def test_phase_boundary_does_not_idle_a_running_loop(self):
+        records = [
+            record("loop.iteration.started", ts_at(NOW - 30), request_index=7),
+            record("model.request.started", ts_at(NOW - 29), request_index=7),
+            record("tool.requested", ts_at(NOW - 20), tool_name="Bash"),
+            record("hook.finished", ts_at(NOW - 18), hook_name="PreToolUse:Bash"),
+            record("session.phase.finished", ts_at(NOW - 6), phase="input.attachments.collect"),
+        ]
+        snap = self._snapshot_from(records)
+        self.assertEqual(snap["goal"]["state"], "RUNNING")
+        self.assertFalse(snap["policy"]["can_dispatch_goal"])
+
+    def test_stale_hook_alone_leaves_an_idle_worker_idle(self):
+        records = [
+            record("hook.finished", ts_at(NOW - 13 * 3600), hook_name="PreToolUse:Bash"),
+        ]
+        snap = self._snapshot_from(records)
+        self.assertEqual(snap["goal"]["state"], "IDLE")
+        self.assertTrue(snap["policy"]["can_dispatch_goal"])
+
 
 class IngestAdapterTest(unittest.TestCase):
     def test_collect_and_resolve_stale_model_is_running(self):

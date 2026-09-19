@@ -126,7 +126,15 @@ def map_record(record: dict[str, Any]) -> dict[str, Any] | None:
         if text.startswith("/goal"):
             return {**base, "kind": "input.goal", "payload": {**data, "text": text}}
         return {**base, "kind": "input.prompt.received", "payload": {**data, "text": text}}
-    if rtype in {"session.phase.finished", "error"}:
+    if rtype == "session.phase.finished":
+        # A per-iteration sub-phase, not a turn boundary. Every observed record
+        # carries phase=input.attachments.collect, which happens *inside* a
+        # live /goal loop: mapping it to turn.ended idled the worker between
+        # iterations and produced dangerous_false_idle rows on zzbrush
+        # (2026-09-19, old probe still active, can_dispatch_goal flipped true).
+        # The turn/goal boundary is turn.finished.
+        return None
+    if rtype == "error":
         return {**base, "kind": "turn.ended", "payload": {**data, "reason": rtype}}
     if rtype == "tool.requested":
         return {**base, "kind": "tool.started", "payload": data}

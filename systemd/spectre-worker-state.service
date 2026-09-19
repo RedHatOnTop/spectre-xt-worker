@@ -1,9 +1,10 @@
 [Unit]
-Description=Spectre authoritative worker-state resolver (shadow)
+Description=Spectre authoritative worker-state resolver
 Documentation=file:///opt/spectre-xt-worker/RUNBOOK.md
-# Shadow only (RUNBOOK 7.17): Slack / Grokbot / goal-watch still use the
-# last-record classifier. This daemon records evidence, serves snapshots,
-# and logs old-vs-new divergence. It does not type into workers.
+# The single resolver (RUNBOOK 7.17). Consumers (slack-bridge,
+# qoder-goal-watch, spectre-continuity) read snapshot.policy only. This daemon
+# records evidence, serves snapshots, and logs old-vs-new divergence; it does
+# not type into workers.
 StartLimitIntervalSec=300
 StartLimitBurst=5
 

@@ -6,7 +6,10 @@ from datetime import datetime, timezone
 from typing import Any
 
 SCHEMA_VERSION = 1
-RESOLVER_VERSION = "1.0.0"
+# 1.0.1: session.phase.finished is no longer a turn boundary, and hook.finished
+# no longer raises IDLE to RUNNING (design I3). Both changes alter resolved
+# output for the same journal, so the version moves with them.
+RESOLVER_VERSION = "1.0.1"
 
 # API-down / never-asked. Distinct from IDLE (unseen worker, dispatch allowed).
 GOAL_STATES = (
@@ -56,10 +59,15 @@ RUNNING_HINT_KINDS = frozenset(
         "tool.started",
         "tool.completed",
         "tool.failed",
-        "hook.finished",
         "subagent.result",
     }
 )
+# `hook.finished` is deliberately absent: a hook is corroboration, not a
+# lifecycle rising edge (design I3). It still counts as structured evidence for
+# observation/health, but it may not raise IDLE to RUNNING — a 13 h old
+# `PreToolUse` hook was the only record left in korea-metro-twin's tail, and
+# letting it mint RUNNING would have refused every later /goal. The rising edge
+# comes from input.goal/terminal_write or from model.request.*/tool.*.
 
 WAIT_BEGIN = frozenset(
     {"delegated_wait.begin", "background_job.begin", "external_wait.begin"}
