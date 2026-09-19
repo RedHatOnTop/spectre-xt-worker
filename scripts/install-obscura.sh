@@ -63,8 +63,16 @@ if [[ -x /usr/local/bin/claude ]]; then
   as_user /usr/local/bin/claude mcp remove obscura >/dev/null 2>&1 || true
   as_user /usr/local/bin/claude mcp add -s user obscura -- "${MCP_ARGS[@]}"
 fi
-# Qoder CLI ships versioned binaries; take the newest.
-qcli="$(ls -1 "${PERSON_HOME}/.qoder/bin/qodercli/qodercli-"* 2>/dev/null | sort -V | tail -n1 || true)"
+# Qoder CLI ships versioned binaries; take the newest. A glob loop rather than
+# `ls | sort -V | tail` so a filename cannot be word-split (SC2012).
+qcli=""
+for cand in "${PERSON_HOME}/.qoder/bin/qodercli/qodercli-"*; do
+  [[ -x "${cand}" ]] || continue
+  if [[ -z "${qcli}" ]] ||
+     [[ "$(printf '%s\n%s\n' "${qcli}" "${cand}" | sort -V | tail -n1)" == "${cand}" ]]; then
+    qcli="${cand}"
+  fi
+done
 if [[ -n "${qcli}" && -x "${qcli}" ]]; then
   as_user "${qcli}" mcp remove obscura >/dev/null 2>&1 || true
   as_user "${qcli}" mcp add -s user -t stdio obscura -- "${MCP_ARGS[@]}"

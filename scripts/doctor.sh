@@ -180,7 +180,7 @@ if [[ "${bridge_enabled}" == "enabled" ]]; then
   if [[ -f "${TARGET_HOME}/.codexpro/http-token" ]]; then
     ok "bridge http-token file present"
   else
-    bad "~/.codexpro/http-token missing"
+    bad "codexpro http-token missing (${TARGET_HOME}/.codexpro/http-token)"
   fi
 else
   warn "codexpro-handoff not enabled (bridge not installed — RUNBOOK 7.9)"
@@ -201,7 +201,7 @@ if [[ -f "${slack_env}" ]]; then
   if RUN_AS_USER test -x "${TARGET_HOME}/.local/bin/qoder-efficient"; then
     ok "qoder-efficient wrapper present (bridge executor)"
   else
-    bad "~/.local/bin/qoder-efficient missing — executor runs will fail"
+    bad "executor wrapper missing at \$HOME/.local/bin/qoder-efficient — executor runs will fail"
   fi
   check_cmd "executor settings installed (slack-executor-settings.json)" "test -f /usr/local/share/remote-agent/slack-executor-settings.json"
   # Cost gate: the wrapper refuses (exit 75) when Efficient is not free; its
@@ -225,10 +225,13 @@ if [[ -f "${slack_env}" ]]; then
   # SLACK_AGY_BIN overrides the default bin (bridge: expandHome, default
   # ~/.local/bin/agy; a non-absolute value refuses startup).
   agy_bin="$(sed -nE 's/^[[:space:]]*SLACK_AGY_BIN[[:space:]]*=[[:space:]]*(.*)$/\1/p' "${slack_env}" | tail -n1 | sed -E 's/^[[:space:]]+|[[:space:]]+$//g')"
+  # The "~" patterns below match a LITERAL leading tilde on purpose: the value
+  # comes from slack.env, where "~" is a string, not a shell expansion.
+  # shellcheck disable=SC2088
   case "${agy_bin}" in
     "") agy_bin="${TARGET_HOME}/.local/bin/agy" ;;
     "~") agy_bin="${TARGET_HOME}" ;;
-    "~/"*) agy_bin="${TARGET_HOME}/${agy_bin#\~/}" ;;
+    "~/"*) agy_bin="${TARGET_HOME}/${agy_bin:2}" ;;
   esac
   if (( debate_on )); then
     if [[ "${agy_bin}" != /* ]]; then
@@ -322,22 +325,53 @@ else
   warn "slack.env missing — Slack community not configured (RUNBOOK 7.10)"
 fi
 
-echo "== worker-state (RUNBOOK 7.17, shadow) =="
+echo "== worker-state (RUNBOOK 7.17, the resolver every consumer asks) =="
 if command -v spectre-state >/dev/null 2>&1; then
   ok "spectre-state CLI on PATH"
   ws_enabled="$(RUN_AS_USER systemctl --user is-enabled spectre-worker-state.service 2>/dev/null || true)"
   if [[ "${ws_enabled}" == "enabled" ]]; then
     check_cmd "spectre-worker-state.service active (user unit)" "$(declare -f RUN_AS_USER); RUN_AS_USER systemctl --user is-active spectre-worker-state.service 2>/dev/null | grep -qx active"
+    # `spectre-state health` is a raw read; the socket can still refuse under
+    # load. What matters for dispatch is `get`: an UNKNOWN snapshot is
+    # fail-closed (every policy flag false), which refuses /goal and /resume.
     if RUN_AS_USER spectre-state health >/dev/null 2>&1; then
       ok "spectre-state health"
     else
-      bad "spectre-state health failed (socket down?)"
+      bad "spectre-state health failed (socket down?) — consumers fail closed"
+    fi
+    ws_probe="$(RUN_AS_USER spectre-state get qoder 2>/dev/null || true)"
+    if [[ -z "${ws_probe}" ]]; then
+      bad "spectre-state get failed — consumers fail closed"
+    else
+      ws_reason="$(printf '%s' "${ws_probe}" | python3 -c "import json,sys;print(json.load(sys.stdin).get('reason') or '')" 2>/dev/null || true)"
+      if [[ "${ws_reason}" == state\ api\ unavailable* || "${ws_reason}" == *timed\ out* ]]; then
+        bad "spectre-state get returns UNKNOWN (${ws_reason}) — dispatch and resume are refused"
+      else
+        ok "spectre-state get serves a real snapshot"
+      fi
     fi
   else
-    warn "spectre-worker-state.service not enabled (shadow resolver off)"
+    warn "spectre-worker-state.service not enabled (resolver off — Slack cannot dispatch)"
   fi
 else
   warn "spectre-state not installed (RUNBOOK 7.17)"
+fi
+# Retired with the cutover: each of these classified occupancy on its own and
+# could type a second, contradictory goal. Enabled again = a regression.
+for ws_legacy in qoder-nudge.timer qoder-continuity.timer \
+                 codex-goal-healer.timer grokbot-goal-event.timer; do
+  ws_legacy_state="$(RUN_AS_USER systemctl --user is-enabled "${ws_legacy}" 2>/dev/null || true)"
+  if [[ "${ws_legacy_state}" == "enabled" ]]; then
+    bad "${ws_legacy} enabled — retired classifier back on (RUNBOOK 7.17)"
+  else
+    ok "${ws_legacy} disabled"
+  fi
+done
+ws_gs="$(RUN_AS_USER systemctl --user is-enabled goal-supervisor.timer 2>/dev/null || true)"
+if [[ "${ws_gs}" == "enabled" ]]; then
+  ok "goal-supervisor.timer enabled (Grokbot active, RUNBOOK 7.16)"
+else
+  warn "goal-supervisor.timer disabled — Grokbot advances nothing (installed off)"
 fi
 
 echo "== codex CLI + session handoff (RUNBOOK 7.11, 7.15) =="
