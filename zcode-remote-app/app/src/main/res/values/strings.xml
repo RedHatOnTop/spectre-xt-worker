@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">ZCode Remote</string>
+    <string name="app_title">ZCode Remote</string>
+    <string name="home_subtitle">Saved remote control links. Scan once, reopen any time.</string>
+    <string name="scan_qr">Scan QR</string>
+    <string name="scan_hint">Point at the ZCode Remote Control QR code</string>
+    <string name="cancel">Cancel</string>
+    <string name="empty_hint">No saved links yet.\nScan the QR shown in ZCode (phone icon) once.</string>
+    <string name="link_saved">Link saved</string>
+    <string name="not_a_remote_link">Not a ZCode remote link</string>
+    <string name="camera_permission_needed">Camera permission is required to scan the pairing QR</string>
+    <string name="link_label_default">Remote session (%1$s)</string>
+    <string name="delete_symbol">&#215;</string>
+    <string name="load_error_banner">Page load problem: %1$s\nIf it persists, the desktop session may need a fresh QR.</string>
+</resources>

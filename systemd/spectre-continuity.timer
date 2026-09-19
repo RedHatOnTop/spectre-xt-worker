@@ -1,0 +1,12 @@
+[Unit]
+Description=Spectre continuity every 3 minutes
+
+[Timer]
+OnBootSec=180s
+OnUnitActiveSec=180s
+AccuracySec=15s
+Persistent=true
+Unit=spectre-continuity.service
+
+[Install]
+WantedBy=timers.target

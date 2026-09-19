@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "deny": [
+      "write_file(**)",
+      "command(regex:curl|wget|nc|ncat|socat|ssh|scp|rsync|ftp|telnet)",
+      "read_file(**/slack.env)",
+      "read_file(~/.config/remote-agent/**)",
+      "read_file(~/.ssh/**)",
+      "read_file(~/.codexpro/**)"
+    ]
+  }
+}

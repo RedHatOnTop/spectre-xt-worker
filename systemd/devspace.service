@@ -1,0 +1,13 @@
+[Unit]
+Description=DevSpace MCP server (ChatGPT connector, RUNBOOK 7.14)
+After=network-online.target
+
+[Service]
+ExecStart=/usr/bin/devspace serve
+Restart=on-failure
+RestartSec=5
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+WorkingDirectory=%h
+
+[Install]
+WantedBy=default.target

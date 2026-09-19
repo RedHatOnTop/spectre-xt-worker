@@ -20,6 +20,7 @@ fi
 src="${BASH_SOURCE[0]:-}"
 local_root=""
 if [[ -n "${src}" && "${src}" != "bash" && "${src}" != "-" ]]; then
+  # shellcheck disable=SC2015  # pwd cannot fail once cd succeeded; keep || true as belt
   local_root="$(cd "$(dirname "${src}")" 2>/dev/null && pwd || true)"
 fi
 
@@ -35,7 +36,11 @@ if [[ -d "${INSTALL_DIR}/.git" ]]; then
   git -C "${INSTALL_DIR}" fetch --depth 1 origin
   git -C "${INSTALL_DIR}" checkout -q -f FETCH_HEAD
 else
-  rm -rf "${INSTALL_DIR}"
+  # Never delete an existing checkout we did not verify as ours; install
+  # beside it and swap atomically instead.
+  if [[ -d "${INSTALL_DIR}" ]]; then
+    mv "${INSTALL_DIR}" "${INSTALL_DIR}.old.$(date +%s)"
+  fi
   git clone --depth 1 "${REPO_URL}" "${INSTALL_DIR}"
 fi
 

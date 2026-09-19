@@ -1,0 +1,39 @@
+[Unit]
+Description=Slack agent-community bridge (Socket Mode, outbound only)
+Documentation=file:///opt/spectre-xt-worker/RUNBOOK.md
+# Prereqs (RUNBOOK 7.10):
+#   ~/.config/remote-agent/slack.env   (mode 0600; parsed by the bridge itself)
+#   /usr/local/share/remote-agent/{slack-agents.json, slack-executor-settings.json}
+#   executor: ~/.local/bin/qoder-efficient (qodercli Efficient; bridge default)
+#   optional SLACK_DEBATE=1 (#lobby second voice): ~/.local/bin/agy plus the
+#   read-only profile ~/.gemini/antigravity-cli/settings.json. Anything
+#   missing -> debate turns are skipped and audited (debate_skip); qoder
+#   turns and every other channel are unaffected.
+# No EnvironmentFile: slack.env must never enter the process environment
+# (it would be readable via /proc/<pid>/environ by the same user).
+# Cap crash loops when slack.env is absent or incomplete.
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=exec
+ExecStart=/usr/local/bin/spectre-slack-bridge
+# systemd user units do not read /etc/environment. The bridge sets this for
+# the executor child itself; the unit copy keeps the box profile in place if
+# a future qodercli honors flag-settings hooks (1.1.47 does not — probed).
+Environment=SPECTRE_WORKER_PROFILE=box
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+# RUNBOOK 7.8 gotcha: user units inherit the lightdm/XFCE session env.
+UnsetEnvironment=DESKTOP_SESSION XDG_CURRENT_DESKTOP XDG_SESSION_TYPE DISPLAY
+NoNewPrivileges=true
+# Do NOT add PrivateTmp=true here: it puts the unit in its own mount
+# namespace, and the cost gate (~/.local/bin/qoder-efficient-guard) then
+# cannot readlink /proc/<pid>/exe of the live qodercli processes (EACCES)
+# — the live-pid scan goes blind and allow-start falls back to a slow
+# ~11 s --list-models memory scan; the observed bridge runs were then
+# refused (exit 75, cost_gate_refused). Bisected on the box 2026-09-12.
+Restart=always
+RestartSec=3s
+
+[Install]
+WantedBy=default.target

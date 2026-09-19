@@ -1,0 +1,1062 @@
+#!/usr/bin/env bash
+# codex-mode — switch Codex CLI between the official ChatGPT account and any
+# number of OpenAI-compatible third-party providers.
+#
+# Registry: ~/.codex/modes/providers.json   Keys: ~/.codex/modes/keys/<id>
+#
+# In api mode the model catalog (TUI picker) is generated locally: every entry
+# from the backend catalog snapshot (~/.codex/models_cache.json), plus the
+# provider's pinned model and any extra names in its "models" array. Context
+# windows pass through unclamped. /v1/models is never consulted — relays that
+# gate clients to coding tools answer it with 401.
+#
+# Usage:
+#   codex-mode status            Human-readable status
+#   codex-mode json              Machine-readable status (used by the GUI)
+#   codex-mode chatgpt           Switch to official ChatGPT account mode
+#   codex-mode api <id> [model]  Switch to provider <id>, optionally setting its model
+#   codex-mode models <id>       Fetch the provider's model list (one per line)
+#   codex-mode add               Add provider (JSON on stdin: name/base_url/wire_api/model/key)
+#   codex-mode update            Update provider (JSON on stdin: id + fields, optional key)
+#   codex-mode remove <id>       Remove provider (and its key)
+#   codex-mode set-key <id>      Store provider key (hidden tty prompt or stdin)
+#   codex-mode probe-payload [id]  Measure the relay body limit and rebuild the model catalog
+#   codex-mode config            Edit providers.json in $EDITOR
+set -euo pipefail
+
+CODEX_HOME="${CODEX_HOME:-$HOME/.codex}"
+CONFIG="$CODEX_HOME/config.toml"
+MODE_DIR="$CODEX_HOME/modes"
+PROVIDERS="$MODE_DIR/providers.json"
+KEY_DIR="$MODE_DIR/keys"
+ENV_SH="$MODE_DIR/env.sh"
+SAVED_MODEL="$MODE_DIR/chatgpt-model"
+CATALOG="$MODE_DIR/thirdparty-catalog.json"
+PAYLOAD_CACHE="$MODE_DIR/payload-cache.json"
+MARK_BEGIN="# codex-mode:begin"
+MARK_END="# codex-mode:end"
+ENV_KEY="CODEX_THIRDPARTY_API_KEY"
+
+die() { echo "codex-mode: $*" >&2; exit 1; }
+
+[ -f "$CONFIG" ] || die "config not found: $CONFIG"
+# Follow symlinks (dotfiles sync setups) so mv-based rewrites don't replace
+# the link itself and silently desync the real file.
+[ -L "$CONFIG" ] && CONFIG="$(readlink -f "$CONFIG")"
+mkdir -p "$MODE_DIR" "$KEY_DIR"
+chmod 700 "$KEY_DIR" 2>/dev/null || true
+
+# ---------------------------------------------------------------- registry --
+
+# One-time migration from the old single-provider layout.
+ensure_registry() {
+    [ -f "$PROVIDERS" ] && return 0
+    local conf="$MODE_DIR/thirdparty.conf"
+    if [ -f "$conf" ]; then
+        # shellcheck source=/dev/null
+        . "$conf" 2>/dev/null || true
+        if [ -n "${BASE_URL:-}" ] && [[ "$BASE_URL" != *your-endpoint* ]]; then
+            MIG_NAME="Third-party API" MIG_URL="$BASE_URL" \
+            MIG_WIRE="${WIRE_API:-responses}" MIG_MODEL="${MODEL:-}" \
+            python3 - "$PROVIDERS" <<'PYEOF'
+import json, os, sys
+p = {"id": "default", "name": os.environ["MIG_NAME"],
+     "base_url": os.environ["MIG_URL"], "wire_api": os.environ["MIG_WIRE"],
+     "model": os.environ["MIG_MODEL"]}
+json.dump({"providers": [p]}, open(sys.argv[1], "w"), indent=2)
+PYEOF
+            chmod 600 "$PROVIDERS"
+            [ -f "$MODE_DIR/api-key" ] && mv "$MODE_DIR/api-key" "$KEY_DIR/default"
+            echo "Migrated legacy thirdparty.conf to providers.json" >&2
+            return 0
+        fi
+    fi
+    echo '{"providers": []}' > "$PROVIDERS"
+    chmod 600 "$PROVIDERS"
+}
+
+# Drop the cached payload measurement for a base_url (e.g. when a key is
+# added or rotated: the old value was probed under another credential).
+cache_forget() {
+    python3 - "$PAYLOAD_CACHE" "$1" <<'PYEOF'
+import json, os, sys
+
+cache_path, base_url = sys.argv[1], sys.argv[2]
+try:
+    cache = json.load(open(cache_path))
+except Exception:
+    sys.exit(0)
+if isinstance(cache, dict) and cache.pop(base_url, None) is not None:
+    tmp = cache_path + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        json.dump(cache, f, indent=2)
+        f.write("\n")
+    os.replace(tmp, cache_path)
+PYEOF
+}
+
+# Read provider JSON from stdin, validate, upsert. Prints the provider id.
+# Fields: name, base_url, wire_api (responses|chat), model, key (optional),
+# id (required for update).
+registry_upsert() {
+    local mode="$1" payload out pid forget
+    # Capture first: the heredoc below replaces python's stdin.
+    payload="$(cat)"
+    [ -n "$payload" ] || die "expected provider JSON on stdin"
+    out="$(PAYLOAD_JSON="$payload" python3 - "$PROVIDERS" "$KEY_DIR" "$mode" <<'PYEOF'
+import json, os, re, sys
+
+path, key_dir, mode = sys.argv[1], sys.argv[2], sys.argv[3]
+try:
+    raw = json.loads(os.environ["PAYLOAD_JSON"])
+except Exception:
+    sys.exit("codex-mode: invalid JSON on stdin")
+if not isinstance(raw, dict):
+    sys.exit("codex-mode: expected a JSON object")
+
+name = str(raw.get("name", "")).strip()
+base_url = str(raw.get("base_url", "")).strip().rstrip("/")
+wire_api = str(raw.get("wire_api", "responses")).strip()
+model = str(raw.get("model", "")).strip()
+key = raw.get("key")
+pid = str(raw.get("id", "")).strip()
+models = raw.get("models")
+if models is not None:
+    if not isinstance(models, list) or any(not isinstance(x, str) for x in models):
+        sys.exit("codex-mode: models must be a JSON array of model names")
+    models = [x.strip() for x in models if x.strip()]
+
+if mode == "update":
+    # Partial update: only supplied fields change.
+    if not pid:
+        sys.exit("codex-mode: id is required for update")
+else:
+    if not name:
+        sys.exit("codex-mode: name is required")
+
+if base_url:
+    # Printable ASCII only: control/invisible chars would corrupt the TOML
+    # block or allow visual spoofing of the endpoint URL.
+    if not re.fullmatch(r"https?://[^/\s]+[!-~]*", base_url):
+        sys.exit("codex-mode: base_url must be an http(s) URL with a host, printable ASCII without quotes")
+if wire_api not in ("responses", "chat"):
+    sys.exit("codex-mode: wire_api must be 'responses' or 'chat'")
+for v in (name, model, base_url, *(models or ())):
+    if '"' in v or '\\' in v or any(ord(c) < 0x20 or ord(c) == 0x7f or 0xD800 <= ord(c) <= 0xDFFF for c in v):
+        sys.exit("codex-mode: values must not contain quotes, backslashes or control chars")
+if key is not None and not str(key).strip():
+    sys.exit("codex-mode: key must not be empty when provided")
+
+reg = json.load(open(path))
+provs = reg.setdefault("providers", [])
+
+if mode == "update":
+    target = next((p for p in provs if p["id"] == pid), None)
+    if target is None:
+        sys.exit(f"codex-mode: unknown provider '{pid}'")
+    if name:
+        target["name"] = name
+    if base_url:
+        target["base_url"] = base_url
+    if wire_api:
+        target["wire_api"] = wire_api
+    if raw.get("model") is not None:
+        target["model"] = model
+    if models is not None:
+        target["models"] = models
+else:
+    pid = re.sub(r"[^a-z0-9-]+", "-", name.lower()).strip("-") or "provider"
+    base = pid
+    n = 2
+    while any(p["id"] == pid for p in provs):
+        pid = f"{base}-{n}"
+        n += 1
+    provs.append({"id": pid, "name": name, "base_url": base_url,
+                  "wire_api": wire_api, "model": model,
+                  "models": models or []})
+
+tmp = path + ".tmp"
+fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+with os.fdopen(fd, "w") as f:
+    json.dump(reg, f, indent=2)
+os.replace(tmp, path)
+
+if key is not None:
+    os.makedirs(key_dir, exist_ok=True)
+    kpath = os.path.join(key_dir, pid)
+    fd = os.open(kpath, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(str(key).strip())
+    # A new key invalidates any payload measured under another credential.
+    forget = target["base_url"] if mode == "update" else base_url
+else:
+    forget = ""
+print(f"{pid}\t{forget}")
+PYEOF
+)"
+    IFS=$'\t' read -r pid forget <<< "$out"
+    [ -n "$forget" ] && cache_forget "$forget"
+    echo "$pid"
+}
+
+registry_remove() {
+    local id="$1"
+    python3 - "$PROVIDERS" "$id" <<'PYEOF'
+import json, os, sys
+path, pid = sys.argv[1], sys.argv[2]
+reg = json.load(open(path))
+provs = reg.get("providers", [])
+if not any(p["id"] == pid for p in provs):
+    sys.exit(f"codex-mode: unknown provider '{pid}'")
+reg["providers"] = [p for p in provs if p["id"] != pid]
+tmp = path + ".tmp"
+fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+with os.fdopen(fd, "w") as f:
+    json.dump(reg, f, indent=2)
+os.replace(tmp, path)
+PYEOF
+    # Key file deletion is best-effort; never fail the removal over it.
+    [ -f "$KEY_DIR/$id" ] && rm -f -- "$KEY_DIR/$id"
+    return 0
+}
+
+# Print "id<TAB>name<TAB>base_url<TAB>wire_api<TAB>model" for provider $1.
+registry_get() {
+    python3 - "$PROVIDERS" "$1" <<'PYEOF'
+import json, sys
+reg = json.load(open(sys.argv[1]))
+p = next((p for p in reg.get("providers", []) if p["id"] == sys.argv[2]), None)
+if p is None:
+    sys.exit(f"codex-mode: unknown provider '{sys.argv[2]}'")
+# The fields are interpolated into config.toml, so reject anything that TOML
+# would choke on or misread — including values a hand-edit or an older
+# version left in the registry after the write-side checks were added.
+vals = [p.get("id"), p.get("name"), p.get("base_url"), p.get("wire_api"), p.get("model", "")]
+if (any(not isinstance(v, str) for v in vals)
+        or any(any(ord(c) < 0x20 or ord(c) == 0x7f or 0xD800 <= ord(c) <= 0xDFFF
+                    or c in ('"', '\\') for c in v) for v in vals)):
+    sys.exit(f"codex-mode: provider '{sys.argv[2]}' has malformed fields (quotes, "
+             f"backslashes, control chars or non-text values) — run 'codex-mode config' and fix it")
+print("\t".join([p["id"], p["name"], p["base_url"], p["wire_api"], p.get("model", "")]))
+PYEOF
+}
+
+# Print the provider's extra catalog models, one per line (may be empty).
+registry_models() {
+    python3 - "$PROVIDERS" "$1" <<'PYEOF'
+import json, sys
+p = next((p for p in json.load(open(sys.argv[1])).get("providers", []) if p["id"] == sys.argv[2]), None)
+if p is None:
+    sys.exit(f"codex-mode: unknown provider '{sys.argv[2]}'")
+# These slugs land in the model catalog, so they get the same TOML-safety
+# check as the scalar fields — including the read-only paths that only
+# print them. A hand-edited registry may predate the write-side checks.
+models = p.get("models")
+if models is None:
+    models = []
+if (not isinstance(models, list) or any(not isinstance(m, str) for m in models)
+        or any(any(ord(c) < 0x20 or ord(c) == 0x7f or 0xD800 <= ord(c) <= 0xDFFF
+                    or c in ('"', '\\') for c in m) for m in models)):
+    sys.exit(f"codex-mode: provider '{sys.argv[2]}' has a malformed models list "
+             f"(non-text entries, quotes, backslashes or control chars) — run 'codex-mode config' and fix it")
+print("\n".join(models))
+PYEOF
+}
+
+registry_count() {
+    python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1])).get("providers",[])))' "$PROVIDERS"
+}
+
+# ------------------------------------------------------------------ config --
+
+current_mode() {
+    if awk '/^\[/{exit} /^model_provider[ \t]*=[ \t]*"thirdparty"/{found=1} END{exit !found}' "$CONFIG"; then
+        echo "api"
+    else
+        echo "chatgpt"
+    fi
+}
+
+# Refuse to run if the markers are unbalanced: with only the begin marker
+# present, the awk below would drop everything after it.
+strip_block() {
+    if grep -qxF "$MARK_BEGIN" "$CONFIG" && ! grep -qxF "$MARK_END" "$CONFIG"; then
+        die "begin marker without end marker in $CONFIG — fix manually (backup: $CONFIG.mode-bak)"
+    fi
+    local tmp
+    tmp="$(mktemp)"
+    awk -v b="$MARK_BEGIN" -v e="$MARK_END" '
+        $0 == b {skip=1; next}
+        $0 == e {skip=0; next}
+        !skip
+    ' "$CONFIG" > "$tmp"
+    mv "$tmp" "$CONFIG"
+}
+
+# Insert or replace a top-level key (only in the preamble before first [table]).
+upsert_toplevel() {
+    local key="$1" val="$2" tmp
+    tmp="$(mktemp)"
+    awk -v k="$key" -v v="$val" '
+        BEGIN { top=1; ins=0 }
+        /^\[/ { if (top && !ins) { print k " = " v; ins=1 } top=0 }
+        top && $0 ~ ("^" k "[ \t]*=") { print k " = " v; ins=1; next }
+        { print }
+        END { if (top && !ins) print k " = " v }
+    ' "$CONFIG" > "$tmp"
+    mv "$tmp" "$CONFIG"
+}
+
+# Delete a top-level key from the preamble.
+remove_toplevel() {
+    local key="$1" tmp
+    tmp="$(mktemp)"
+    awk -v k="$key" '
+        BEGIN { top=1 }
+        /^\[/ { top=0 }
+        top && $0 ~ ("^" k "[ \t]*=") { next }
+        { print }
+    ' "$CONFIG" > "$tmp"
+    mv "$tmp" "$CONFIG"
+}
+
+write_env_sh() {
+    {
+        echo "# Generated by codex-mode; sourced from ~/.bashrc"
+        echo "export $ENV_KEY=\"\$(cat \"$KEY_DIR/current\")\""
+    } > "$ENV_SH"
+    chmod 600 "$ENV_SH"
+    if ! grep -qsF ". \"$ENV_SH\"" "$HOME/.bashrc" 2>/dev/null; then
+        printf '\n# Codex third-party API key (managed by codex-mode)\n[ -f "%s" ] && . "%s"\n' "$ENV_SH" "$ENV_SH" >> "$HOME/.bashrc"
+        echo "Added env.sh source line to ~/.bashrc" >&2
+    fi
+}
+
+# ------------------------------------------------------- model catalog --
+#
+# Context windows are NOT clamped. Older versions folded the measured relay
+# body limit into a small token budget (32k on a 1 MiB relay), which held
+# every model far below what the backend accepts. Windows now pass through
+# from the backend snapshot (272k, max 872k); the relay body limit remains
+# the only 413 risk. The payload probe is kept so `status` / the GUI can
+# still show the measured limit.
+
+catalog_build() {
+    # args: base_url wire_api model [force_probe] [extra model names, newline-separated] [key file]
+    CATALOG_EXTRA_MODELS="${5:-}" CATALOG_KEY_FILE="${6:-}" \
+    python3 - "$1" "$2" "$3" "$4" "$PAYLOAD_CACHE" "$CATALOG" "$CODEX_HOME/models_cache.json" <<'PYEOF'
+import http.client, json, os, ssl, sys, time
+from datetime import datetime, timezone
+from urllib.parse import urlparse
+
+base_url, wire_api, model, force, cache_path, catalog_path, official_path = sys.argv[1:8]
+force = force == "1"
+mib = 1024 * 1024
+# Probes must authenticate: unauthenticated posts hit a stricter edge limit
+# (anyrouter answers 413/closed pipe at ~1 MiB) and under-measure the API.
+key = ""
+key_path = os.environ.get("CATALOG_KEY_FILE", "")
+if key_path:
+    try:
+        key = open(key_path, encoding="utf-8").read().strip()
+    except Exception:
+        key = ""
+# Conservative fallback if the probe cannot run: 8 MiB nginx default-ish.
+FALLBACK = 8 * mib
+
+def load_cache():
+    try:
+        return json.load(open(cache_path))
+    except Exception:
+        return {}
+
+def save_cache(cache):
+    tmp = cache_path + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        json.dump(cache, f, indent=2)
+        f.write("\n")
+    os.replace(tmp, cache_path)
+
+def probe(url, wire, key):
+    parsed = urlparse(url if "://" in url else "https://" + url)
+    host = parsed.hostname
+    if not host:
+        sys.exit(f"codex-mode: base_url {url!r} has no host to probe")
+    port = parsed.port or (443 if parsed.scheme != "http" else 80)
+    prefix = (parsed.path or "/v1").rstrip("/") or "/v1"
+    path = prefix + ("/chat/completions" if wire == "chat" else "/responses")
+    ctx = ssl.create_default_context()
+
+    def once(size):
+        pad = max(0, size - 14)
+        body = b'{"input":"' + (b"a" * pad) + b'"}'
+        if len(body) > size:
+            body = body[:size]
+        elif len(body) < size:
+            body = body + (b"a" * (size - len(body)))
+        klass = http.client.HTTPSConnection if parsed.scheme != "http" else http.client.HTTPConnection
+        kw = {"timeout": 45}
+        if klass is http.client.HTTPSConnection:
+            kw["context"] = ctx
+        conn = klass(host, port=port, **kw)
+        try:
+            headers = {
+                "Content-Type": "application/json",
+                "Connection": "close",
+                "User-Agent": "codex-mode/2.1",
+            }
+            if key:
+                headers["Authorization"] = "Bearer " + key
+            conn.request("POST", path, body=body, headers=headers)
+            status = conn.getresponse().status
+            conn.close()
+            return status
+        except Exception:
+            try:
+                conn.close()
+            except Exception:
+                pass
+            return None
+
+    saw_2xx = False
+
+    def conclusive(st):
+        # Answers on the merits of the request: processed (2xx), or rejected
+        # as a request (app-level 4xx). Auth / edge / rate-limit / 5xx
+        # answers can be produced before the body is read, so they prove
+        # nothing about the size limit — treating them as an accepted body
+        # is how a bad key manufactured a 64 MiB "measurement". A run with
+        # no 2xx at all is labeled probed-4xx: the rejections may come from
+        # a router that never consumed the body.
+        nonlocal saw_2xx
+        if st is not None and 200 <= st < 300:
+            saw_2xx = True
+            return True
+        return st in (400, 404, 415, 422)
+
+    def measured_how():
+        base = "probed" if key else "probed-noauth"
+        return base if saw_2xx else base + "-4xx"
+
+    st = once(mib)
+    if st == 413:
+        return 512 * 1024, measured_how()
+    if not conclusive(st):
+        return FALLBACK, "inconclusive"
+    last_ok = mib
+    for mb in (4, 8, 12, 16, 20, 24, 32, 48, 64):
+        size = mb * mib
+        st = once(size)
+        if st == 413:
+            lo, hi = last_ok, size
+            while hi - lo > mib:
+                mid = ((lo + hi) // 2) // mib * mib
+                if mid <= lo:
+                    mid = lo + mib
+                st = once(mid)
+                if st == 413:
+                    hi = mid
+                elif conclusive(st):
+                    lo = mid
+                else:
+                    break
+            return lo, measured_how()
+        if conclusive(st):
+            last_ok = size
+        else:
+            # Beyond last_ok nothing is proven about the cap.
+            return FALLBACK, "inconclusive"
+    return last_ok, measured_how()
+
+cache = load_cache()
+entry = cache.get(base_url) if isinstance(cache.get(base_url), dict) else None
+has_key = bool(key)
+# A measurement is only reusable under the auth condition it was taken in:
+# unauthenticated posts hit a stricter edge limit, so a keyless measurement
+# must not stick once a key exists (and vice versa). Entries without the
+# flag predate authenticated probing and count as keyless.
+if (not force and entry
+        and isinstance(entry.get("max_payload_bytes"), int) and entry["max_payload_bytes"] > 0
+        and bool(entry.get("auth")) == has_key):
+    payload = entry["max_payload_bytes"]
+    how = "cache"
+else:
+    payload, how = probe(base_url, wire_api, key)
+    if how != "inconclusive":
+        cache[base_url] = {
+            "max_payload_bytes": payload,
+            "probed_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "how": how,
+            "auth": has_key,
+        }
+        save_cache(cache)
+
+levels = [
+    {"effort": "low", "description": "Fast responses with lighter reasoning"},
+    {"effort": "medium", "description": "Balanced speed and reasoning for everyday tasks"},
+    {"effort": "high", "description": "Greater reasoning depth for complex problems"},
+    {"effort": "xhigh", "description": "Extra high reasoning depth for complex problems"},
+]
+
+def strip_tiers(entry):
+    # Relays do not implement OpenAI's priority tier or fast speed tier;
+    # strip both so a pick cannot fail downstream.
+    entry["additional_speed_tiers"] = []
+    entry["service_tiers"] = []
+    return entry
+
+def template(slug, priority):
+    # Fallback shape for models the backend snapshot does not know about.
+    # Windows mirror the flagship backend slugs; relays do not advertise
+    # per-model windows for names they do not know.
+    return strip_tiers({
+        "slug": slug,
+        "display_name": slug,
+        "description": "Third-party API via relay.",
+        "default_reasoning_level": "medium",
+        "supported_reasoning_levels": levels,
+        "shell_type": "shell_command",
+        "visibility": "list",
+        "supported_in_api": True,
+        "priority": priority,
+        "additional_speed_tiers": [],
+        "service_tiers": [],
+        "availability_nux": None,
+        "upgrade": None,
+        "base_instructions": "You are Codex CLI. Follow AGENTS.md and the instructions file.",
+        "model_messages": {
+            "instructions_template": "You are Codex CLI. Follow AGENTS.md and the instructions file.",
+            "instructions_variables": {
+                "personality_default": "",
+                "personality_friendly": "",
+                "personality_pragmatic": "",
+            },
+            "approvals": None,
+        },
+        "include_skills_usage_instructions": False,
+        "supports_reasoning_summaries": True,
+        "default_reasoning_summary": "auto",
+        "support_verbosity": True,
+        "default_verbosity": "low",
+        "apply_patch_tool_type": "freeform",
+        "web_search_tool_type": "text",
+        "truncation_policy": {"mode": "tokens", "limit": 10000},
+        "supports_parallel_tool_calls": True,
+        "supports_image_detail_original": True,
+        "context_window": 272_000,
+        "max_context_window": 872_000,
+        "auto_compact_token_limit": None,
+        "effective_context_window_percent": 95,
+        "experimental_supported_tools": [],
+        "input_modalities": ["text", "image"],
+        "supports_search_tool": True,
+        "use_responses_lite": False,
+    })
+
+def backend_models():
+    # comp_hash marks backend-provided entries; template() never sets it, so a
+    # rewritten cache cannot leak a past provider's custom models in here.
+    try:
+        data = json.load(open(official_path, encoding="utf-8"))
+    except Exception:
+        return []
+    raw = data.get("models") if isinstance(data, dict) else None
+    return [m for m in (raw or [])
+            if isinstance(m, dict) and str(m.get("slug", "")).strip() and "comp_hash" in m]
+
+# Full catalog: every backend model (visibility kept, hidden ones stay usable
+# but unlisted), then the provider's pinned model and any extra names from the
+# registry, so the picker is never pinned to a single slug.
+catalog_models = [strip_tiers(m) for m in backend_models()]
+seen = {m["slug"] for m in catalog_models}
+pinned = (model or "").strip()
+if not catalog_models and not pinned:
+    # Fresh install with no snapshot yet: keep one usable entry, as before.
+    pinned = "gpt-5.6-sol"
+extra = [s.strip() for s in os.environ.get("CATALOG_EXTRA_MODELS", "").splitlines() if s.strip()]
+priority = 100
+for slug in [pinned, *extra]:
+    if slug and slug not in seen:
+        catalog_models.append(template(slug, priority))
+        seen.add(slug)
+        priority += 1
+
+catalog = {"models": catalog_models}
+tmp = catalog_path + ".tmp"
+fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+with os.fdopen(fd, "w") as f:
+    json.dump(catalog, f, indent=2)
+    f.write("\n")
+os.replace(tmp, catalog_path)
+
+print(f"{payload}\t{how}\t{len(catalog_models)}")
+PYEOF
+}
+
+catalog_apply() {
+    local base_url="$1" wire_api="$2" model="$3" force="${4:-0}" extra="${5:-}" key_file="${6:-}"
+    local out payload how count
+    out="$(catalog_build "$base_url" "$wire_api" "$model" "$force" "$extra" "$key_file")" \
+        || die "failed to build the model catalog"
+    IFS=$'\t' read -r payload how count <<< "$out"
+    [ -n "$how" ] || die "failed to build the model catalog"
+    # Drop overrides written by older versions; windows come from the catalog.
+    remove_context_cap
+    upsert_toplevel model_catalog_json "\"$CATALOG\""
+    if [ "$how" = "inconclusive" ]; then
+        echo "Payload cap : unmeasured (probe inconclusive) — informational; context windows are not clamped."
+    else
+        echo "Payload cap : ${payload} bytes ($how) — informational; context windows are not clamped."
+    fi
+    echo "Catalog     : $count models listed for the picker (backend list + provider models, windows unclamped)."
+}
+
+remove_context_cap() {
+    remove_toplevel model_context_window
+    remove_toplevel model_auto_compact_token_limit
+    remove_toplevel model_catalog_json
+}
+
+# ------------------------------------------------------------------ switch --
+
+switch_api() {
+    local id="${1:-}" model="${2:-}"
+    [ -n "$id" ] || die "usage: codex-mode api <provider-id> [model]"
+    [ "$(registry_count)" -gt 0 ] || die "no providers configured — pipe provider JSON into: codex-mode add"
+    if [ -n "$model" ]; then
+        # The model is interpolated into a JSON payload below; keep it to
+        # printable chars without quotes/backslashes so it can never break
+        # the payload or the TOML it lands in.
+        python3 -c '
+import sys
+m = sys.argv[1]
+if len(m) > 200 or any(ord(c) < 32 or ord(c) == 127 or 0xD800 <= ord(c) <= 0xDFFF
+                       or c in (chr(34), chr(92)) for c in m):
+    sys.exit(1)
+' "$model" || die "invalid model name '$model' (max 200 chars, no quotes/backslashes/control chars)"
+    fi
+
+    local info base_url wire_api prov_model prov_models
+    info="$(registry_get "$id")"
+    IFS=$'\t' read -r _ _ base_url wire_api prov_model <<< "$info"
+    prov_models="$(registry_models "$id")" \
+        || die "provider '$id' has an unusable models list — run 'codex-mode config' and fix it"
+
+    if [ -n "$model" ]; then
+        # Partial update (no name field) — keeps the provider's display name.
+        printf '{"id":"%s","base_url":"%s","wire_api":"%s","model":"%s"}' \
+            "$id" "$base_url" "$wire_api" "$model" | registry_upsert update > /dev/null
+        prov_model="$model"
+    fi
+
+    cp -p "$CONFIG" "$CONFIG.mode-bak"
+    strip_block
+
+    # Save current model so chatgpt mode can restore it later. Only when
+    # coming from chatgpt mode, so re-running `api` doesn't clobber it.
+    # Parsed with tomllib, not grepped: a trailing comment or an escaped
+    # quote in the line must not change what gets saved.
+    if [ "$(current_mode)" = "chatgpt" ]; then
+        python3 - "$CONFIG" "$SAVED_MODEL" <<'PYEOF'
+import json, os, sys, tomllib
+try:
+    with open(sys.argv[1], "rb") as f:
+        cfg = tomllib.load(f)
+    m = cfg.get("model")
+    if isinstance(m, str) and m:
+        tmp = sys.argv[2] + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(json.dumps(m))
+        os.replace(tmp, sys.argv[2])
+except Exception:
+    sys.exit(0)
+PYEOF
+    fi
+
+    cat >> "$CONFIG" <<EOF
+
+$MARK_BEGIN
+[model_providers.thirdparty]
+name = "Third-party API"
+base_url = "$base_url"
+wire_api = "$wire_api"
+env_key = "$ENV_KEY"
+requires_openai_auth = false
+$MARK_END
+EOF
+    upsert_toplevel model_provider '"thirdparty"'
+    [ -n "$prov_model" ] && upsert_toplevel model "\"$prov_model\""
+
+    ln -sfn "$KEY_DIR/$id" "$KEY_DIR/current"
+    write_env_sh
+    if [ ! -s "$KEY_DIR/$id" ]; then
+        echo "warning: no API key stored for '$id'. Run: codex-mode set-key $id" >&2
+    fi
+    catalog_apply "$base_url" "$wire_api" "${prov_model:-}" 0 "$prov_models" "$KEY_DIR/$id"
+    echo "Switched to provider '$id' ($base_url)."
+    echo "Open a new shell (or 'source $ENV_SH') so $ENV_KEY is exported."
+}
+
+switch_chatgpt() {
+    cp -p "$CONFIG" "$CONFIG.mode-bak"
+    strip_block
+    remove_toplevel model_provider
+    remove_context_cap
+    if [ -s "$SAVED_MODEL" ]; then
+        local saved
+        saved="$(python3 - "$SAVED_MODEL" <<'PYEOF'
+import json, re, sys
+m = ""
+try:
+    raw = open(sys.argv[1], encoding="utf-8").read().strip()
+    try:
+        v = json.loads(raw)
+        if isinstance(v, str):
+            m = v
+    except Exception:
+        # Older versions saved the bare value; trust only obvious model slugs.
+        if re.fullmatch(r"[A-Za-z0-9._:+/ -]+", raw):
+            m = raw
+    if m and not any(ord(c) < 0x20 or ord(c) == 0x7f or 0xD800 <= ord(c) <= 0xDFFF
+                     or c in ('"', '\\') for c in m):
+        print(m)
+except Exception:
+    # Unreadable file or an unencodable value (e.g. a lone surrogate): leave
+    # stdout empty so the caller prints its note instead of aborting midway.
+    pass
+PYEOF
+        )"
+        if [ -n "$saved" ]; then
+            upsert_toplevel model "\"$saved\""
+        else
+            echo "note: saved ChatGPT model name could not be restored safely — set it in $CONFIG" >&2
+        fi
+    fi
+    echo "Switched to ChatGPT account mode."
+    # codex prints its login status to stderr
+    codex login status >/dev/null 2>&1 || echo "note: not logged in to ChatGPT. Run: codex login" >&2
+}
+
+# ------------------------------------------------------------------ models --
+
+fetch_models() {
+    local id="${1:-}"
+    [ -n "$id" ] || die "usage: codex-mode models <provider-id>"
+    local info base_url
+    info="$(registry_get "$id")"
+    IFS=$'\t' read -r _ _ base_url _ _ <<< "$info"
+    [ -s "$KEY_DIR/$id" ] || die "no API key stored for '$id' — run: codex-mode set-key $id"
+
+    python3 - "$base_url/models" "$KEY_DIR/$id" <<'PYEOF'
+import json, sys, urllib.error, urllib.request
+
+url, key_path = sys.argv[1], sys.argv[2]
+key = open(key_path).read().strip()
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    # Never follow redirects: urllib would resend the Authorization header
+    # (i.e. the API key) to whatever host the endpoint redirects to.
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise urllib.error.HTTPError(
+            req.full_url, code,
+            f"redirects disabled (endpoint pointed at {newurl})", headers, fp)
+
+req = urllib.request.Request(
+    url,
+    headers={"Authorization": f"Bearer {key}", "User-Agent": "codex-mode/2.0"},
+)
+try:
+    opener = urllib.request.build_opener(NoRedirect)
+    with opener.open(req, timeout=20) as r:
+        data = json.load(r)
+except urllib.error.HTTPError as e:
+    if e.code in (401, 403):
+        sys.exit(f"codex-mode: {url} answered {e.code}. Relays that gate clients to "
+                 "coding tools refuse this listing; api mode builds its catalog from "
+                 "the local snapshot — add relay-only names to the provider's "
+                 "\"models\" array (codex-mode config) if they should be pickable.")
+    sys.exit(f"codex-mode: failed to fetch models from {url}: {e}")
+except Exception as e:
+    sys.exit(f"codex-mode: failed to fetch models from {url}: {e}")
+
+items = data.get("data", data) if isinstance(data, dict) else data
+if not isinstance(items, list):
+    sys.exit("codex-mode: unexpected response shape from /models")
+models = sorted({str(m.get("id", "")).strip() for m in items
+                 if isinstance(m, dict) and str(m.get("id", "")).strip()})
+if not models:
+    sys.exit("codex-mode: provider returned an empty model list")
+
+# The relay is untrusted; never print names that could break the terminal or
+# a later paste into config.toml. repr() keeps the warning itself safe.
+def usable(s):
+    return not any(ord(c) < 0x20 or ord(c) == 0x7f or 0xD800 <= ord(c) <= 0xDFFF
+                   or c in ('"', '\\') for c in s)
+
+kept = [m for m in models if usable(m)]
+hidden = [m for m in models if not usable(m)]
+if hidden:
+    print(f"note: hid {len(hidden)} model name(s) with quotes, backslashes, "
+          f"control chars or invalid text: " + ", ".join(repr(m) for m in hidden[:5]),
+          file=sys.stderr)
+if not kept:
+    sys.exit("codex-mode: provider returned no usable model names")
+print("\n".join(kept))
+PYEOF
+}
+
+# ------------------------------------------------------------------ status --
+
+active_provider_id() {
+    # The keys/current symlink names the active provider.
+    [ -L "$KEY_DIR/current" ] || return 0
+    basename "$(readlink "$KEY_DIR/current")"
+}
+
+# Effective context window for the configured model, from the generated
+# catalog (no top-level model_context_window is written anymore).
+catalog_window() {
+    python3 - "$CATALOG" "$CONFIG" <<'PYEOF'
+import json, re, sys
+
+catalog_path, config_path = sys.argv[1], sys.argv[2]
+model = ""
+try:
+    with open(config_path, encoding="utf-8") as f:
+        for line in f:
+            if line.startswith("["):
+                break
+            m = re.match(r'^model\s*=\s*"([^"]+)"', line)
+            if m:
+                model = m.group(1)
+    cat = json.load(open(catalog_path, encoding="utf-8"))
+except Exception:
+    sys.exit(0)
+for e in cat.get("models", []):
+    if isinstance(e, dict) and e.get("slug") == model and isinstance(e.get("context_window"), int):
+        print(e["context_window"])
+        break
+PYEOF
+}
+
+status_json() {
+    local mode login=""
+    mode="$(current_mode)"
+    if [ "$mode" = "chatgpt" ]; then
+        # codex prints its login status to stderr
+        login="$(codex login status 2>&1 || echo 'not logged in')"
+    fi
+    python3 - "$PROVIDERS" "$KEY_DIR" "$mode" "$(active_provider_id)" "$login" "$CODEX_HOME/auth.json" "$CONFIG" "$PAYLOAD_CACHE" "$CATALOG" <<'PYEOF'
+import base64, json, os, re, sys
+
+prov_path, key_dir, mode, active, login, auth_path, config_path, cache_path, catalog_path = sys.argv[1:10]
+reg = json.load(open(prov_path))
+
+if mode == "chatgpt" and os.path.isfile(auth_path):
+    try:
+        adata = json.load(open(auth_path, encoding="utf-8"))
+        id_token = (adata.get("tokens") or {}).get("id_token", "")
+        if id_token and "." in id_token:
+            parts = id_token.split(".")
+            if len(parts) >= 2:
+                p_b64 = parts[1] + "=" * ((4 - len(parts[1]) % 4) % 4)
+                claims = json.loads(base64.urlsafe_b64decode(p_b64.encode("utf-8")).decode("utf-8"))
+                email = claims.get("email", "")
+                auth_claim = claims.get("https://api.openai.com/auth", {})
+                plan = auth_claim.get("chatgpt_plan_type", "") if isinstance(auth_claim, dict) else ""
+                if email:
+                    plan_str = f" ({plan.capitalize()})" if plan else ""
+                    login = f"Logged in as {email}{plan_str}"
+    except Exception:
+        pass
+
+ctx = None
+ctx_max = None
+payload = None
+if mode == "api":
+    model = ""
+    try:
+        with open(config_path, encoding="utf-8") as f:
+            for line in f:
+                if line.startswith("["):
+                    break
+                m = re.match(r"^model_context_window\s*=\s*(\d+)", line)
+                if m:
+                    ctx = int(m.group(1))
+                m = re.match(r'^model\s*=\s*"([^"]+)"', line)
+                if m:
+                    model = m.group(1)
+    except Exception:
+        pass
+    if model:
+        # No top-level override (now the normal state): the window comes
+        # from the generated catalog entry for the configured model. With a
+        # legacy override, only the advertised maximum is read here.
+        try:
+            cat = json.load(open(catalog_path, encoding="utf-8"))
+            for e in cat.get("models", []):
+                if isinstance(e, dict) and e.get("slug") == model:
+                    if ctx is None and isinstance(e.get("context_window"), int):
+                        ctx = e["context_window"]
+                    mx = e.get("max_context_window")
+                    if isinstance(mx, int):
+                        ctx_max = mx
+                    break
+        except Exception:
+            pass
+    try:
+        cache = json.load(open(cache_path))
+        # Match the active provider's base_url if we can.
+        url = None
+        for p in reg.get("providers", []):
+            if p.get("id") == active:
+                url = p.get("base_url")
+                break
+        if url and isinstance(cache.get(url), dict):
+            kf = os.path.join(key_dir, active)
+            key_set = os.path.isfile(kf) and os.path.getsize(kf) > 0
+            e = cache[url]
+            # Only show a measurement taken under the current auth condition.
+            if bool(e.get("auth")) == key_set:
+                payload = e.get("max_payload_bytes")
+    except Exception:
+        pass
+
+out = {"mode": mode, "login": login,
+       "active": active if mode == "api" else "",
+       "last_active": active,
+       "context_window": ctx,
+       "max_context_window": ctx_max,
+       "max_payload_bytes": payload,
+       "providers": []}
+for p in reg.get("providers", []):
+    out["providers"].append({
+        "id": p["id"], "name": p["name"], "base_url": p["base_url"],
+        "wire_api": p["wire_api"], "model": p.get("model", ""),
+        "key_set": os.path.isfile(os.path.join(key_dir, p["id"]))
+                   and os.path.getsize(os.path.join(key_dir, p["id"])) > 0,
+    })
+print(json.dumps(out))
+PYEOF
+}
+
+status_human() {
+    local mode active
+    mode="$(current_mode)"
+    active="$(active_provider_id)"
+    echo "Codex config : $CONFIG"
+    if [ "$mode" = "api" ]; then
+        echo "Current mode : third-party API"
+        if [ -n "$active" ] && info="$(registry_get "$active" 2>/dev/null)"; then
+            IFS=$'\t' read -r _ name base_url wire_api model <<< "$info"
+            echo "  provider   : $name ($active)"
+            echo "  base_url   : $base_url"
+            echo "  wire_api   : $wire_api"
+            echo "  model      : ${model:-<config default>}"
+            local ctx_override
+            ctx_override="$(awk '/^\[/{exit} /^model_context_window[ \t]*=/{sub(/^[^=]*=[ \t]*/,""); print; exit}' "$CONFIG")"
+            if [ -n "$ctx_override" ]; then
+                echo "  context    : $ctx_override tokens (legacy override)"
+            else
+                local ctx_cat
+                ctx_cat="$(catalog_window)"
+                if [ -n "$ctx_cat" ]; then
+                    echo "  context    : $ctx_cat tokens (model catalog)"
+                else
+                    echo "  context    : unknown (no catalog entry for the configured model)"
+                fi
+            fi
+        else
+            echo "  provider   : (registry out of sync — active key link is stale)"
+        fi
+    else
+        echo "Current mode : ChatGPT account ($(codex login status 2>&1 || echo 'not logged in'))"
+    fi
+    echo "Providers    : $(registry_count) configured"
+    if [ -n "$active" ] && [ -s "$KEY_DIR/$active" ]; then
+        echo "API key      : stored ($KEY_DIR/$active)"
+    else
+        echo "API key      : not set (codex-mode set-key <id>)"
+    fi
+}
+
+set_key() {
+    local id="${1:-}" key base_url
+    [ -n "$id" ] || die "usage: codex-mode set-key <provider-id>"
+    registry_get "$id" > /dev/null
+    if [ -t 0 ]; then
+        printf 'API key for %s (input hidden): ' "$id" >&2
+        IFS= read -rs key; echo >&2
+    else
+        IFS= read -r key
+    fi
+    key="${key%$'\r'}"
+    key="$(printf '%s' "$key" | tr -d '[:space:]')"
+    [ -n "$key" ] || die "empty key"
+    local fd
+    fd="$(mktemp "$KEY_DIR/.XXXXXX")"
+    printf '%s' "$key" > "$fd"
+    chmod 600 "$fd"
+    mv "$fd" "$KEY_DIR/$id"
+    # The cached payload (if any) was measured before this key existed, and
+    # unauthenticated posts hit a stricter edge limit — so drop it.
+    base_url="$(registry_get "$id" | cut -f3)"
+    cache_forget "$base_url"
+    # Refresh the export if this provider is the active one.
+    [ "$(active_provider_id)" = "$id" ] && write_env_sh
+    echo "API key stored for '$id'. Run 'source $ENV_SH' or open a new shell."
+}
+
+config_model() {
+    awk '/^\[/{exit} /^model[ \t]*=/{sub(/^model[ \t]*=[ \t]*/,""); gsub(/"/,""); print; exit}' "$CONFIG"
+}
+
+probe_payload() {
+    local id="${1:-}"
+    [ -n "$id" ] || id="$(active_provider_id)"
+    [ -n "$id" ] || die "usage: codex-mode probe-payload <provider-id>"
+    local info base_url wire_api model prov_models out payload how count
+    info="$(registry_get "$id")"
+    IFS=$'\t' read -r _ _ base_url wire_api model <<< "$info"
+    [ -n "$model" ] || model="$(config_model)"
+    prov_models="$(registry_models "$id")" \
+        || die "provider '$id' has an unusable models list — run 'codex-mode config' and fix it"
+    echo "Probing payload limit at $base_url ..."
+    if [ "$(current_mode)" = "api" ] && [ "$(active_provider_id)" = "$id" ]; then
+        cp -p "$CONFIG" "$CONFIG.mode-bak"
+        catalog_apply "$base_url" "$wire_api" "$model" 1 "$prov_models" "$KEY_DIR/$id"
+    else
+        out="$(catalog_build "$base_url" "$wire_api" "$model" 1 "$prov_models" "$KEY_DIR/$id")" \
+            || die "failed to build the model catalog"
+        IFS=$'\t' read -r payload how count <<< "$out"
+        if [ "$how" = "inconclusive" ]; then
+            echo "Probe was inconclusive (relay answered before reading the body) — nothing cached." >&2
+        else
+            echo "Payload cap: $payload bytes ($how). Switch with: codex-mode api $id"
+        fi
+    fi
+}
+
+# -------------------------------------------------------------------- main --
+
+ensure_registry
+cmd="${1:-status}"
+case "$cmd" in
+    status)   status_human ;;
+    json)     status_json ;;
+    chatgpt)  switch_chatgpt ;;
+    api)      shift; switch_api "$@" ;;
+    models)   shift; fetch_models "$@" ;;
+    add)      registry_upsert add ;;
+    update)   registry_upsert update ;;
+    remove)   [ -n "${2:-}" ] || die "usage: codex-mode remove <id>"
+              [ "$2" != "$(active_provider_id)" ] || [ "$(current_mode)" != "api" ] \
+                  || die "provider '$2' is active — switch to chatgpt first"
+              registry_remove "$2" ;;
+    set-key)  shift; set_key "$@" ;;
+    probe-payload) shift; probe_payload "$@" ;;
+    config)   "${EDITOR:-vi}" "$PROVIDERS" ;;
+    *)        die "unknown command '$cmd' (status|json|chatgpt|api|models|add|update|remove|set-key|probe-payload|config)" ;;
+esac

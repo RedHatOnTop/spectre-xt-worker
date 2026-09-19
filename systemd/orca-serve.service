@@ -1,0 +1,19 @@
+[Unit]
+StartLimitIntervalSec=300
+StartLimitBurst=5
+Description=Orca ADE headless runtime server
+After=network-online.target
+
+[Service]
+# Headless per Orca guide: no DISPLAY -> build auto-starts its own Xvfb.
+UnsetEnvironment=DISPLAY WAYLAND_DISPLAY XAUTHORITY XAUTHLOCALHOSTNAME DESKTOP_SESSION GDMSESSION XDG_CURRENT_DESKTOP XDG_SESSION_DESKTOP XDG_SESSION_TYPE XDG_SESSION_CLASS XDG_SESSION_ID XDG_SESSION_PATH XDG_SEAT XDG_SEAT_PATH XDG_GREETER_DATA_DIR XDG_MENU_PREFIX
+ExecStart=/usr/bin/orca-ide serve --port 6768 --pairing-address 100.119.252.88 --json
+# serve can self-exit with status 0 (clean shutdown); bring it back anyway.
+# Exit 3 is the singleton conflict — the only exit that must stay down.
+Restart=always
+RestartSec=3
+RestartPreventExitStatus=3
+KillMode=mixed
+
+[Install]
+WantedBy=default.target

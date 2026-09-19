@@ -1,0 +1,12 @@
+[Unit]
+Description=Spectre qoder goal-park watcher every 120s
+
+[Timer]
+OnBootSec=120s
+OnUnitActiveSec=120s
+AccuracySec=5s
+Persistent=true
+Unit=qoder-goal-watch.service
+
+[Install]
+WantedBy=timers.target

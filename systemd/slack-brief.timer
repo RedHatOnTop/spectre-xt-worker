@@ -1,0 +1,11 @@
+[Unit]
+Description=Post the Slack community brief daily at 09:00
+
+[Timer]
+OnCalendar=*-*-* 09:00:00
+AccuracySec=1min
+Persistent=true
+Unit=slack-brief.service
+
+[Install]
+WantedBy=timers.target

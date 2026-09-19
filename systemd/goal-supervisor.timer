@@ -1,0 +1,15 @@
+[Unit]
+Description=Spectre goal supervisor every 180s (Grokbot review of stopped /goal units)
+# 180 s > the park watcher's 120 s tick, so a park is classified before this
+# review reads it. The poll itself is cheap (local jsonl probes); only a *new*
+# stop event buys a grok call (RUNBOOK 7.16 cost note).
+
+[Timer]
+OnBootSec=240s
+OnUnitActiveSec=180s
+AccuracySec=10s
+Persistent=true
+Unit=goal-supervisor.service
+
+[Install]
+WantedBy=timers.target

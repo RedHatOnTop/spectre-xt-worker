@@ -1,0 +1,23 @@
+[Unit]
+Description=Spectre authoritative worker-state resolver
+Documentation=file:///opt/spectre-xt-worker/RUNBOOK.md
+# The single resolver (RUNBOOK 7.17). Consumers (slack-bridge,
+# qoder-goal-watch, spectre-continuity) read snapshot.policy only. This daemon
+# records evidence, serves snapshots, and logs old-vs-new divergence; it does
+# not type into workers.
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=exec
+ExecStart=/usr/local/bin/spectre-state serve
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+Environment=HOME=%h
+# RUNBOOK 7.8 gotcha: user units inherit the lightdm/XFCE session env.
+UnsetEnvironment=DESKTOP_SESSION XDG_CURRENT_DESKTOP XDG_SESSION_TYPE DISPLAY
+NoNewPrivileges=true
+Restart=always
+RestartSec=3s
+
+[Install]
+WantedBy=default.target

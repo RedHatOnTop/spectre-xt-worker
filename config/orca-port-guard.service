@@ -1,0 +1,14 @@
+[Unit]
+Description=Orca serve port guard (6768 on lo/tailscale0 only)
+Documentation=file:///etc/nftables/orca-port-guard.nft
+After=network-pre.target
+Before=systemd-user-sessions.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/nft -f /etc/nftables/orca-port-guard.nft
+ExecReload=/usr/sbin/nft -f /etc/nftables/orca-port-guard.nft
+
+[Install]
+WantedBy=multi-user.target

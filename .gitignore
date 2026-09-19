@@ -1,9 +1,11 @@
 .env
 env.json
 health.env
+slack.env
 *.pem
 credentials.json
 node_modules/
 *.log
 __pycache__/
 *.pyc
+references/

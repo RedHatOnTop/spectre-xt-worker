@@ -7,7 +7,20 @@ set -u
 MODE="${1:-closed}"
 PERSON_USER="${STEALTH_USER:-person}"
 LOG="${STEALTH_LOG:-/work/logs/stealth.log}"
+CONF="${STEALTH_CONF:-/etc/default/spectre-stealth}"
 install -d -m 0755 "$(dirname "${LOG}")" 2>/dev/null || true
+
+# External-display policy when a real monitor is connected:
+#   keep (default) — leave it on; the box is only guaranteed dark with
+#                    an HDMI dummy instead of a monitor.
+#   dpms           — blank it with DPMS (output stays alive, Electron safe)
+external_mode() {
+  if [[ -r "${CONF}" ]]; then
+    # shellcheck disable=SC1090
+    source "${CONF}" 2>/dev/null || true
+  fi
+  printf '%s\n' "${STEALTH_EXTERNAL:-keep}"
+}
 
 ts() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 note() { printf '%s %s\n' "$(ts)" "$*" >>"${LOG}" 2>/dev/null || true; }
@@ -72,8 +85,7 @@ blank_vt() {
 }
 
 wait_for_x() {
-  local i
-  for i in 1 2 3 4 5 6 7 8 9 10; do
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
     as_graphical xrandr --query >/dev/null 2>&1 && return 0
     sleep 1
   done
@@ -95,6 +107,14 @@ case "${MODE}" in
           as_graphical xrandr --output "${out}" --off 2>/dev/null || true
           note "internal ${out} off (dummy HDMI stays)"
         done < <(internal_outputs)
+        # A real monitor (not a dummy) stays lit by design — killing the
+        # last output can wedge Electron. STEALTH_EXTERNAL=dpms in
+        # /etc/default/spectre-stealth blanks it via DPMS instead, which
+        # keeps the output alive and the window mapped.
+        if [[ "$(external_mode)" == "dpms" ]]; then
+          as_graphical xset -display :0 dpms force off 2>/dev/null || true
+          note "external display dpms off (STEALTH_EXTERNAL=dpms)"
+        fi
       else
         as_graphical xset -display :0 dpms force off 2>/dev/null || true
         note "no HDMI dummy — panel connected, dpms off, backlight 0"
@@ -108,6 +128,7 @@ case "${MODE}" in
     ;;
   open)
     if wait_for_x; then
+      as_graphical xset -display :0 dpms force on 2>/dev/null || true
       while read -r out; do
         [[ -z "${out}" ]] && continue
         as_graphical xrandr --output "${out}" --auto 2>/dev/null || true

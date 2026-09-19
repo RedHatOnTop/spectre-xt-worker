@@ -1,0 +1,72 @@
+[Unit]
+Description=CodexPro handoff bridge (ChatGPT -> local agy executor)
+Documentation=https://github.com/rebel0789/codexpro
+# Prereqs (RUNBOOK 7.9):
+#   ~/.codexpro/http-token              (openssl rand -hex 32, mode 0600)
+#   ~/.codexpro/cloudflare-tunnel-token (dashboard-managed named tunnel, 0600)
+#   agy logged in once interactively (headless uses cached credentials)
+#   agy permissions scoped in ~/.gemini/antigravity-cli/settings.json
+# EDIT the --root and --hostname lines below before first enable.
+# network-online.target is a system-manager unit, so ordering would be a
+# no-op here; the service binds 127.0.0.1 and the tunnel is outbound-only.
+# Cap crash loops: a permanent misconfig (e.g. bad token file mode) exits
+# immediately and must not restart forever.
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=exec
+# EDIT: --root is the pilot repo, --hostname the tunnel's public hostname.
+# First week runs --no-bash; then optionally swap it for `--bash safe`.
+# --bash full and --no-auth are banned on this box.
+ExecStart=/usr/bin/env codexpro start \
+  --root %h/Projects/handoff-pilot \
+  --mode handoff \
+  --no-bash \
+  --tool-mode standard \
+  --tunnel cloudflare-named \
+  --hostname handoff.example.com \
+  --tunnel-name codexpro \
+  --cloudflare-token-file %h/.codexpro/cloudflare-tunnel-token \
+  --token-file %h/.codexpro/http-token \
+  --headless \
+  --no-copy-url
+EnvironmentFile=-%h/.config/remote-agent/codexpro.env
+# RUNBOOK 7.8 gotcha: user units inherit the lightdm/XFCE session
+# environment; keep this list when editing.
+UnsetEnvironment=DESKTOP_SESSION XDG_CURRENT_DESKTOP XDG_SESSION_TYPE
+NoNewPrivileges=true
+PrivateTmp=true
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=default.target
+
+# ---------------------------------------------------------------------------
+# Phase 2 — autonomous watch loop. Copy the block below into
+# ~/.config/systemd/user/codexpro-watch.service and enable it ONLY after
+# the manual execute-handoff cycle (RUNBOOK 7.9) has been verified and
+# trusted. It auto-runs every plan ChatGPT drops into .ai-bridge/.
+#
+# [Unit]
+# Description=CodexPro watch-handoff (auto-run ChatGPT plans via agy)
+# Documentation=https://github.com/rebel0789/codexpro
+# After=codexpro-handoff.service
+#
+# [Service]
+# Type=exec
+# ExecStart=/usr/bin/env codexpro watch-handoff \
+#   --root %h/Projects/handoff-pilot \
+#   --agent custom \
+#   --command "%h/.local/bin/agy-handoff {{plan_file}} {{root}}" \
+#   --yes
+# EnvironmentFile=-%h/.config/remote-agent/codexpro.env
+# UnsetEnvironment=DESKTOP_SESSION XDG_CURRENT_DESKTOP XDG_SESSION_TYPE
+# NoNewPrivileges=true
+# Restart=on-failure
+# RestartSec=5s
+#
+# [Install]
+# WantedBy=default.target
+# ---------------------------------------------------------------------------

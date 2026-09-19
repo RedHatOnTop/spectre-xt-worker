@@ -1,0 +1,15 @@
+[Unit]
+Description=Daily deterministic brief to the Slack #lobby commons
+Documentation=file:///opt/spectre-xt-worker/RUNBOOK.md
+# Prereqs (RUNBOOK 7.10): as slack-bridge.service. Posts as `bridge`;
+# no LLM, no tokens in the environment (reads slack.env itself).
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/spectre-slack-brief
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+UnsetEnvironment=DESKTOP_SESSION XDG_CURRENT_DESKTOP XDG_SESSION_TYPE DISPLAY
+NoNewPrivileges=true
+PrivateTmp=true
