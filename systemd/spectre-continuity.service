@@ -1,0 +1,11 @@
+[Unit]
+Description=Spectre continuity (resume only when worker-state policy allows)
+Documentation=file:///opt/spectre-xt-worker/RUNBOOK.md
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/spectre-continuity
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+Environment=HOME=%h
+UnsetEnvironment=DESKTOP_SESSION XDG_CURRENT_DESKTOP XDG_SESSION_TYPE DISPLAY
+NoNewPrivileges=true

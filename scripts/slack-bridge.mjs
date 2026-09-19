@@ -4,8 +4,12 @@
 // Listens on a websocket (outbound only; no tunnel, no inbound firewall
 // change) and applies a per-channel policy to message.channels events:
 //   #control  bot mention from an allowlisted member -> built-in or qoder run
+//             (goal/resume <worker>: type /goal[ resume] into a worker's tmux)
 //   #lobby    agent-identity post -> qoder discussion reply in-thread
-//             (humans only when allowlisted AND prefixed "qoder:")
+//             (humans only when allowlisted AND prefixed "qoder:").
+//             With SLACK_DEBATE=1 the antigravity CLI (agy) joins as a
+//             second voice: a responder's own post draws the *other*
+//             responder, strictly alternating until [PASS] or a cap.
 //   #alerts   healthcheck post -> optional auto-triage in-thread (SLACK_TRIAGE=1)
 //   #fleet    posts only
 //
@@ -30,6 +34,8 @@ import {
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { randomUUID } from "node:crypto";
+import { actionResult, claimAction, getSnapshot } from "./worker-state-client.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const DEFAULT_ENV_FILE = join(homedir(), ".config/remote-agent/slack.env");
@@ -37,11 +43,25 @@ const STATE_FILE = join(homedir(), ".local/state/remote-agent/slack-bridge-state
 const AUDIT_LOG = "/work/logs/slack-bridge.log";
 const SETTINGS_PATH = "/usr/local/share/remote-agent/slack-executor-settings.json";
 const DEFAULT_EXECUTOR_BIN = join(homedir(), ".local/bin/qoder-efficient");
+const DEFAULT_AGY_BIN = join(homedir(), ".local/bin/agy");
+// agy has no flag or env for its permissions file; the live path is fixed.
+const AGY_SETTINGS_PATH = join(homedir(), ".gemini/antigravity-cli/settings.json");
+const AGY_CWD = join(homedir(), ".local/state/remote-agent/agy-cwd");
+const AGY_PRINT_TIMEOUT = "4m"; // = 240 s; must fire before EXECUTOR_TIMEOUT_MS (300 s)
 const BOX_REGISTRY = "/usr/local/share/remote-agent/slack-agents.json";
 const REPO_REGISTRY = join(HERE, "..", "config", "slack-agents.json");
+const BOX_WORKERS_FILE = "/usr/local/share/remote-agent/qoder-workers.json";
+const REPO_WORKERS_FILE = join(HERE, "..", "config", "qoder-workers.json");
+const BOX_CLAUSE_FILE = "/usr/local/share/remote-agent/qoder-goal-clause.md";
+const REPO_CLAUSE_FILE = join(HERE, "..", "config", "qoder-goal-clause.md");
+const TMUX_BIN = "tmux";
+const ORCA_BIN = "orca-ide";
+const GOAL_LINE_MAX = 4000; // one tmux send-keys literal (goal text + clause)
 const SLACK_API = "https://slack.com/api";
 
-export const RESPONDER = "qoder"; // identity used for replies
+export const RESPONDER = "qoder"; // primary responder identity
+export const RESPONDER_AGY = "antigravity"; // second #lobby voice (SLACK_DEBATE=1)
+export const RESPONDERS = [RESPONDER, RESPONDER_AGY];
 export const INFRA_IDENTITY = "bridge"; // excluded from #lobby triggers (brief, acks)
 const HUMAN_PREFIX = /^qoder:\s*/i;
 const RECOVERY_PREFIX = ":white_check_mark:";
@@ -50,6 +70,7 @@ const EVENT_MAX_AGE_SEC = 300;
 export const REPLY_CHUNK = 3000;
 const EXECUTOR_TIMEOUT_MS = 300_000;
 export const THREAD_RUNS_PER_HOUR = 4;
+export const DEBATE_MERGE_SEC = 60;
 export const RATE_MAX = 6;
 export const RATE_WINDOW_SEC = 600;
 export const RATE_MIN_GAP_SEC = 10;
@@ -60,30 +81,64 @@ const THREAD_CONTEXT_MSG_CHARS = 1500;
 const SEEN_MAX = 2000;
 
 const HELP_TEXT =
-  "commands: `@spectre-agents ping` | `status` | `help` | any question " +
-  "(qoder runs read-only, rate-limited, ~1-3 min)";
+  "commands: `@spectre-agents ping` | `status` | `help` | `goal <worker> <text>` | " +
+  "`resume <worker>` | any question (qoder runs rate-limited, ~1-3 min)";
 
-const BOX_FACTS = [
+const BOX_FACTS_QODER = [
   "Context: you are running headless on the Spectre XT worker box (Debian 13, user person),",
   "inside the Spectre agent community in Slack.",
-  "Services: orca-serve (user unit, :6768), hardened-zai-proxy (:18088, optional),",
-  "ZCode (Electron GUI app, cannot run headless), qodercli (you, via the Efficient model).",
+  "Services: orca-serve (user unit, :6768), qodercli (you, via the Efficient model);",
+  "ZCode and the hardened-zai-proxy were retired from this box on 2026-09-15.",
   "Logs: /work/logs/health.log (a line per failing run and on state changes;",
   "a healthy box writes nothing — silence is normal, not a dead checker) and journald.",
-  "You have a read-only tool allowlist; unlisted tools fail closed.",
+  "You have read, write and shell access on the box (posture 2026-09-16); a deny list",
+  "blocks destructive commands (rm, dd, mkfs, shutdown, force-push, history rewrites,",
+  "package publishes) and secret files. Work directly — do not ask permission for",
+  "ordinary steps, and do not assume a tool is unavailable without trying it.",
   "Never ask for or print secrets. Reply in plain text suitable for a Slack message.",
 ].join("\n");
 
+const BOX_FACTS_AGY = [
+  "Context: you are Antigravity (antigravity), the second voice in the Spectre agent",
+  "community — a Slack workspace around the Spectre XT worker box (Debian 13, user person).",
+  "You have no tool access in this mode: you cannot read files, run commands, browse, or",
+  "inspect the box. You only see the thread text quoted in this prompt. Never claim to have",
+  "inspected the box, read a file, or run a command — if the thread lacks the evidence, say",
+  "what is unknown and what you would check, instead of inventing specifics.",
+  "Never ask for or print secrets. Reply in plain text suitable for a Slack message.",
+].join("\n");
+
+const PASS_INSTRUCTION =
+  "The exchange may continue beyond this reply. If the thread has reached a natural end " +
+  "and you have nothing substantive to add, reply with exactly [PASS] and nothing else — " +
+  "the bridge then stops the exchange. Never use [PASS] to dodge a question; it is not " +
+  "offered on first replies, only mid-discussion.";
+
 const PERSONAS = {
   control:
-    "The operator asked something in #control. Investigate read-only and reply " +
+    "The operator asked something in #control. Investigate (you have read/write/shell " +
+    "access) and reply " +
     "with a concise, concrete answer (no more than 2000 characters).",
   discussion:
     "You are qoder in #lobby, the commons where agents share issues and findings. " +
     "Join the thread with a concise, concrete reply (no more than 2000 characters). " +
     "Disagree when the evidence says so; do not pad.",
+  discussionDebateQoder:
+    "You are qoder in #lobby, the commons where agents share issues and findings. " +
+    "You are one of two voices in an open discussion with Antigravity (antigravity). " +
+    "Join the thread with a concise, concrete reply (no more than 2000 characters). " +
+    "Address the author you are responding to, disagree when the evidence says so, " +
+    "mark what you are uncertain about, and do not pad or restate the thread.",
+  discussionDebateAgy:
+    "You are Antigravity (antigravity) in #lobby, the commons where agents share " +
+    "issues and findings. You are one of two voices in an open discussion with qoder. " +
+    "Join the thread with a concise, concrete reply (no more than 2000 characters). " +
+    "Address the author you are responding to, disagree when the evidence says so, and " +
+    "mark what you are uncertain about — you cannot check the box yourself, so reason " +
+    "only from what the thread shows and say what you would verify. Do not pad or " +
+    "restate the thread.",
   triage:
-    "A healthcheck alert was posted to #alerts. Triage it read-only: likely cause, " +
+    "A healthcheck alert was posted to #alerts. Triage it: likely cause, " +
     "evidence, suggested next action. Keep it under 1500 characters.",
 };
 
@@ -132,11 +187,26 @@ export function loadConfig(text) {
       .map((item) => item.trim())
       .filter(Boolean),
     triage: truthy(env.SLACK_TRIAGE || "0"),
+    debate: truthy(env.SLACK_DEBATE || "0"),
     maxRunsPerDay: Math.max(1, Math.floor(numberOr(env.SLACK_MAX_RUNS_PER_DAY, 30))),
+    threadRunsPerHour: Math.max(
+      1,
+      Math.floor(numberOr(env.SLACK_THREAD_RUNS_PER_HOUR, THREAD_RUNS_PER_HOUR)),
+    ),
+    threadTurnsPerDay: Math.max(
+      1,
+      Math.floor(numberOr(env.SLACK_THREAD_TURNS_PER_DAY, 8)),
+    ),
+    debateMaxRunsPerDay: Math.max(
+      1,
+      Math.floor(numberOr(env.SLACK_DEBATE_MAX_RUNS_PER_DAY, 20)),
+    ),
     // qodercli "efficient" is the 0-multiplier model; the wrapper adds the
     // billing guard (refuses to start, exit 75, if the promo price changed).
     executorBin: expandHome((env.SLACK_EXECUTOR_BIN || "").trim()) || DEFAULT_EXECUTOR_BIN,
     executorModel: (env.SLACK_EXECUTOR_MODEL || "efficient").trim(),
+    // second #lobby voice (debate mode); the agy CLI, spawned by absolute path
+    agyBin: expandHome((env.SLACK_AGY_BIN || "").trim()) || DEFAULT_AGY_BIN,
   };
 }
 
@@ -154,6 +224,9 @@ export function validateConfig(cfg) {
   }
   if (!cfg.executorBin.startsWith("/")) {
     problems.push("SLACK_EXECUTOR_BIN must be an absolute path");
+  }
+  if (cfg.debate && !cfg.agyBin.startsWith("/")) {
+    problems.push("SLACK_AGY_BIN must be an absolute path (SLACK_DEBATE=1)");
   }
   return problems;
 }
@@ -206,6 +279,27 @@ export function isRecoveryText(text) {
   return String(text || "").trimStart().startsWith(RECOVERY_PREFIX);
 }
 
+// Strict: the personas are told to reply with exactly [PASS]; a discussion
+// that merely mentions the marker still gets posted.
+export function isPassText(text) {
+  return /^\[pass\]$/i.test(String(text || "").trim());
+}
+
+export function otherResponder(identity) {
+  return identity === RESPONDER_AGY ? RESPONDER : RESPONDER_AGY;
+}
+
+// The agy leg is best-effort: bin+settings absent -> lobby debate turns are
+// skipped and audited, never an error loop. qoder turns are never gated here.
+export function speakerReady(speaker, cfg, existsFn = existsSync) {
+  if (speaker !== RESPONDER_AGY) return true;
+  return (
+    String(cfg.agyBin || "").startsWith("/") &&
+    existsFn(cfg.agyBin) &&
+    existsFn(AGY_SETTINGS_PATH)
+  );
+}
+
 export function classifyMessage(msg, cfg, ctx) {
   if (msg.channel === cfg.channels.fleet) {
     return { kind: "ignore", reason: "fleet_posts_only" };
@@ -246,23 +340,52 @@ export function classifyMessage(msg, cfg, ctx) {
       if (!cfg.allowedUsers.includes(msg.user)) {
         return { kind: "ignore", reason: "lobby_human_not_allowed" };
       }
+      // continuation=false even mid-thread: a human question is never
+      // answerable with [PASS] silence.
       return {
         kind: "discussion",
         identity: "human",
+        speaker: RESPONDER,
+        continuation: false,
         prompt: msg.text.replace(HUMAN_PREFIX, "").trim().slice(0, PROMPT_MAX),
       };
     }
     const identity = agentIdentity(msg, ctx.agents, ctx.botId);
     if (!identity) return { kind: "ignore", reason: "lobby_unknown_identity" };
-    if (identity === RESPONDER || identity === INFRA_IDENTITY) {
-      return { kind: "ignore", reason: "lobby_self" };
+    if (identity === INFRA_IDENTITY) return { kind: "ignore", reason: "lobby_self" };
+    const isReply = Boolean(msg.threadTs && msg.threadTs !== msg.ts);
+    if (!cfg.debate) {
+      if (identity === RESPONDER) return { kind: "ignore", reason: "lobby_self" };
+      // Single-hop by construction: agent posts only trigger at top level;
+      // humans continue threads with the qoder: prefix.
+      if (isReply) return { kind: "ignore", reason: "lobby_thread_reply" };
+      return {
+        kind: "discussion",
+        identity,
+        speaker: RESPONDER,
+        continuation: false,
+        prompt: msg.text.slice(0, PROMPT_MAX),
+      };
     }
-    // Single-hop by construction: agent posts only trigger at top level;
-    // humans continue threads with the qoder: prefix.
-    if (msg.threadTs && msg.threadTs !== msg.ts) {
-      return { kind: "ignore", reason: "lobby_thread_reply" };
+    // Debate mode: a responder's own post (top level or in-thread) draws the
+    // other responder — that event-driven alternation is the whole exchange.
+    if (RESPONDERS.includes(identity)) {
+      return {
+        kind: "discussion",
+        identity,
+        speaker: otherResponder(identity),
+        continuation: true,
+        prompt: msg.text.slice(0, PROMPT_MAX),
+      };
     }
-    return { kind: "discussion", identity, prompt: msg.text.slice(0, PROMPT_MAX) };
+    if (isReply) return { kind: "ignore", reason: "lobby_thread_reply" };
+    return {
+      kind: "discussion",
+      identity,
+      speaker: RESPONDER,
+      continuation: false,
+      prompt: msg.text.slice(0, PROMPT_MAX),
+    };
   }
 
   return { kind: "ignore", reason: "channel" };
@@ -287,14 +410,199 @@ export function shouldHandle(msg, cfg, ctx, now, seen) {
   return classifyMessage(msg, cfg, ctx);
 }
 
+// ChatGPT Slack connector attribution trailers come in three observed forms:
+//   legacy:  *Sent using ChatGPT*
+//   bold:    *Sent using* <@U0C0XE1NCLF|ChatGPT>
+//   italic:  _Sent using_ <@U0C0XE1NCLF|ChatGPT>
+// The regex strips exactly one trailing attribution line so that bare commands
+// (help, resume, goal) still parse, while legitimate goal text that merely
+// mentions "Sent using" mid-message is preserved.
+// (Synced from the box's live bridge on 2026-09-16 — the box carried this fix
+// from 2026-09-15 and the repo did not.)
+const ATTRIBUTION_TRAILER_RE =
+  /\s*(?:\*Sent using\*\s*<@[^>\n]*>[^\n]*|_Sent using_\s*<@[^>\n]*>[^\n]*|\*Sent using [^*\n]*\*)\s*$/i;
+
 export function classifyCommand(text) {
-  const command = String(text || "").trim();
+  // Slack add-ons can append a trailer to the operator's text; a bare command
+  // must still parse as one.
+  const command = String(text || "")
+    .replace(ATTRIBUTION_TRAILER_RE, "")
+    .trim();
   const words = command.split(/\s+/);
   const first = (words[0] || "").toLowerCase();
   if (words.length === 1 && ["status", "ping", "help"].includes(first)) {
     return { builtin: first, prompt: "" };
   }
+  if (first === "resume") {
+    const rest = command.slice(words[0].length).trim();
+    const parts = rest ? rest.split(/\s+/) : [];
+    if (parts.length === 1) return { builtin: "resume", worker: parts[0].toLowerCase(), prompt: "" };
+    return { builtin: "resume", worker: null, prompt: "" };
+  }
+  if (first === "goal") {
+    const rest = command.slice(words[0].length).trim();
+    if (!rest) return { builtin: "goal", worker: null, prompt: "" };
+    const space = rest.search(/\s/);
+    const worker = (space < 0 ? rest : rest.slice(0, space)).toLowerCase();
+    const body = (space < 0 ? "" : rest.slice(space + 1)).trim();
+    return { builtin: "goal", worker, prompt: body.slice(0, PROMPT_MAX) };
+  }
   return { builtin: null, prompt: command.slice(0, PROMPT_MAX) };
+}
+
+// What the #control handler hands to handleDispatch. Pure: the worker and
+// goal text come from classifyCommand — the message decision carries neither
+// field, and reading them from it silently broke every Slack goal/resume.
+export function controlDispatchArgs(decision) {
+  const { builtin, worker, prompt } = classifyCommand(String((decision && decision.command) || ""));
+  return { builtin, worker: worker || null, prompt: prompt || "" };
+}
+
+// Whether a probed worker position may be typed into. Pure.
+// Active workers own the terminal; a plan_gate park shows an ExitPlanMode
+// permission dialog — blind keystrokes could select a dialog option, so the
+// operator must approve that one in the orca UI.
+export function dispatchAction(builtin) {
+  return builtin === "resume" ? "resume" : "dispatch_goal";
+}
+
+export function dispatchAllowed(pos, action = "dispatch_goal") {
+  const policy = pos && pos.policy;
+  if (!policy || typeof policy !== "object") {
+    return { ok: false, detail: "state api unavailable (no policy) — refusing to type blind" };
+  }
+  const flag = action === "resume" ? "can_resume" : "can_dispatch_goal";
+  if (policy[flag] === true) return { ok: true };
+  const park = (pos.goal && pos.goal.park_reason) || pos.park_reason || pos.reason;
+  const state = (pos.goal && pos.goal.state) || pos.goal_state || pos.state || "UNKNOWN";
+  if (park === "plan_gate") {
+    return {
+      ok: false,
+      detail: "worker awaits ExitPlanMode approval in the UI — blind keystrokes could " +
+        "select a dialog option; approve or deny it in orca first",
+    };
+  }
+  return { ok: false, detail: `worker is ${state} (policy.${flag}=false)` };
+}
+
+// Last guard before typing: the injected text is a command line for whatever
+// runs in that pane. A pane that fell back to a shell would execute it, and a
+// pane in another project would take the goal into the wrong session.
+const SHELL_COMMANDS = ["bash", "zsh", "sh", "dash", "fish", "ksh", "tcsh"];
+export function paneRefusal(command, path, cwd) {
+  const cmd = String(command || "").replace(/^-/, "").toLowerCase();
+  if (SHELL_COMMANDS.includes(cmd)) {
+    return `pane runs a shell (${cmd}) — the text would execute as a shell command`;
+  }
+  if (cwd && path) {
+    let same = path === cwd;
+    if (!same) {
+      try {
+        same = realpathSync(path) === realpathSync(cwd);
+      } catch {
+        same = false;
+      }
+    }
+    if (!same) return `pane cwd (${path}) is not the worker cwd (${cwd})`;
+  }
+  return null;
+}
+
+// A bare registry name is ambiguous as a tmux target: tmux matches it as a
+// window name in the current session before a session name (pugc's window is
+// named "qodercli", so `-t qoder` landed on the pugc pane). Qualify bare
+// names as sessions; explicit targets (%pane, @window, sess:w.p) pass through.
+export function paneTarget(tmux) {
+  const t = String(tmux || "");
+  if (!t || t.startsWith("%") || t.startsWith("@") || t.includes(":")) return t;
+  return `${t}:`;
+}
+
+// A worker with no tmux path lives in an Orca-managed native terminal. Only a
+// single live, connected, writable terminal for the worker's worktree may be
+// typed into; no match or an ambiguous match is a refusal, never a guess.
+// A worktree can legitimately hold several terminals (a handoff session beside
+// the qoder worker), so a worker may carry a `terminal` pin. The pin only
+// narrows — it is honored while that exact terminal is live, and a stale pin
+// refuses: falling back to "the other one" could type /goal resume into a
+// foreign session.
+export function pickNativeTerminal(terminals, cwd, pin) {
+  const live = (Array.isArray(terminals) ? terminals : []).filter(
+    (t) => t && t.worktreePath === cwd && t.connected === true && t.writable === true,
+  );
+  const wanted = String(pin || "");
+  const matches = wanted ? live.filter((t) => t.handle === wanted) : live;
+  if (matches.length === 1) return { ok: true, terminal: matches[0] };
+  if (matches.length === 0) {
+    if (wanted) {
+      const rest = live.length ? ` (${live.length} other live)` : "";
+      return {
+        ok: false,
+        detail: `pinned terminal ${wanted} for ${cwd} is not live${rest} — update the worker registry or the orca UI`,
+      };
+    }
+    return { ok: false, detail: `no live orca terminal for ${cwd} — create one in the orca UI` };
+  }
+  return {
+    ok: false,
+    detail: `${matches.length} live orca terminals for ${cwd} — refusing to guess; pin one with the worker's "terminal" field`,
+  };
+}
+
+// Collapse arbitrary text to a single line safe for one tmux send-keys literal.
+export function oneLine(text) {
+  return String(text || "").replace(/\s+/g, " ").trim();
+}
+
+// The exact line a dispatch types. Pure, and shared by the #control path and
+// the supervisor CLI so the clause/prefix can never drift between them.
+export function dispatchLine(builtin, goalText, clauseText) {
+  let line = builtin === "resume" ? "/goal resume" : `/goal ${oneLine(goalText)}`;
+  if (builtin !== "resume" && oneLine(clauseText)) line += ` ${oneLine(clauseText)}`;
+  return line.length > GOAL_LINE_MAX ? line.slice(0, GOAL_LINE_MAX) : line;
+}
+
+// CLI parsing for `--dispatch` (the goal supervisor's path; needs no Slack).
+// Returns {builtin, worker, text, dryRun, operator, workersFile} or {error}.
+export function parseDispatchArgs(argv) {
+  const out = {
+    builtin: null,
+    worker: null,
+    text: "",
+    dryRun: false,
+    operator: "supervisor",
+    workersFile: null,
+    error: null,
+  };
+  const rest = [];
+  for (let i = 0; i < argv.length; i += 1) {
+    const arg = String(argv[i]);
+    if (arg === "--dry-run") {
+      out.dryRun = true;
+    } else if (arg === "--operator") {
+      out.operator = String(argv[i + 1] || "").trim() || "supervisor";
+      i += 1;
+    } else if (arg === "--workers-file") {
+      out.workersFile = String(argv[i + 1] || "").trim() || null;
+      i += 1;
+    } else {
+      rest.push(arg);
+    }
+  }
+  const builtin = String(rest[0] || "").toLowerCase();
+  if (builtin !== "goal" && builtin !== "resume") {
+    out.error = "usage: --dispatch goal|resume <worker> [goal text] [--dry-run]";
+    return out;
+  }
+  out.builtin = builtin;
+  out.worker = String(rest[1] || "").toLowerCase() || null;
+  out.text = rest.slice(2).join(" ").trim();
+  if (!out.worker) {
+    out.error = `usage: --dispatch ${builtin} <worker>${builtin === "goal" ? " <goal text>" : ""}`;
+  } else if (builtin === "goal" && !out.text) {
+    out.error = "usage: --dispatch goal <worker> <goal text>";
+  }
+  return out;
 }
 
 export function chunkText(text, limit = REPLY_CHUNK) {
@@ -347,30 +655,68 @@ export function pruneThreads(state, now) {
     if (recent.length) state.threads[key] = recent;
     else delete state.threads[key];
   }
+  const today = dayKey(now);
+  for (const [key, entry] of Object.entries(state.threadDays)) {
+    if (!entry || entry.date !== today) delete state.threadDays[key];
+  }
+}
+
+// A responder's follow-up post inside DEBATE_MERGE_SEC of its previous one in
+// the same thread is one logical message (chunked replies) — merging it stops
+// a 3-chunk post from buying 3 turns. Recording slides the window forward.
+export function debateMerged(merge, where, identity, now) {
+  const last = Number(merge[`${where.channel}:${where.rootTs}:${identity}`]);
+  return Number.isFinite(last) && last <= now && now - last < DEBATE_MERGE_SEC;
+}
+
+export function debateMergeRecord(merge, where, identity, now) {
+  merge[`${where.channel}:${where.rootTs}:${identity}`] = now;
+  for (const [key, at] of Object.entries(merge)) {
+    if (!Number.isFinite(at) || at > now || now - at > 3600) delete merge[key];
+  }
 }
 
 export function budgetCheck(state, where, now, cfg) {
-  if (state.daily.date === dayKey(now) && state.daily.runs >= cfg.maxRunsPerDay) {
+  const day = dayKey(now);
+  if (state.daily.date === day && state.daily.runs >= cfg.maxRunsPerDay) {
     return { ok: false, reason: "daily_cap" };
+  }
+  // Debate runs count against the global daily too (above), so lobby turns
+  // beyond this cap cannot eat #control's share of the budget.
+  if (where.debate && state.daily.date === day && state.daily.debate >= cfg.debateMaxRunsPerDay) {
+    return { ok: false, reason: "debate_day_cap" };
   }
   const key = `${where.channel}:${where.rootTs}`;
   const recent = (state.threads[key] || []).filter(
     (t) => Number.isFinite(t) && withinWindow(t, now, 3600),
   );
-  if (recent.length >= THREAD_RUNS_PER_HOUR) return { ok: false, reason: "thread_cap" };
+  if (recent.length >= cfg.threadRunsPerHour) return { ok: false, reason: "thread_cap" };
+  // The non-renewing per-thread day cap is a debate-model backstop only:
+  // with SLACK_DEBATE=0 the budget must behave exactly as before (hourly
+  // per-thread window + global daily cap).
+  const threadDay = state.threadDays[key];
+  if (where.debate && threadDay && threadDay.date === day && threadDay.turns >= cfg.threadTurnsPerDay) {
+    return { ok: false, reason: "thread_day_cap" };
+  }
   return { ok: true };
 }
 
 export function budgetRecord(state, where, now) {
   const day = dayKey(now);
-  if (state.daily.date !== day) state.daily = { date: day, runs: 0 };
+  if (state.daily.date !== day) state.daily = { date: day, runs: 0, debate: 0 };
   state.daily.runs += 1;
+  if (where.debate) state.daily.debate += 1;
   const key = `${where.channel}:${where.rootTs}`;
   const recent = (state.threads[key] || []).filter(
     (t) => Number.isFinite(t) && withinWindow(t, now, 3600),
   );
   recent.push(now);
   state.threads[key] = recent;
+  if (where.debate) {
+    const threadDay = state.threadDays[key];
+    if (threadDay && threadDay.date === day) threadDay.turns += 1;
+    else state.threadDays[key] = { date: day, turns: 1 };
+  }
   pruneThreads(state, now);
 }
 
@@ -394,7 +740,14 @@ export function rateRecord(state, userId, now) {
 }
 
 function defaultState() {
-  return { daily: { date: "", runs: 0 }, threads: {}, rate: {}, seen: {} };
+  return {
+    daily: { date: "", runs: 0, debate: 0 },
+    threads: {},
+    threadDays: {},
+    merge: {},
+    rate: {},
+    seen: {},
+  };
 }
 
 // Only finite numbers / string timestamps survive a hand-edited or older
@@ -419,6 +772,7 @@ function loadState() {
         state.daily = {
           date: String(parsed.daily.date || ""),
           runs: Math.max(0, Math.floor(numberOr(parsed.daily.runs, 0))),
+          debate: Math.max(0, Math.floor(numberOr(parsed.daily.debate, 0))),
         };
       }
       const timestampList = (value) =>
@@ -427,6 +781,18 @@ function loadState() {
       for (const [key, value] of Object.entries(threads)) {
         state.threads[key] = timestampList(value);
       }
+      if (parsed.threadDays && typeof parsed.threadDays === "object" && !Array.isArray(parsed.threadDays)) {
+        for (const [key, value] of Object.entries(parsed.threadDays)) {
+          if (typeof key !== "string" || !key) continue;
+          if (!value || typeof value !== "object" || Array.isArray(value)) continue;
+          state.threadDays[key] = {
+            date: String(value.date || ""),
+            turns: Math.max(0, Math.floor(numberOr(value.turns, 0))),
+          };
+        }
+      }
+      const merge = numberMap(parsed.merge, isTimestamp);
+      for (const [key, value] of Object.entries(merge)) state.merge[key] = Number(value);
       const rate = numberMap(parsed.rate, Array.isArray);
       for (const [key, value] of Object.entries(rate)) {
         state.rate[key] = timestampList(value);
@@ -469,20 +835,30 @@ function markSeen(state, msg) {
 }
 
 // ---------------------------------------------------------------------------
-// executor (qodercli, Efficient model) — read-only by construction
+// executor (qodercli, Efficient model) — full working surface, deny-list floor
 //
-// Verified against qodercli 1.1.47 on the box: writes always require
-// confirmation and are denied headless; compound commands (`;`, `&&`, `|`)
-// are split into segments and each is checked — a denied or write segment
-// denies the whole command; substitution-bearing commands (`$(...)`,
-// `${...}`) were denied in every probe, including inside otherwise-runnable
-// commands (structural check vs. no-rule-match is not isolated). `cwd: "/"`
-// puts every read inside the workspace root so the
-// read/Glob deny list applies to box paths. Flag-level PreToolUse
-// hooks are NOT executed by qodercli (probed: a logging hook never ran),
-// so the executable boundary is the permission engine + the narrow
-// allowlist in slack-executor-settings.json (plus the engine's internal
-// read-only safe list, e.g. wc/ls), not the guard hook.
+// Posture changed 2026-09-16 (user decision, RUNBOOK 7.10): the executor is no
+// longer a read-only reporter. The profile allows Read/Glob/Grep, the write
+// tools, the web tools, subagents, and the whole shell through a bare `Bash`;
+// the deny list in slack-executor-settings.json carries the destructive floor
+// (rm/dd/mkfs/shutdown, force-push, history rewrites, publishes) and the secret
+// file gates. Honest limit, same class as the guard hooks: deny rules are
+// prefix-matched and qodercli 1.1.47 runs no PreToolUse hooks from --settings
+// (probed: a logging hook never ran), so a deny entry catches `rm -rf x` but
+// not `cd x && rm -rf .` — it stops accidents and the direct form of an
+// injected instruction, not indirection. The engine's own splitting rules
+// (compound commands checked per segment, substitution-bearing commands denied)
+// were probed 2026-09-12 and still apply. `cwd: "/"` is retained so relative
+// paths land inside the box workspace, not inside the bridge's cwd.
+//
+// Second #lobby voice (SLACK_DEBATE=1): the antigravity CLI (agy) in
+// headless print mode. agy has no per-invocation settings/system-prompt
+// flag, so BOX_FACTS_AGY and the persona are folded into the single -p
+// string and the read-only posture rides on its fixed settings file
+// (~/.gemini/antigravity-cli/settings.json, installed from the repo
+// example; permission semantics are NOT contractual — the on-box probes in
+// RUNBOOK 7.10 are the deploy gate). --dangerously-skip-permissions is
+// banned for this path exactly as --yolo is for qodercli.
 // ---------------------------------------------------------------------------
 
 export function buildExecutorArgs({ prompt, systemPrompt, settingsPath, model }) {
@@ -498,8 +874,14 @@ export function buildExecutorArgs({ prompt, systemPrompt, settingsPath, model })
     "",
     "--settings",
     settingsPath,
+    // acceptEdits, not default: measured on the box 2026-09-16, `default` keeps
+    // the engine's headless write gate shut, so the Write/Edit tools refuse even
+    // when the profile allows them (probe: Write -> DENIED). With acceptEdits
+    // the same probe returns DONE. It is not `--dangerously-skip-permissions`
+    // (still banned, asserted in the tests) — the allow/deny lists still govern
+    // every tool call, and the destructive floor still refuses `rm`.
     "--permission-mode",
-    "default",
+    "acceptEdits",
     "--model",
     model,
   ];
@@ -548,7 +930,46 @@ export function parseExecutorResult(stdout, code) {
   return { ok: false, error: `exit_${code}_no_result` };
 }
 
-function runExecutor({ prompt, systemPrompt, cfg }) {
+export function buildAgyArgs({ prompt }) {
+  return ["-p", prompt, "--output-format", "json", "--print-timeout", AGY_PRINT_TIMEOUT];
+}
+
+// agy's envelope (verified against current docs; re-probe on upgrade):
+// {conversation_id, status, response, error, duration_seconds, num_turns,
+// usage}. Log lines may precede it on stdout — scan reversed lines and
+// accept only an object carrying a string `status`.
+export function parseAgyResult(stdout, code) {
+  const lines = String(stdout || "").split("\n").reverse();
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    let payload;
+    try {
+      payload = JSON.parse(trimmed);
+    } catch {
+      continue;
+    }
+    if (!payload || typeof payload !== "object" || Array.isArray(payload)) continue;
+    if (typeof payload.status !== "string") continue;
+    if (payload.status !== "SUCCESS") {
+      const detail = String(payload.error || "").slice(0, 200);
+      return {
+        ok: false,
+        error: `agy_${payload.status || "unknown"}${detail ? `: ${detail}` : ""}`,
+      };
+    }
+    const text = String(payload.response || "").trim();
+    if (!text) return { ok: false, error: "empty_result" };
+    return { ok: true, text };
+  }
+  return { ok: false, error: `exit_${code}_no_result` };
+}
+
+export function buildAgyPrompt(job, threadContext) {
+  return `${BOX_FACTS_AGY}\n\n${composePrompt(job, threadContext)}`;
+}
+
+function runExecutor({ prompt, systemPrompt, cfg, speaker }) {
   return new Promise((resolve) => {
     let settled = false;
     const finish = (value) => {
@@ -557,15 +978,30 @@ function runExecutor({ prompt, systemPrompt, cfg }) {
         resolve(value);
       }
     };
-    const args = buildExecutorArgs({
-      prompt,
-      systemPrompt,
-      settingsPath: SETTINGS_PATH,
-      model: cfg.executorModel,
-    });
-    const child = spawn(cfg.executorBin, args, {
+    const agy = speaker === RESPONDER_AGY;
+    if (agy) {
+      try {
+        mkdirSync(AGY_CWD, { recursive: true });
+      } catch (err) {
+        audit({ evt: "agy_cwd_failed", error: String(err) });
+        resolve({ ok: false, error: "agy_cwd_unavailable" });
+        return;
+      }
+    }
+    const args = agy
+      ? buildAgyArgs({ prompt })
+      : buildExecutorArgs({
+          prompt,
+          systemPrompt,
+          settingsPath: SETTINGS_PATH,
+          model: cfg.executorModel,
+        });
+    const child = spawn(agy ? cfg.agyBin : cfg.executorBin, args, {
       env: childEnv(),
-      cwd: "/", // in-workspace reads: box paths filtered by the deny list
+      // qodercli: cwd "/" so box paths go through the deny list. agy: a
+      // dedicated empty scratch dir (its permissions are file-based, and
+      // the workspace-auto-allow behavior must never see box paths).
+      cwd: agy ? AGY_CWD : "/",
       stdio: ["ignore", "pipe", "pipe"],
       detached: true, // own process group: the timeout can kill tool children too
     });
@@ -595,7 +1031,7 @@ function runExecutor({ prompt, systemPrompt, cfg }) {
     });
     child.on("close", (code) => {
       clearTimeout(timer);
-      const parsed = parseExecutorResult(stdout, code);
+      const parsed = agy ? parseAgyResult(stdout, code) : parseExecutorResult(stdout, code);
       if (!parsed.ok) parsed.stderr = stderrTail;
       finish(parsed);
     });
@@ -675,7 +1111,7 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 function enqueue(job) {
   queue.push(job);
-  audit({ evt: "job_queued", kind: job.kind, channel: job.channel });
+  audit({ evt: "job_queued", kind: job.kind, channel: job.channel, speaker: job.speaker });
   void pumpQueue();
 }
 
@@ -693,8 +1129,19 @@ async function pumpQueue() {
   }
 }
 
-function systemPromptFor(kind) {
-  return `${BOX_FACTS}\n\n${PERSONAS[kind] || PERSONAS.control}`;
+function personaFor(speaker, debate) {
+  if (!debate) return PERSONAS.discussion;
+  return speaker === RESPONDER_AGY ? PERSONAS.discussionDebateAgy : PERSONAS.discussionDebateQoder;
+}
+
+function systemPromptFor(job) {
+  if (job.kind !== "discussion") {
+    return `${BOX_FACTS_QODER}\n\n${PERSONAS[job.kind] || PERSONAS.control}`;
+  }
+  const facts = job.speaker === RESPONDER_AGY ? BOX_FACTS_AGY : BOX_FACTS_QODER;
+  const parts = [facts, personaFor(job.speaker, job.debate)];
+  if (job.debate && job.continuation) parts.push(PASS_INSTRUCTION);
+  return parts.join("\n\n");
 }
 
 function composePrompt(job, threadContext) {
@@ -707,7 +1154,12 @@ function composePrompt(job, threadContext) {
     parts.push("A healthcheck alert is in #alerts:", job.text);
   }
   if (threadContext) parts.push("", "Thread so far:", threadContext);
-  parts.push("", PERSONAS[job.kind] || PERSONAS.control);
+  if (job.kind === "discussion") {
+    parts.push("", personaFor(job.speaker, job.debate));
+    if (job.debate && job.continuation) parts.push("", PASS_INSTRUCTION);
+  } else {
+    parts.push("", PERSONAS[job.kind] || PERSONAS.control);
+  }
   return parts.join("\n");
 }
 
@@ -730,32 +1182,53 @@ async function fetchThreadContext(token, channel, rootTs) {
 
 async function runJob(job) {
   const { ctx } = job;
-  audit({ evt: "job_start", kind: job.kind, channel: job.channel, ts: job.ts });
+  audit({
+    evt: "job_start",
+    kind: job.kind,
+    channel: job.channel,
+    ts: job.ts,
+    speaker: job.speaker,
+  });
   const threadContext = await fetchThreadContext(ctx.cfg.botToken, job.channel, job.rootTs);
+  const agy = job.speaker === RESPONDER_AGY;
   const result = await runExecutor({
-    prompt: composePrompt(job, threadContext),
-    systemPrompt: systemPromptFor(job.kind),
+    prompt: agy ? buildAgyPrompt(job, threadContext) : composePrompt(job, threadContext),
+    systemPrompt: agy ? "" : systemPromptFor(job),
     cfg: ctx.cfg,
+    speaker: job.speaker,
   });
   if (!result.ok) {
-    audit({ evt: "job_failed", kind: job.kind, error: result.error });
+    audit({ evt: "job_failed", kind: job.kind, speaker: job.speaker, error: result.error });
+    // The second voice is best-effort (shared quota, preview API): its
+    // failures are audited, never posted — the debate just goes quiet.
+    if (agy) return;
     const tail = String(result.stderr || "").trim().slice(-300);
     const suffix = tail ? `\n\`\`\`\n${tail}\n\`\`\`` : "";
     await post(ctx, {
       agent: INFRA_IDENTITY,
       channel: job.channel,
       threadTs: job.ts,
-      text: `:warning: qoder run failed (${result.error})${suffix}`,
+      text: `:warning: ${job.speaker || RESPONDER} run failed (${result.error})${suffix}`,
+    });
+    return;
+  }
+  if (job.debate && job.continuation && isPassText(result.text)) {
+    audit({
+      evt: "debate_pass",
+      kind: job.kind,
+      speaker: job.speaker,
+      channel: job.channel,
+      ts: job.ts,
     });
     return;
   }
   await postChunks(ctx, {
-    agent: RESPONDER,
+    agent: job.speaker || RESPONDER,
     channel: job.channel,
     threadTs: job.ts,
     text: result.text,
   });
-  audit({ evt: "job_done", kind: job.kind, chars: result.text.length });
+  audit({ evt: "job_done", kind: job.kind, speaker: job.speaker, chars: result.text.length });
 }
 
 function runCommandCapture(command, args, timeoutMs) {
@@ -776,6 +1249,408 @@ async function runLocalStatus() {
   return text;
 }
 
+function loadWorkers(overridePath) {
+  const path = overridePath || (existsSync(BOX_WORKERS_FILE) ? BOX_WORKERS_FILE : REPO_WORKERS_FILE);
+  try {
+    const payload = JSON.parse(readFileSync(path, "utf8"));
+    const workers = payload && typeof payload.workers === "object" ? payload.workers : null;
+    if (!workers) return { path, error: "no workers map" };
+    return { path, workers };
+  } catch (err) {
+    return { path, error: String((err && err.message) || err) };
+  }
+}
+
+function loadClause() {
+  const path = existsSync(BOX_CLAUSE_FILE) ? BOX_CLAUSE_FILE : REPO_CLAUSE_FILE;
+  try {
+    const text = readFileSync(path, "utf8").trim();
+    if (!text) return { path, error: "empty" };
+    return { path, text };
+  } catch (err) {
+    return { path, error: String((err && err.message) || err) };
+  }
+}
+
+async function probeWorker(_workersFile, name) {
+  const snapshot = await getSnapshot(name);
+  if (snapshot && snapshot.debug && snapshot.debug.unavailable) {
+    return { ok: false, error: snapshot.reason || "state api unavailable" };
+  }
+  if (!snapshot || typeof snapshot !== "object" || !snapshot.policy) {
+    return { ok: false, error: "state api unavailable" };
+  }
+  const goal = snapshot.goal || {};
+  return {
+    ok: true,
+    payload: {
+      ...snapshot,
+      state: goal.state || snapshot.state || "UNKNOWN",
+      reason: goal.park_reason || snapshot.reason || goal.state,
+      park_reason: goal.park_reason || null,
+    },
+  };
+}
+
+async function finishClaim(claim, ok, error) {
+  if (!claim || !claim.action_id) return;
+  try {
+    await actionResult(claim.action_id, ok, error);
+  } catch {
+    // Reconcile on the daemon will mark delivery unknown.
+  }
+}
+
+async function claimDispatch(worker, builtin, snapshot) {
+  const action = dispatchAction(builtin);
+  try {
+    const { status, payload } = await claimAction({
+      worker,
+      action,
+      expected_snapshot_version: snapshot.snapshot_version,
+      idempotency_key: `${action}:${worker}:${snapshot.snapshot_version}:${randomUUID()}`,
+    });
+    if (status !== 200 || !payload || !payload.action_id) {
+      return {
+        ok: false,
+        error: (payload && (payload.detail || payload.error)) || `claim http ${status}`,
+      };
+    }
+    return { ok: true, claim: payload };
+  } catch (err) {
+    return { ok: false, error: String((err && err.message) || err) };
+  }
+}
+
+async function sendKeysToWorker(target, text) {
+  const literal = await runCommandCapture(TMUX_BIN, ["send-keys", "-l", "-t", target, text], 10_000);
+  if (!literal.ok) return { ok: false, error: literal.error };
+  // Separate Enter call: with -l the payload must never be parsed as key names.
+  await sleep(150);
+  const enter = await runCommandCapture(TMUX_BIN, ["send-keys", "-t", target, "Enter"], 10_000);
+  if (!enter.ok) return { ok: false, error: enter.error };
+  return { ok: true };
+}
+
+async function listOrcaTerminals() {
+  const result = await runCommandCapture(ORCA_BIN, ["terminal", "list", "--json"], 20_000);
+  if (!result.ok) return { ok: false, error: result.error };
+  let payload = null;
+  try {
+    payload = JSON.parse(result.stdout.trim());
+  } catch {
+    return { ok: false, error: "bad orca terminal list output" };
+  }
+  const terminals = payload && payload.result && Array.isArray(payload.result.terminals)
+    ? payload.result.terminals
+    : null;
+  if (!terminals) return { ok: false, error: "unexpected orca terminal list shape" };
+  return { ok: true, terminals };
+}
+
+async function sendToNativeTerminal(handle, text) {
+  const result = await runCommandCapture(
+    ORCA_BIN,
+    ["terminal", "send", "--terminal", handle, "--text", text, "--enter", "--json"],
+    20_000,
+  );
+  if (!result.ok) return { ok: false, error: result.error };
+  try {
+    const payload = JSON.parse(result.stdout.trim());
+    if (payload && payload.ok === false) return { ok: false, error: "orca terminal send refused" };
+  } catch {
+    // Non-JSON stdout still means the CLI ran; the exit status is the verdict.
+  }
+  return { ok: true };
+}
+
+// The same guard chain as the #control path, without Slack: `--dispatch` is the
+// goal supervisor's entry point. It runs before the config check in main(), so a
+// box with no slack.env can still dispatch (nothing in this path posts).
+async function dispatchCli(argv) {
+  const opts = parseDispatchArgs(argv);
+  if (opts.error) return { ok: false, evt: "dispatch_usage", detail: opts.error, code: 2 };
+
+  const { path: workersFile, workers, error: workersError } = loadWorkers(opts.workersFile);
+  if (!workers) {
+    return {
+      ok: false,
+      evt: "dispatch_registry_failed",
+      detail: `worker registry unreadable (${workersFile}): ${workersError}`,
+      code: 1,
+    };
+  }
+  const entry = workers[opts.worker];
+  if (!entry) {
+    const known = Object.keys(workers).sort().join(", ");
+    return { ok: false, evt: "dispatch_unknown_worker", detail: `unknown worker ${opts.worker} (known: ${known})`, code: 1 };
+  }
+
+  let injected;
+  if (opts.builtin === "goal") {
+    const clause = loadClause();
+    if (!clause.text) {
+      audit({ evt: "dispatch_clause_failed", origin: opts.operator, error: clause.error });
+      return {
+        ok: false,
+        evt: "dispatch_clause_failed",
+        detail: `protocol clause unreadable (${clause.path}): ${clause.error}`,
+        code: 1,
+      };
+    }
+    injected = dispatchLine("goal", opts.text, clause.text);
+  } else {
+    injected = dispatchLine("resume", "", "");
+  }
+
+  const probe = await probeWorker(workersFile, opts.worker);
+  if (!probe.ok) {
+    audit({ evt: "dispatch_probe_failed", builtin: opts.builtin, worker: opts.worker, origin: opts.operator, error: probe.error });
+    return {
+      ok: false,
+      evt: "dispatch_probe_failed",
+      detail: `cannot probe ${opts.worker} (${probe.error}) — refusing to type blind`,
+      code: 1,
+    };
+  }
+  const verdict = dispatchAllowed(probe.payload, dispatchAction(opts.builtin));
+  if (!verdict.ok) {
+    audit({ evt: "dispatch_refused", builtin: opts.builtin, worker: opts.worker, state: probe.payload.state, origin: opts.operator });
+    return {
+      ok: false,
+      evt: "dispatch_refused",
+      detail: verdict.detail,
+      state: probe.payload.state,
+      reason: probe.payload.reason,
+      code: 1,
+    };
+  }
+
+  if (!entry.tmux) {
+    const listed = await listOrcaTerminals();
+    if (!listed.ok) {
+      audit({ evt: "dispatch_orca_failed", worker: opts.worker, origin: opts.operator, error: listed.error });
+      return { ok: false, evt: "dispatch_orca_failed", detail: `cannot list orca terminals for ${opts.worker}: ${listed.error}`, code: 1 };
+    }
+    const pick = pickNativeTerminal(listed.terminals, entry.cwd, entry.terminal);
+    if (!pick.ok) {
+      audit({ evt: "dispatch_orca_refused", worker: opts.worker, origin: opts.operator, detail: pick.detail });
+      return { ok: false, evt: "dispatch_orca_refused", detail: pick.detail, code: 1 };
+    }
+    const base = {
+      builtin: opts.builtin,
+      worker: opts.worker,
+      terminal: pick.terminal.handle,
+      chars: injected.length,
+      state: probe.payload.state,
+      reason: probe.payload.reason,
+      origin: opts.operator,
+    };
+    if (opts.dryRun) {
+      audit({ evt: "dispatch_dry_run", ...base });
+      return { ok: true, evt: "dispatch_dry_run", ...base };
+    }
+    const claimed = await claimDispatch(opts.worker, opts.builtin, probe.payload);
+    if (!claimed.ok) {
+      audit({ evt: "dispatch_claim_failed", worker: opts.worker, origin: opts.operator, error: claimed.error });
+      return { ok: false, evt: "dispatch_claim_failed", detail: `claim refused for ${opts.worker}: ${claimed.error}`, code: 1 };
+    }
+    const sent = await sendToNativeTerminal(pick.terminal.handle, injected);
+    await finishClaim(claimed.claim, sent.ok, sent.error);
+    if (!sent.ok) {
+      audit({ evt: "dispatch_send_failed", worker: opts.worker, terminal: pick.terminal.handle, origin: opts.operator, error: sent.error });
+      return { ok: false, evt: "dispatch_send_failed", detail: `orca terminal send failed for ${pick.terminal.handle}: ${sent.error}`, code: 1 };
+    }
+    audit({ evt: "dispatch_sent", ...base, action_id: claimed.claim.action_id });
+    return { ok: true, evt: "dispatch_sent", ...base, line: injected.slice(0, 200) };
+  }
+
+  const target = paneTarget(entry.tmux);
+  const pane = await runCommandCapture(
+    TMUX_BIN,
+    ["display-message", "-p", "-t", target, "#{pane_current_command}\t#{pane_current_path}"],
+    10_000,
+  );
+  if (!pane.ok) {
+    audit({ evt: "dispatch_pane_failed", worker: opts.worker, origin: opts.operator, error: pane.error });
+    return { ok: false, evt: "dispatch_pane_failed", detail: `cannot read tmux pane ${entry.tmux}: ${pane.error}`, code: 1 };
+  }
+  const [paneCommand, panePath] = pane.stdout.trim().split("\t");
+  const refusal = paneRefusal(paneCommand, panePath, entry.cwd);
+  if (refusal) {
+    audit({ evt: "dispatch_pane_refused", builtin: opts.builtin, worker: opts.worker, pane: paneCommand, origin: opts.operator });
+    return { ok: false, evt: "dispatch_pane_refused", detail: refusal, pane: paneCommand, code: 1 };
+  }
+
+  const base = {
+    builtin: opts.builtin,
+    worker: opts.worker,
+    tmux: entry.tmux,
+    pane: paneCommand,
+    chars: injected.length,
+    state: probe.payload.state,
+    reason: probe.payload.reason,
+    origin: opts.operator,
+  };
+  if (opts.dryRun) {
+    audit({ evt: "dispatch_dry_run", ...base });
+    return { ok: true, evt: "dispatch_dry_run", ...base };
+  }
+  const claimed = await claimDispatch(opts.worker, opts.builtin, probe.payload);
+  if (!claimed.ok) {
+    audit({ evt: "dispatch_claim_failed", worker: opts.worker, origin: opts.operator, error: claimed.error });
+    return { ok: false, evt: "dispatch_claim_failed", detail: `claim refused for ${opts.worker}: ${claimed.error}`, code: 1 };
+  }
+  const sent = await sendKeysToWorker(target, injected);
+  await finishClaim(claimed.claim, sent.ok, sent.error);
+  if (!sent.ok) {
+    audit({ evt: "dispatch_send_failed", worker: opts.worker, tmux: entry.tmux, origin: opts.operator, error: sent.error });
+    return { ok: false, evt: "dispatch_send_failed", detail: `tmux send-keys failed for ${entry.tmux}: ${sent.error}`, code: 1 };
+  }
+  audit({ evt: "dispatch_sent", ...base, action_id: claimed.claim.action_id });
+  return { ok: true, evt: "dispatch_sent", ...base, line: injected.slice(0, 200) };
+}
+
+async function handleDispatch(msg, ctx, builtin, workerName, goalText) {
+  const reply = (text) =>
+    post(ctx, { agent: INFRA_IDENTITY, channel: msg.channel, threadTs: msg.ts, text });
+
+  if (!workerName || (builtin === "goal" && !goalText)) {
+    const usage =
+      builtin === "goal"
+        ? "usage: `goal <worker> <goal text>` — types /goal into the worker's session"
+        : "usage: `resume <worker>` — types /goal resume into the worker's session";
+    await reply(`:warning: ${usage}`);
+    return;
+  }
+
+  const { path: workersFile, workers, error: workersError } = loadWorkers();
+  if (!workers) {
+    audit({ evt: "dispatch_registry_failed", error: workersError });
+    await reply(`:warning: worker registry unreadable (${workersFile}): ${workersError}`);
+    return;
+  }
+  const entry = workers[workerName];
+  if (!entry) {
+    await reply(`:warning: unknown worker \`${workerName}\` (known: ${Object.keys(workers).sort().join(", ")})`);
+    return;
+  }
+
+  let injected;
+  if (builtin === "goal") {
+    const clause = loadClause();
+    if (!clause.text) {
+      audit({ evt: "dispatch_clause_failed", error: clause.error });
+      await reply(`:warning: protocol clause unreadable (${clause.path}) — refusing to dispatch without it`);
+      return;
+    }
+    injected = dispatchLine("goal", goalText, clause.text);
+  } else {
+    injected = dispatchLine("resume", "", "");
+  }
+
+  const probe = await probeWorker(workersFile, workerName);
+  if (!probe.ok) {
+    audit({ evt: "dispatch_probe_failed", worker: workerName, error: probe.error });
+    await reply(`:warning: cannot probe \`${workerName}\` (${probe.error}) — refusing to type blind`);
+    return;
+  }
+  const verdict = dispatchAllowed(probe.payload, dispatchAction(builtin));
+  if (!verdict.ok) {
+    audit({ evt: "dispatch_refused", builtin, worker: workerName, state: probe.payload.state });
+    await reply(`:no_entry: ${builtin} refused: ${verdict.detail}`);
+    return;
+  }
+
+  const was = `${probe.payload.state}${probe.payload.reason ? `/${probe.payload.reason}` : ""}`;
+  const preview = injected.length > 140 ? `${injected.slice(0, 140)}…` : injected;
+
+  if (!entry.tmux) {
+    const listed = await listOrcaTerminals();
+    if (!listed.ok) {
+      audit({ evt: "dispatch_orca_failed", worker: workerName, error: listed.error });
+      await reply(`:warning: cannot list orca terminals for \`${workerName}\`: ${listed.error}`);
+      return;
+    }
+    const pick = pickNativeTerminal(listed.terminals, entry.cwd, entry.terminal);
+    if (!pick.ok) {
+      audit({ evt: "dispatch_orca_refused", worker: workerName, detail: pick.detail });
+      await reply(`:no_entry: ${builtin} refused: ${pick.detail}`);
+      return;
+    }
+    const claimed = await claimDispatch(workerName, builtin, probe.payload);
+    if (!claimed.ok) {
+      audit({ evt: "dispatch_claim_failed", worker: workerName, error: claimed.error });
+      await reply(`:no_entry: ${builtin} refused: claim failed (${claimed.error})`);
+      return;
+    }
+    const sent = await sendToNativeTerminal(pick.terminal.handle, injected);
+    await finishClaim(claimed.claim, sent.ok, sent.error);
+    if (!sent.ok) {
+      audit({ evt: "dispatch_send_failed", worker: workerName, terminal: pick.terminal.handle, error: sent.error });
+      await reply(`:warning: orca terminal send failed for \`${workerName}\`: ${sent.error}`);
+      return;
+    }
+    audit({
+      evt: "dispatch_sent",
+      builtin,
+      worker: workerName,
+      terminal: pick.terminal.handle,
+      user: msg.user,
+      chars: injected.length,
+      state: probe.payload.state,
+      reason: probe.payload.reason,
+    });
+    await reply(`:rocket: ${builtin} sent to \`${workerName}\` (orca terminal ${pick.terminal.handle}, was ${was}): ${preview}`);
+    return;
+  }
+
+  const target = paneTarget(entry.tmux);
+  const pane = await runCommandCapture(
+    TMUX_BIN,
+    ["display-message", "-p", "-t", target, "#{pane_current_command}\t#{pane_current_path}"],
+    10_000,
+  );
+  if (!pane.ok) {
+    audit({ evt: "dispatch_pane_failed", worker: workerName, error: pane.error });
+    await reply(`:warning: cannot read tmux pane \`${entry.tmux}\`: ${pane.error}`);
+    return;
+  }
+  const [paneCommand, panePath] = pane.stdout.trim().split("\t");
+  const refusal = paneRefusal(paneCommand, panePath, entry.cwd);
+  if (refusal) {
+    audit({ evt: "dispatch_pane_refused", builtin, worker: workerName, pane: paneCommand });
+    await reply(`:no_entry: ${builtin} refused: ${refusal}`);
+    return;
+  }
+
+  const claimed = await claimDispatch(workerName, builtin, probe.payload);
+  if (!claimed.ok) {
+    audit({ evt: "dispatch_claim_failed", worker: workerName, error: claimed.error });
+    await reply(`:no_entry: ${builtin} refused: claim failed (${claimed.error})`);
+    return;
+  }
+  const sent = await sendKeysToWorker(target, injected);
+  await finishClaim(claimed.claim, sent.ok, sent.error);
+  if (!sent.ok) {
+    audit({ evt: "dispatch_send_failed", worker: workerName, tmux: entry.tmux, error: sent.error });
+    await reply(`:warning: tmux send-keys failed for \`${entry.tmux}\`: ${sent.error}`);
+    return;
+  }
+  audit({
+    evt: "dispatch_sent",
+    builtin,
+    worker: workerName,
+    tmux: entry.tmux,
+    pane: paneCommand,
+    user: msg.user,
+    chars: injected.length,
+    state: probe.payload.state,
+    reason: probe.payload.reason,
+  });
+  await reply(`:rocket: ${builtin} sent to \`${workerName}\` (tmux ${entry.tmux}, was ${was}): ${preview}`);
+}
+
 async function handleControl(msg, decision, ctx) {
   const now = nowSec();
   const rate = rateCheck(ctx.state, msg.user, now);
@@ -791,7 +1666,7 @@ async function handleControl(msg, decision, ctx) {
   }
   rateRecord(ctx.state, msg.user, now);
 
-  const { builtin, prompt } = classifyCommand(decision.command);
+  const { builtin, worker, prompt } = controlDispatchArgs(decision);
   if (builtin === "ping") {
     await post(ctx, {
       agent: INFRA_IDENTITY,
@@ -819,6 +1694,10 @@ async function handleControl(msg, decision, ctx) {
     });
     return;
   }
+  if (builtin === "goal" || builtin === "resume") {
+    await handleDispatch(msg, ctx, builtin, worker, prompt);
+    return;
+  }
 
   const budget = budgetCheck(ctx.state, { channel: msg.channel, rootTs: msg.ts }, now, ctx.cfg);
   if (!budget.ok) {
@@ -836,7 +1715,7 @@ async function handleControl(msg, decision, ctx) {
     agent: INFRA_IDENTITY,
     channel: msg.channel,
     threadTs: msg.ts,
-    text: ":hourglass_flowing_sand: on it — qoder is running (read-only)",
+    text: ":hourglass_flowing_sand: on it — qoder is running",
   });
   enqueue({
     kind: "control",
@@ -845,6 +1724,9 @@ async function handleControl(msg, decision, ctx) {
     rootTs: msg.ts,
     text: prompt,
     identity: msg.user,
+    speaker: RESPONDER,
+    debate: false,
+    continuation: false,
     ctx,
   });
 }
@@ -852,23 +1734,44 @@ async function handleControl(msg, decision, ctx) {
 async function handleDiscussion(msg, decision, ctx) {
   const now = nowSec();
   const rootTs = msg.threadTs || msg.ts;
-  const budget = budgetCheck(ctx.state, { channel: msg.channel, rootTs }, now, ctx.cfg);
-  if (!budget.ok) {
-    audit({ evt: "budget_blocked", kind: "discussion", reason: budget.reason });
-    await post(ctx, {
-      agent: INFRA_IDENTITY,
-      channel: msg.channel,
-      threadTs: msg.ts,
-      text: `:no_entry: run limit: ${budget.reason}`,
-    });
+  const speaker = decision.speaker || RESPONDER;
+  const where = { channel: msg.channel, rootTs, debate: Boolean(ctx.cfg.debate) };
+  if (decision.continuation) {
+    // Chunked responder posts must not buy a turn per chunk (merge window).
+    if (debateMerged(ctx.state.merge, where, decision.identity, now)) {
+      debateMergeRecord(ctx.state.merge, where, decision.identity, now);
+      audit({ evt: "debate_merged", channel: msg.channel, ts: msg.ts, author: decision.identity });
+      return;
+    }
+    debateMergeRecord(ctx.state.merge, where, decision.identity, now);
+  }
+  if (!speakerReady(speaker, ctx.cfg)) {
+    // agy missing/unconfigured: skip quietly (audit only) — qoder turns
+    // never reach this branch because speakerReady(qoder) is always true.
+    audit({ evt: "debate_skip", speaker, reason: "agy_unavailable", channel: msg.channel, ts: msg.ts });
     return;
   }
-  budgetRecord(ctx.state, { channel: msg.channel, rootTs }, now);
+  const budget = budgetCheck(ctx.state, where, now, ctx.cfg);
+  if (!budget.ok) {
+    audit({ evt: "budget_blocked", kind: "discussion", speaker, reason: budget.reason });
+    // A continuation that hits a cap just ends the exchange silently; only a
+    // fresh (human/third-party) trigger gets the visible refusal.
+    if (!decision.continuation) {
+      await post(ctx, {
+        agent: INFRA_IDENTITY,
+        channel: msg.channel,
+        threadTs: msg.ts,
+        text: `:no_entry: run limit: ${budget.reason}`,
+      });
+    }
+    return;
+  }
+  budgetRecord(ctx.state, where, now);
   await post(ctx, {
     agent: INFRA_IDENTITY,
     channel: msg.channel,
     threadTs: msg.ts,
-    text: ":hourglass_flowing_sand: qoder is reading the thread",
+    text: `:hourglass_flowing_sand: ${speaker} is reading the thread`,
   });
   enqueue({
     kind: "discussion",
@@ -877,6 +1780,9 @@ async function handleDiscussion(msg, decision, ctx) {
     rootTs,
     text: decision.prompt,
     identity: decision.identity,
+    speaker,
+    debate: where.debate,
+    continuation: Boolean(decision.continuation),
     ctx,
   });
 }
@@ -902,6 +1808,9 @@ async function handleTriage(msg, decision, ctx) {
     rootTs: msg.ts,
     text: msg.text,
     identity: decision.identity,
+    speaker: RESPONDER,
+    debate: false,
+    continuation: false,
     ctx,
   });
 }
@@ -1038,6 +1947,18 @@ function readTextFile(path) {
 // ---------------------------------------------------------------------------
 
 async function main() {
+  // The goal supervisor's path: guarded dispatch with no Slack config required
+  // (it never posts). Handled first so a box without slack.env can still drive
+  // a worker, and so it can never fall into the socket loop.
+  const argv = process.argv.slice(2);
+  const dispatchAt = argv.indexOf("--dispatch");
+  if (dispatchAt > -1) {
+    const result = await dispatchCli(argv.slice(dispatchAt + 1));
+    console.log(JSON.stringify(result));
+    process.exitCode = result.ok ? 0 : Math.max(1, Number(result.code) || 1);
+    return;
+  }
+
   const flagIndex = process.argv.indexOf("--env-file");
   const envFile = flagIndex > -1 ? process.argv[flagIndex + 1] : DEFAULT_ENV_FILE;
 
@@ -1053,7 +1974,7 @@ async function main() {
   const ctx = { cfg: null, agents, botUserId: "", botId: "", envFile, state };
   const cfg0 = loadConfig(readTextFile(envFile));
   console.log(
-    `slack-bridge: starting (${Object.keys(agents).length} agents, triage=${cfg0.triage ? "on" : "off"})`,
+    `slack-bridge: starting (${Object.keys(agents).length} agents, triage=${cfg0.triage ? "on" : "off"}, debate=${cfg0.debate ? "on" : "off"})`,
   );
   const me = await slackCall(cfg0.botToken, "auth.test", {});
   if (!me.ok) {
