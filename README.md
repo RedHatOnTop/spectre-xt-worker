@@ -26,13 +26,56 @@ The script formats the unused 128 GB SATA disk as 8 GB swap + `/work`,
 installs XFCE, ignores the lid, blanks the panel, and puts `warp` on
 `$PATH`.
 
-**3. After reboot:**
+**3. After reboot — one wizard to full operation:**
+
+```bash
+sudo bash /opt/spectre-xt-worker/scripts/setup-wizard.sh
+```
+
+The wizard walks every stage in order and skips what is already done,
+so it is safe to re-run after a failed stage: bootstrap (if not done via
+the one-click), tailscale login, key pull from fedora, ufw + key-only
+SSH hardening, cockpit bind, proxy pull from fedora + unit enable,
+ntfy health env + timer, ZCode pin, the stealth/lid looks-off check,
+and a final `spectre-doctor` pass. It prints exactly what to do at each
+interactive step (login URL, env.json hand-copy, lid-close check).
+
+Prefer manual steps? The same order works one command at a time:
 
 ```bash
 sudo tailscale up --ssh --hostname=spectre
+sudo spectre-pull-keys fedora
+sudo bash scripts/harden-network.sh   # ufw + key-only ssh (needs keys first)
 sudo spectre-bind-cockpit
-spectre-pull-keys fedora
+# copy hardened-zai-proxy into /work/hardened-zai-proxy (no node_modules)
+#   + env.json by hand, then:
+systemctl --user enable --now glm-proxy.service
+cp config/health.env.example ~/.config/remote-agent/health.env  # fill NTFY_TOPIC
+# start ZCode once, add the Hardened provider, then:
+spectre-pin-zcode
+sudo spectre-stealth closed && close the lid
 ```
+
+**4. Verify in one pass:** `sudo spectre-doctor` — runs every gate from
+RUNBOOK.md and fails loudly on any miss. `spectre-status` (or
+`spectre-status --json`) shows the same facts on one screen.
+
+Every agent on the box can browse: obscura (headless browser, no
+Chromium) gives them a CLI, an MCP server and a CDP endpoint on
+`127.0.0.1:9222` for Playwright/Puppeteer scripts — RUNBOOK §7.12.
+
+Agents also get `devcodex` — durable task sessions, bounded code
+navigation, workspace-scoped writes and commands, and evidence-backed
+completion, runnable from any repo — RUNBOOK §7.13.
+
+Worker occupancy is being centralized in `spectre-state` (UDS JSON API +
+SQLite journal, RUNBOOK §7.17). The daemon is **shadow-only**: Slack
+`/goal` still uses `qoder-goal-watch --probe`. Do not treat the new
+snapshot as live dispatch authority until cutover.
+
+A Codex CLI session can be handed to the other machine and picked up there:
+`codex-handoff push` from the project directory, then `codex resume <uuid>`
+where it landed (`pull` brings one back) — RUNBOOK §7.15.
 
 Phone control that still works when Z.ai is down: Tailscale on the
 Fold 7 → Termius → `tmux attach -t work`. Cockpit at
@@ -51,14 +94,13 @@ bash spectre-xt-worker/scripts/install-warp.sh
 Same absolute path on both machines. From the project you are in:
 
 ```bash
-warp to spectre      # Zenbook → Spectre
-warp from spectre    # Spectre → Zenbook
-warp to fedora       # Spectre → Zenbook
-warp from fedora     # Zenbook → Spectre
+warp push     # this machine -> the other one
+warp pull     # the other one -> this machine
 ```
 
-Sends the tree (minus `target/`, `node_modules/`, …) and the ZCode
-sessions for that directory. Close ZCode on the machine that is
-**receiving** before the session import.
+No peer names, no direction juggling: each box knows the other. Repo
+files and ZCode sessions for that directory move together; if ZCode is
+still open on the receiving side, the session import waits in the
+background for it to quit (10 min) and applies itself.
 
 Full ops: [RUNBOOK.md](RUNBOOK.md).
