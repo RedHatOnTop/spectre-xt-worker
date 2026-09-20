@@ -10,13 +10,45 @@ from pathlib import Path
 from time import time
 from typing import Any
 
-from . import process, qoder_jsonl
+from . import dsh_jsonl, process, qoder_jsonl
 from .http_api import MAX_BODY, handle
 from .shadow import compare, load_old_classifier
 from .store import Store
 from .types import iso_from
 
 _POLL_LOG = Path("/work/logs/worker-state.log")
+_FLASH_SEEN_ALIVE: dict[str, bool] = {}
+_FLASH_DIED_AT: dict[str, float] = {}
+_PACKETS = Path.home() / ".local/state/remote-agent/packets"
+
+
+def _ingest_dsh_exit(store: Store, name: str, now: float) -> None:
+    snap = store.snapshot(name, now, rebuild=True)
+    execution = snap.get("execution") or {}
+    goal = snap.get("goal") or {}
+    dispatch_id = str(goal.get("dispatch_id") or "")
+    if not dispatch_id or str(execution.get("target") or "") != "flash":
+        return
+    alive = bool(execution.get("process_alive"))
+    if alive:
+        _FLASH_SEEN_ALIVE[name] = True
+        _FLASH_DIED_AT.pop(name, None)
+        return
+    if not _FLASH_SEEN_ALIVE.get(name):
+        return
+    died_at = _FLASH_DIED_AT.get(name)
+    if died_at is None:
+        _FLASH_DIED_AT[name] = now
+        died_at = now
+    path = _PACKETS / f"{dispatch_id}.exit"
+    code = dsh_jsonl.parse_exit_file(path)
+    if code is None and now - died_at < 30:
+        return
+    if code is None:
+        code = 1
+    store.ingest(dsh_jsonl.dsh_exit_event(name, dispatch_id, code, snap, now), now)
+    _FLASH_SEEN_ALIVE.pop(name, None)
+    _FLASH_DIED_AT.pop(name, None)
 
 
 def _poll_log(text: str) -> None:
@@ -110,10 +142,24 @@ def ingest_workers(
     old = load_old_classifier() if shadow else None
     results: dict[str, Any] = {}
     for name, entry in workers.items():
-        for event in qoder_jsonl.collect_worker_evidence(name, entry, sessions_root):
-            store.ingest(event, now)
+        prior = store.snapshot(name, now, rebuild=True)
+        target = str((prior.get("execution") or {}).get("target") or "efficient")
+        cwd = str(entry.get("cwd") or "")
         for event in process.evidence_for_worker(name, entry, now):
             store.ingest(event, now)
+        if target == "flash":
+            injected = (prior.get("goal") or {}).get("injected_at")
+            inj_ts = None
+            if isinstance(injected, (int, float)):
+                inj_ts = float(injected)
+            for event in dsh_jsonl.collect_dsh_evidence(
+                name, cwd, now, injected_at=inj_ts
+            ):
+                store.ingest(event, now)
+            _ingest_dsh_exit(store, name, now)
+        else:
+            for event in qoder_jsonl.collect_worker_evidence(name, entry, sessions_root):
+                store.ingest(event, now)
         try:
             store.reconcile(name, now)
         except Exception:

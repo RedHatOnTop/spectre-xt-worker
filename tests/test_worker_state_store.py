@@ -26,6 +26,128 @@ class StoreTest(unittest.TestCase):
         self.store.close()
         self.tmp.cleanup()
 
+    def test_get_unseen_worker_is_idle_without_rebuild(self):
+        snap = self.store.snapshot("pugc", NOW, rebuild=False)
+        self.assertEqual(snap["goal"]["state"], "IDLE")
+        self.assertTrue(snap["policy"]["can_dispatch_goal"])
+
+    def test_get_does_not_begin_immediate(self):
+        self.store.snapshot("pugc", NOW, rebuild=True)
+        rebuilds: list[str] = []
+        orig = self.store._rebuild_locked
+
+        def wrapped(worker, now):
+            rebuilds.append(worker)
+            return orig(worker, now)
+
+        self.store._rebuild_locked = wrapped  # type: ignore[method-assign]
+        try:
+            later = self.store.snapshot("pugc", NOW + 10, rebuild=False)
+        finally:
+            self.store._rebuild_locked = orig  # type: ignore[method-assign]
+        self.assertEqual(rebuilds, [])
+        self.assertEqual(later["goal"]["state"], "IDLE")
+
+    def test_cached_get_applies_unconfirmed_timeout_without_ingest(self):
+        self.store.ingest(
+            {
+                "event_id": "inj",
+                "worker": "pugc",
+                "kind": "terminal_write.succeeded",
+                "source": "api",
+                "goal_id": "g-1",
+                "dispatch_id": "d-1",
+                "attempt_id": 1,
+                "payload": {"action": "dispatch_goal", "target": "efficient"},
+                "source_timestamp": iso_from(NOW),
+            },
+            NOW,
+        )
+        later = self.store.snapshot("pugc", NOW + 241, rebuild=False)
+        self.assertEqual(later["goal"]["state"], "FAILED")
+        self.assertTrue(later["policy"]["can_dispatch_goal"])
+
+    def test_flash_stalled_blocks_continuity_resume(self):
+        self.store.ingest(
+            {
+                "event_id": "inj",
+                "worker": "minecraft",
+                "kind": "terminal_write.succeeded",
+                "source": "api",
+                "goal_id": "g-m",
+                "dispatch_id": "d-m",
+                "attempt_id": 1,
+                "payload": {"action": "dispatch_goal", "target": "flash"},
+                "source_timestamp": iso_from(NOW - 10),
+            },
+            NOW - 10,
+        )
+        self.store.ingest(
+            {
+                "event_id": "run",
+                "worker": "minecraft",
+                "kind": "model.request.started",
+                "source": "dsh_jsonl",
+                "turn_id": "t1",
+                "goal_id": "g-m",
+                "source_timestamp": iso_from(NOW - 2000),
+            },
+            NOW - 2000,
+        )
+        snap = self.store.snapshot("minecraft", NOW, rebuild=True)
+        self.assertEqual(snap["execution"]["target"], "flash")
+        self.assertTrue(snap["execution"]["stalled"])
+        self.assertFalse(snap["policy"]["continuity_recovery_allowed"])
+
+    def test_claim_target_lives_on_claimed_event_not_result_json(self):
+        self.store.snapshot("pugc", NOW, rebuild=True)
+        claim = self.store.claim(
+            "pugc",
+            "dispatch_goal",
+            0,
+            "k-target",
+            NOW,
+            extra={"target": "flash"},
+        )
+        self.assertEqual(claim["state"], "claimed")
+        row = [
+            e
+            for e in self.store.events_for("pugc")
+            if e.kind == "action.claimed"
+        ][0]
+        self.assertEqual(row.payload.get("target"), "flash")
+        self.assertIsNone(claim.get("result_json"))
+
+    def test_advance_result_does_not_inject(self):
+        self.store.ingest(
+            {
+                "event_id": "done",
+                "worker": "qoder",
+                "kind": "goal.completed",
+                "source": "session_jsonl",
+                "goal_id": "g-q",
+                "turn_id": "t-q",
+                "source_timestamp": iso_from(NOW),
+            },
+            NOW,
+        )
+        snap = self.store.snapshot("qoder", NOW, rebuild=True)
+        self.assertTrue(snap["policy"]["grokbot_may_advance"])
+        claim = self.store.claim(
+            "qoder",
+            "advance",
+            snap["snapshot_version"],
+            "k-adv",
+            NOW + 1,
+        )
+        result = self.store.action_result(claim["action_id"], True, NOW + 2)
+        states = [e.kind for e in self.store.events_for("qoder")]
+        self.assertIn("advance.completed", states)
+        self.assertNotIn("terminal_write.succeeded", states)
+        after = result["snapshot"]
+        # folded snapshot; apply_now_effects may still show COMPLETED
+        self.assertNotEqual(after.get("goal", {}).get("state"), "INJECTED")
+
     def test_wal_pragmas(self):
         p = self.store.pragmas()
         self.assertEqual(p["journal_mode"], "WAL")
@@ -135,8 +257,9 @@ class StoreTest(unittest.TestCase):
         self.store.snapshot("pugc", NOW, rebuild=True)
         claim = self.store.claim("pugc", "dispatch_goal", 0, "k", NOW)
         snapshot = self.store.reconcile("pugc", NOW + 31)
-        self.assertIn(snapshot["goal"]["state"], {"INJECTED", "UNCONFIRMED"})
-        self.assertFalse(snapshot["policy"]["can_dispatch_goal"])
+        # Missing claim target fail-closes the inject (never default-efficient).
+        self.assertEqual(snapshot["goal"]["state"], "FAILED")
+        self.assertTrue(snapshot["policy"]["can_dispatch_goal"])
         row = self.store._conn.execute(
             "SELECT state, delivery_state FROM action_claims WHERE action_id = ?",
             (claim["action_id"],),

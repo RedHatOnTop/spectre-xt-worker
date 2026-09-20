@@ -117,11 +117,32 @@ def sample_tree(root_pid: int) -> dict[str, Any] | None:
     }
 
 
+def find_headless_dsh(proc_root: Path = Path("/proc")) -> int | None:
+    for ent in proc_root.iterdir():
+        if not ent.name.isdigit():
+            continue
+        try:
+            cmd = (ent / "cmdline").read_bytes().replace(b"\x00", b" ").decode("utf-8", "replace")
+        except OSError:
+            continue
+        if "--profile tui" in cmd:
+            continue
+        if "dsh" in cmd and "--profile headless" in cmd:
+            return int(ent.name)
+    return None
+
+
 def evidence_for_worker(name: str, entry: dict, now: float) -> list[dict[str, Any]]:
     tmux = entry.get("tmux")
-    if not tmux:
+    source = "tmux"
+    if tmux:
+        pid = pane_pid(str(tmux))
+    elif entry.get("terminal") or entry.get("_pid"):
+        source = "process"
+        raw = entry.get("_pid")
+        pid = int(raw) if raw else find_headless_dsh()
+    else:
         return []
-    pid = pane_pid(str(tmux))
     events: list[dict[str, Any]] = []
     if pid is None:
         tree = None
@@ -145,9 +166,9 @@ def evidence_for_worker(name: str, entry: dict, now: float) -> list[dict[str, An
             "event_id": f"transport-{name}-{kind}-{int(now)}",
             "worker": name,
             "kind": kind,
-            "source": "tmux",
+            "source": source,
             "source_timestamp": iso_from(now),
-            "payload": {"kind": "tmux"},
+            "payload": {"kind": "tmux" if tmux else "dsh"},
         }
     )
     if tree is not None:

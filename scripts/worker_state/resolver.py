@@ -32,6 +32,7 @@ def resolve(
     worker_id: str,
     *,
     completion_open: bool = False,
+    apply_time: bool = True,
 ) -> dict[str, Any]:
     goal: dict[str, Any] = {
         "goal_id": None,
@@ -52,6 +53,10 @@ def resolve(
         "wait_kind": None,
         "stalled": False,
         "stall_reason": None,
+        "target": "efficient",
+        "process_alive": False,
+        "cpu_delta": 0,
+        "last_process_at": None,
     }
     transport: dict[str, Any] = {"kind": None, "state": "UNKNOWN"}
     last: Event | None = None
@@ -60,6 +65,9 @@ def resolve(
 
     for event in events:
         if event.worker_id != worker_id:
+            continue
+        if goal["state"] == "ASSIGNING" and event.source != "api":
+            ignored += 1
             continue
         if _stale_attempt(goal, event):
             ignored += 1
@@ -93,15 +101,24 @@ def resolve(
         _apply_kind(goal, execution, event, now, reasons)
         last = event
 
-    _apply_time_effects(goal, execution, now)
+    if apply_time:
+        _apply_time_effects(goal, execution, now)
     waiting = goal["state"] == "WAITING"
     observation = _observation(execution, now)
+    idle_slo = _idle_slo(
+        goal["state"],
+        execution,
+        now,
+        completion_open=completion_open and goal["state"] == "COMPLETED",
+    )
     policy = policy_for(
         goal_state=goal["state"],
         park_reason=goal["park_reason"],
         stalled=bool(execution["stalled"]),
         waiting=waiting,
         completion_open=completion_open and goal["state"] == "COMPLETED",
+        target=str(execution.get("target") or "efficient"),
+        idle_slo=idle_slo,
     )
     reason = reasons[-1] if reasons else (
         "no evidence; worker unseen" if not events else "resolved"
@@ -119,6 +136,7 @@ def resolve(
             "attempt_id": goal["attempt_id"],
             "state": goal["state"],
             "park_reason": goal["park_reason"],
+            "injected_at": goal["injected_at"],
         },
         "transport": transport,
         "observation": {"state": observation},
@@ -127,6 +145,13 @@ def resolve(
             "current_operation": execution["current_operation"],
             "stalled": bool(execution["stalled"]),
             "stall_reason": execution["stall_reason"],
+            "target": execution.get("target") or "efficient",
+            "in_flight": execution.get("in_flight"),
+            "wait_kind": execution.get("wait_kind"),
+            "last_progress_at": execution.get("last_progress_at"),
+            "process_alive": bool(execution.get("process_alive")),
+            "cpu_delta": int(execution.get("cpu_delta") or 0),
+            "last_process_at": execution.get("last_process_at"),
         },
         "policy": policy,
         "evidence": {
@@ -236,8 +261,35 @@ def _apply_kind(
     if event.turn_id and goal["turn_id"] is None:
         goal["turn_id"] = event.turn_id
 
+    if kind == "assignment.started":
+        goal["state"] = "ASSIGNING"
+        goal["park_reason"] = None
+        reasons.append("assigning")
+        return
+    if kind == "assignment.failed":
+        goal["state"] = "COMPLETED"
+        reasons.append("assignment failed")
+        return
+    if kind == "assignment.finished":
+        goal["state"] = "COMPLETED"
+        reasons.append("assignment finished")
+        return
+    if kind == "advance.completed":
+        reasons.append("advance closed")
+        return
+    if kind == "terminal_write.failed":
+        goal["state"] = "FAILED"
+        goal["park_reason"] = str(payload.get("error") or "write_failed")
+        reasons.append("terminal write failed")
+        return
     if kind in {"terminal_write.succeeded", "goal.created", "input.goal", "input.resume"}:
+        if kind == "terminal_write.succeeded" and payload.get("action") == "advance":
+            return
         _bind_identity(goal, event)
+        if payload.get("target"):
+            execution["target"] = str(payload.get("target"))
+        elif kind != "input.resume":
+            execution["target"] = execution.get("target") or "efficient"
         goal["state"] = "INJECTED"
         goal["park_reason"] = None
         goal["injected_at"] = when
@@ -395,37 +447,96 @@ def _apply_transport(transport: dict, event: Event) -> None:
 
 
 def _apply_time_effects(goal: dict, execution: dict, now: float) -> None:
-    if goal["state"] == "INJECTED" and goal["injected_at"] is not None:
-        if now - float(goal["injected_at"]) >= UNCONFIRMED_SEC:
+    injected_at = goal.get("injected_at")
+    if goal["state"] in {"INJECTED", "UNCONFIRMED"} and injected_at is not None:
+        age = now - float(injected_at)
+        if age >= UNCONFIRMED_SEC:
+            goal["state"] = "FAILED"
+            goal["park_reason"] = "unconfirmed_timeout"
+        elif goal["state"] == "INJECTED" and age >= 120:
             goal["state"] = "UNCONFIRMED"
     execution["stalled"] = False
     execution["stall_reason"] = None
     if goal["state"] != "RUNNING":
         return
-    if execution["wait_kind"] or execution["in_flight"]:
+    if execution.get("wait_kind"):
         return
     last_proc = execution.get("last_process_at")
+    cpu = int(execution.get("cpu_delta") or 0)
     if (
         execution.get("process_alive")
-        and int(execution.get("cpu_delta") or 0) > 0
+        and cpu > 0
         and last_proc is not None
         and now - float(last_proc) < STALL_DEFAULT_SEC
     ):
         return
-    last_progress = execution["last_progress_at"]
+    in_flight = execution.get("in_flight")
+    if in_flight:
+        structured = execution.get("last_structured_at") or execution.get("last_progress_at")
+        if cpu > 0:
+            return
+        if structured is not None and now - float(structured) < STALL_DEFAULT_SEC:
+            return
+        execution["stalled"] = True
+        execution["stall_reason"] = f"wedged_tool ({in_flight})"
+        return
+    last_progress = execution.get("last_progress_at")
     if last_progress is None:
         return
     age = now - float(last_progress)
-    op = execution["current_operation"]
+    op = execution.get("current_operation")
     limit = STALL_MODEL_SEC if op == "model.request" else STALL_DEFAULT_SEC
     if age >= limit:
         execution["stalled"] = True
         execution["stall_reason"] = f"no progress for {int(age)}s ({op or 'idle-run'})"
 
 
+def _idle_slo(goal_state: str, execution: dict, now: float, *, completion_open: bool) -> bool:
+    if goal_state == "RUNNING" and execution.get("stalled"):
+        return True
+    if completion_open and goal_state == "COMPLETED":
+        last = execution.get("last_progress_at")
+        if last is not None and now - float(last) >= STALL_DEFAULT_SEC:
+            return True
+    return False
+
+
+def apply_now_effects(snapshot: dict[str, Any], now: float) -> dict[str, Any]:
+    """Recompute stall / UNCONFIRMED / policy from stored timestamps. No journal."""
+    import copy
+
+    out = copy.deepcopy(snapshot)
+    goal = dict(out.get("goal") or {})
+    execution = dict(out.get("execution") or {})
+    _apply_time_effects(goal, execution, now)
+    waiting = goal.get("state") == "WAITING"
+    idle_slo = _idle_slo(
+        str(goal.get("state") or ""),
+        execution,
+        now,
+        completion_open=bool((out.get("policy") or {}).get("grokbot_may_advance"))
+        and goal.get("state") == "COMPLETED",
+    )
+    out["goal"] = goal
+    out["execution"] = execution
+    out["observation"] = {"state": _observation(execution, now)}
+    out["policy"] = policy_for(
+        goal_state=str(goal.get("state") or "UNKNOWN"),
+        park_reason=goal.get("park_reason"),
+        stalled=bool(execution.get("stalled")),
+        waiting=waiting,
+        completion_open=bool((snapshot.get("policy") or {}).get("grokbot_may_advance"))
+        and goal.get("state") == "COMPLETED",
+        target=str(execution.get("target") or "efficient"),
+        idle_slo=idle_slo,
+    )
+    out["server_time"] = iso_from(now)
+    return out
+
+
 def _observation(execution: dict, now: float) -> str:
-    hb = execution["last_heartbeat_at"]
-    structured = execution["last_structured_at"]
+    hb = execution.get("last_heartbeat_at")
+    structured = execution.get("last_structured_at")
     if hb is not None and now - float(hb) <= HEARTBEAT_HEALTHY_SEC:
         return "HEALTHY"
     if structured is not None and now - float(structured) <= STRUCTURED_HEALTHY_SEC:

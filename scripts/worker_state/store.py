@@ -1,6 +1,7 @@
 """SQLite WAL store. Evidence append, snapshot, claims share one transaction."""
 from __future__ import annotations
 
+import copy
 import json
 import sqlite3
 import threading
@@ -8,7 +9,8 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-from .resolver import resolve
+from .policy import fail_closed_snapshot
+from .resolver import apply_now_effects, resolve
 from .types import (
     CLAIM_RECONCILE_SEC,
     Event,
@@ -35,6 +37,7 @@ class Store:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
+        self._published: dict[str, dict[str, Any]] = {}
         self._conn = sqlite3.connect(
             str(self.path),
             check_same_thread=False,
@@ -138,29 +141,33 @@ class Store:
                         self._claim_completion(raw, worker, now)
                 snapshot = self._rebuild_locked(worker, now)
                 self._conn.execute("COMMIT")
-                return snapshot
             except Exception:
                 self._conn.execute("ROLLBACK")
                 raise
+            return apply_now_effects(copy.deepcopy(snapshot), now)
 
     def snapshot(self, worker: str, now: float, *, rebuild: bool = True) -> dict[str, Any]:
-        # Stall / UNCONFIRMED depend on `now`, so a cached row is not safe to serve.
+        if rebuild:
+            with self._lock:
+                self._conn.execute("BEGIN IMMEDIATE")
+                try:
+                    self._rebuild_locked(worker, now)
+                    self._conn.execute("COMMIT")
+                except Exception:
+                    self._conn.execute("ROLLBACK")
+                    raise
+                folded = copy.deepcopy(self._published[worker])
+            return apply_now_effects(folded, now)
         with self._lock:
-            if not rebuild:
-                row = self._conn.execute(
-                    "SELECT snapshot_json FROM worker_snapshots WHERE worker_id = ?",
-                    (worker,),
-                ).fetchone()
-                if row:
-                    return json.loads(row["snapshot_json"])
-            self._conn.execute("BEGIN IMMEDIATE")
-            try:
-                snapshot = self._rebuild_locked(worker, now)
-                self._conn.execute("COMMIT")
-                return snapshot
-            except Exception:
-                self._conn.execute("ROLLBACK")
-                raise
+            row = self._conn.execute(
+                "SELECT snapshot_json FROM worker_snapshots WHERE worker_id = ?",
+                (worker,),
+            ).fetchone()
+            if row:
+                folded = json.loads(row["snapshot_json"])
+            else:
+                folded = resolve([], now, worker, apply_time=False)
+        return apply_now_effects(folded, now)
 
     def replay(self, worker: str, now: float) -> dict[str, Any]:
         return self.snapshot(worker, now, rebuild=True)
@@ -184,6 +191,7 @@ class Store:
         expected_snapshot_version: int,
         idempotency_key: str,
         now: float,
+        extra: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         if action not in {"dispatch_goal", "resume", "advance"}:
             raise StoreError("action", f"unknown action {action!r}")
@@ -258,7 +266,11 @@ class Store:
                         "goal_id": identity["goal_id"],
                         "dispatch_id": identity["dispatch_id"],
                         "attempt_id": identity["attempt_id"],
-                        "payload": {"action": action, "action_id": action_id},
+                        "payload": {
+                            "action": action,
+                            "action_id": action_id,
+                            **({k: extra[k] for k in extra if k in {"target", "terminal", "pin"}} if extra else {}),
+                        },
                     },
                     now,
                 )
@@ -293,12 +305,21 @@ class Store:
                     return _claim_to_dict(row, reused=True)
                 worker = row["worker_id"]
                 result = {"ok": bool(ok), "error": error}
+                claimed_payload = self._claimed_payload_locked(action_id)
                 if ok:
                     state, delivery = "succeeded", "written"
-                    kind = "terminal_write.succeeded"
+                    kind = (
+                        "advance.completed"
+                        if row["action"] == "advance"
+                        else "terminal_write.succeeded"
+                    )
                 else:
                     state, delivery = "failed", "failed"
-                    kind = "terminal_write.failed"
+                    kind = (
+                        "advance.completed"
+                        if row["action"] == "advance"
+                        else "terminal_write.failed"
+                    )
                 self._conn.execute(
                     """
                     UPDATE action_claims
@@ -326,6 +347,11 @@ class Store:
                             "goal_id": row["goal_id"],
                             "dispatch_id": row["dispatch_id"],
                             "attempt_id": row["attempt_id"],
+                            **{
+                                k: claimed_payload[k]
+                                for k in ("target", "terminal", "pin")
+                                if k in claimed_payload
+                            },
                         },
                     },
                     now,
@@ -364,6 +390,25 @@ class Store:
                     ts = parse_ts(claimed_at)
                     if ts is None or now - ts < CLAIM_RECONCILE_SEC:
                         continue
+                    if row["action"] == "advance":
+                        self._conn.execute(
+                            """
+                            UPDATE action_claims
+                            SET state = 'unknown', delivery_state = 'unknown',
+                                result_at = ?, result_json = ?
+                            WHERE action_id = ?
+                            """,
+                            (
+                                iso_from(now),
+                                json.dumps({"ok": None, "error": "reconciled; advance not injected"}),
+                                row["action_id"],
+                            ),
+                        )
+                        continue
+                    claimed_payload = self._claimed_payload_locked(row["action_id"])
+                    inject_kind = "terminal_write.succeeded"
+                    if row["action"] == "dispatch_goal" and not claimed_payload.get("target"):
+                        inject_kind = "terminal_write.failed"
                     self._conn.execute(
                         """
                         UPDATE action_claims
@@ -399,7 +444,7 @@ class Store:
                         {
                             "event_id": f"reconcile-inject-{row['action_id']}",
                             "worker": worker,
-                            "kind": "terminal_write.succeeded",
+                            "kind": inject_kind,
                             "source": "api",
                             "source_timestamp": iso_from(now),
                             "goal_id": row["goal_id"],
@@ -412,6 +457,11 @@ class Store:
                                 "goal_id": row["goal_id"],
                                 "dispatch_id": row["dispatch_id"],
                                 "attempt_id": row["attempt_id"],
+                                **{
+                                    k: claimed_payload[k]
+                                    for k in ("target", "terminal", "pin")
+                                    if k in claimed_payload
+                                },
                             },
                         },
                         now,
@@ -530,9 +580,9 @@ class Store:
         ).fetchall()
         events = [_row_to_event(row) for row in rows]
         # completion_open needs a first pass for COMPLETED, then policy.
-        draft = resolve(events, now, worker, completion_open=False)
+        draft = resolve(events, now, worker, completion_open=False, apply_time=False)
         open_flag = self._completion_open(worker, draft)
-        snapshot = resolve(events, now, worker, completion_open=open_flag)
+        snapshot = resolve(events, now, worker, completion_open=open_flag, apply_time=False)
         last_seq = events[-1].journal_seq if events else 0
         snapshot["snapshot_version"] = last_seq
         self._conn.execute(
@@ -574,7 +624,21 @@ class Store:
                 iso_from(now),
             ),
         )
+        self._published[worker] = snapshot
         return snapshot
+
+    def _claimed_payload_locked(self, action_id: str) -> dict[str, Any]:
+        row = self._conn.execute(
+            "SELECT payload_json FROM evidence_journal WHERE event_id = ?",
+            (f"claim-{action_id}",),
+        ).fetchone()
+        if not row:
+            return {}
+        try:
+            data = json.loads(row["payload_json"] or "{}")
+        except json.JSONDecodeError:
+            return {}
+        return data if isinstance(data, dict) else {}
 
     def _insert_event_locked(self, raw: dict[str, Any], now: float) -> None:
         payload = raw.get("payload") if isinstance(raw.get("payload"), dict) else {}

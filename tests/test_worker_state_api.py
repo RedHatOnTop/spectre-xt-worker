@@ -63,6 +63,7 @@ class ApiTest(unittest.TestCase):
         self.assertEqual(body["goal"]["state"], "RUNNING")
 
     def test_claim_result_roundtrip(self):
+        self.store.snapshot("pugc", NOW, rebuild=True)
         handle(self.store, "GET", "/v1/workers/pugc/snapshot", None, NOW)
         code, claim = handle(
             self.store,

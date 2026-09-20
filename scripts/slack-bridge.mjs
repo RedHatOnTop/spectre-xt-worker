@@ -489,9 +489,12 @@ export function dispatchAllowed(pos, action = "dispatch_goal") {
 // runs in that pane. A pane that fell back to a shell would execute it, and a
 // pane in another project would take the goal into the wrong session.
 const SHELL_COMMANDS = ["bash", "zsh", "sh", "dash", "fish", "ksh", "tcsh"];
-export function paneRefusal(command, path, cwd) {
+export function paneRefusal(command, path, cwd, opts = {}) {
   const cmd = String(command || "").replace(/^-/, "").toLowerCase();
   if (SHELL_COMMANDS.includes(cmd)) {
+    if (opts.allowFlashShell && String(opts.line || "").startsWith(FLASH_FILE_PREFIX)) {
+      return null;
+    }
     return `pane runs a shell (${cmd}) — the text would execute as a shell command`;
   }
   if (cwd && path) {
@@ -562,6 +565,35 @@ export function dispatchLine(builtin, goalText, clauseText) {
   return line.length > GOAL_LINE_MAX ? line.slice(0, GOAL_LINE_MAX) : line;
 }
 
+export const FLASH_FILE_PREFIX = "/usr/local/bin/dsh-clinepass --file ";
+export const FLASH_PACKET_DIR = "/home/person/.local/state/remote-agent/packets";
+
+export function flashSendLine(dispatchId) {
+  const id = String(dispatchId || "dry-run").replace(/[^A-Za-z0-9._-]/g, "");
+  return `${FLASH_FILE_PREFIX}${FLASH_PACKET_DIR}/${id}.txt`;
+}
+
+export function injectionLine({ builtin, target, goalText, clauseText, dispatchId }) {
+  if (builtin === "plan") return oneLine(goalText);
+  if (builtin === "goal" && String(target || "efficient") === "flash") {
+    return flashSendLine(dispatchId);
+  }
+  if (builtin === "resume") return dispatchLine("resume", "", "");
+  return dispatchLine("goal", goalText, clauseText);
+}
+
+export function astraPidVerdict(cmdlines) {
+  const lines = (Array.isArray(cmdlines) ? cmdlines : []).map((c) => String(c));
+  const astra = lines.filter((c) => c.includes("gpt-6-astra"));
+  if (astra.some((c) => /model_provider\s*=\s*openai/.test(c))) {
+    return { ok: false, evt: "dispatch_astra_plus_burn" };
+  }
+  if (astra.length !== 1) {
+    return { ok: false, evt: "dispatch_astra_busy", count: astra.length };
+  }
+  return { ok: true };
+}
+
 // CLI parsing for `--dispatch` (the goal supervisor's path; needs no Slack).
 // Returns {builtin, worker, text, dryRun, operator, workersFile} or {error}.
 export function parseDispatchArgs(argv) {
@@ -572,6 +604,7 @@ export function parseDispatchArgs(argv) {
     dryRun: false,
     operator: "supervisor",
     workersFile: null,
+    target: "efficient",
     error: null,
   };
   const rest = [];
@@ -585,13 +618,16 @@ export function parseDispatchArgs(argv) {
     } else if (arg === "--workers-file") {
       out.workersFile = String(argv[i + 1] || "").trim() || null;
       i += 1;
+    } else if (arg === "--target") {
+      out.target = String(argv[i + 1] || "efficient").trim().toLowerCase() || "efficient";
+      i += 1;
     } else {
       rest.push(arg);
     }
   }
   const builtin = String(rest[0] || "").toLowerCase();
-  if (builtin !== "goal" && builtin !== "resume") {
-    out.error = "usage: --dispatch goal|resume <worker> [goal text] [--dry-run]";
+  if (builtin !== "goal" && builtin !== "resume" && builtin !== "plan") {
+    out.error = "usage: --dispatch goal|resume|plan <worker> [goal text] [--target flash|efficient] [--dry-run]";
     return out;
   }
   out.builtin = builtin;
@@ -1301,7 +1337,7 @@ async function finishClaim(claim, ok, error) {
   }
 }
 
-async function claimDispatch(worker, builtin, snapshot) {
+async function claimDispatch(worker, builtin, snapshot, target) {
   const action = dispatchAction(builtin);
   try {
     const { status, payload } = await claimAction({
@@ -1309,6 +1345,7 @@ async function claimDispatch(worker, builtin, snapshot) {
       action,
       expected_snapshot_version: snapshot.snapshot_version,
       idempotency_key: `${action}:${worker}:${snapshot.snapshot_version}:${randomUUID()}`,
+      target: target || "efficient",
     });
     if (status !== 200 || !payload || !payload.action_id) {
       return {
@@ -1387,7 +1424,16 @@ async function dispatchCli(argv) {
   }
 
   let injected;
-  if (opts.builtin === "goal") {
+  const targetName = opts.target || "efficient";
+  if (opts.builtin === "plan") {
+    injected = injectionLine({ builtin: "plan", goalText: opts.text });
+  } else if (opts.builtin === "goal" && targetName === "flash") {
+    injected = injectionLine({
+      builtin: "goal",
+      target: "flash",
+      dispatchId: opts.text || "dry-run",
+    });
+  } else if (opts.builtin === "goal") {
     const clause = loadClause();
     if (!clause.text) {
       audit({ evt: "dispatch_clause_failed", origin: opts.operator, error: clause.error });
@@ -1398,9 +1444,14 @@ async function dispatchCli(argv) {
         code: 1,
       };
     }
-    injected = dispatchLine("goal", opts.text, clause.text);
+    injected = injectionLine({
+      builtin: "goal",
+      target: targetName,
+      goalText: opts.text,
+      clauseText: clause.text,
+    });
   } else {
-    injected = dispatchLine("resume", "", "");
+    injected = injectionLine({ builtin: "resume" });
   }
 
   const probe = await probeWorker(workersFile, opts.worker);
@@ -1447,10 +1498,10 @@ async function dispatchCli(argv) {
       origin: opts.operator,
     };
     if (opts.dryRun) {
-      audit({ evt: "dispatch_dry_run", ...base });
-      return { ok: true, evt: "dispatch_dry_run", ...base };
+      audit({ evt: "dispatch_dry_run", ...base, line: injected });
+      return { ok: true, evt: "dispatch_dry_run", ...base, line: injected };
     }
-    const claimed = await claimDispatch(opts.worker, opts.builtin, probe.payload);
+    const claimed = await claimDispatch(opts.worker, opts.builtin, probe.payload, targetName);
     if (!claimed.ok) {
       audit({ evt: "dispatch_claim_failed", worker: opts.worker, origin: opts.operator, error: claimed.error });
       return { ok: false, evt: "dispatch_claim_failed", detail: `claim refused for ${opts.worker}: ${claimed.error}`, code: 1 };
@@ -1476,7 +1527,10 @@ async function dispatchCli(argv) {
     return { ok: false, evt: "dispatch_pane_failed", detail: `cannot read tmux pane ${entry.tmux}: ${pane.error}`, code: 1 };
   }
   const [paneCommand, panePath] = pane.stdout.trim().split("\t");
-  const refusal = paneRefusal(paneCommand, panePath, entry.cwd);
+  const refusal = paneRefusal(paneCommand, panePath, entry.cwd, {
+    allowFlashShell: targetName === "flash",
+    line: injected,
+  });
   if (refusal) {
     audit({ evt: "dispatch_pane_refused", builtin: opts.builtin, worker: opts.worker, pane: paneCommand, origin: opts.operator });
     return { ok: false, evt: "dispatch_pane_refused", detail: refusal, pane: paneCommand, code: 1 };
@@ -1493,10 +1547,10 @@ async function dispatchCli(argv) {
     origin: opts.operator,
   };
   if (opts.dryRun) {
-    audit({ evt: "dispatch_dry_run", ...base });
-    return { ok: true, evt: "dispatch_dry_run", ...base };
+    audit({ evt: "dispatch_dry_run", ...base, line: injected });
+    return { ok: true, evt: "dispatch_dry_run", ...base, line: injected };
   }
-  const claimed = await claimDispatch(opts.worker, opts.builtin, probe.payload);
+  const claimed = await claimDispatch(opts.worker, opts.builtin, probe.payload, targetName);
   if (!claimed.ok) {
     audit({ evt: "dispatch_claim_failed", worker: opts.worker, origin: opts.operator, error: claimed.error });
     return { ok: false, evt: "dispatch_claim_failed", detail: `claim refused for ${opts.worker}: ${claimed.error}`, code: 1 };

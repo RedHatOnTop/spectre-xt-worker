@@ -30,6 +30,7 @@ ALLOW = {
     "tests/test_worker_state_api.py",
     "tests/test_worker_state_adapter.py",
     "tests/test_worker_state_guard.py",
+    "tests/test_dsh_jsonl.py",
     "tests/test_slack_executor_settings.py",
 }
 SCAN_ROOTS = (ROOT / "scripts", ROOT / "tests")

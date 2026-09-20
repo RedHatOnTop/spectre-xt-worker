@@ -2459,6 +2459,29 @@ or drop the write from GET) is not implemented.
 
 ---
 
+## 7.18 Control plane (since 2026-09-21)
+
+One occupancy authority (`spectre-state`) and one typer (`spectre-slack-bridge
+--dispatch`). GET copies a published snapshot and applies now-dependent stall /
+UNCONFIRMED effects without `BEGIN IMMEDIATE`; a cache miss is UNKNOWN
+(fail-closed). Efficient `/goal` lines still go through the clause; Flash
+packets send only `/usr/local/bin/dsh-clinepass --file $HOME/.local/state/remote-agent/packets/<id>.txt`.
+`SPECTRE_LOOP` and `ASTRA_ENABLED` stay unset (installed-off) until the operator
+enables them after the store tests for `advance` vs `terminal_write.succeeded`
+are green. `goal-supervisor.timer` stays installed-off even if grok reappears.
+
+Verify (host):
+
+```bash
+python3 -m unittest discover -s tests -p 'test_*.py'
+node --test tests/slack_bridge.test.mjs
+```
+
+On the box, do not enable `spectre-loop.timer` or `ASTRA_ENABLED` in this slice.
+Retired classifiers must stay disabled (`spectre-doctor` / `systemctl --user is-enabled`).
+
+---
+
 ## 8. Monitoring
 
 

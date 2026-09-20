@@ -22,8 +22,11 @@ import {
   dayKey,
   debateMerged,
   debateMergeRecord,
+  astraPidVerdict,
   dispatchAllowed,
   dispatchLine,
+  flashSendLine,
+  injectionLine,
   formatThreadContext,
   isPassText,
   isRecoveryText,
@@ -911,6 +914,7 @@ test("parseDispatchArgs: supervisor CLI shape", () => {
     dryRun: false,
     operator: "supervisor",
     workersFile: null,
+    target: "efficient",
     error: null,
   });
 
@@ -935,6 +939,44 @@ test("parseDispatchArgs: supervisor CLI shape", () => {
 
   // A hyphenated or multi-word goal stays one literal; only flags are consumed.
   assert.equal(parseDispatchArgs(["goal", "q", "fix --dry-run bug"]).text, "fix --dry-run bug");
+});
+
+test("injectionLine: flash never types /goal; efficient does", () => {
+  const flash = injectionLine({ builtin: "goal", target: "flash", dispatchId: "abc" });
+  assert.equal(flash, flashSendLine("abc"));
+  assert.ok(flash.startsWith("/usr/local/bin/dsh-clinepass --file "));
+  assert.ok(!flash.includes("/goal"));
+  const efficient = injectionLine({
+    builtin: "goal",
+    target: "efficient",
+    goalText: "fix parser",
+    clauseText: "PROTOCOL",
+  });
+  assert.ok(efficient.startsWith("/goal "));
+  assert.ok(efficient.includes("fix parser"));
+});
+
+test("astraPidVerdict: plus-burn and busy", () => {
+  assert.equal(
+    astraPidVerdict(["codex -m gpt-6-astra -c model_provider=openai"]).evt,
+    "dispatch_astra_plus_burn",
+  );
+  assert.equal(astraPidVerdict(["codex -m gpt-6-astra", "codex -m gpt-6-astra"]).evt, "dispatch_astra_busy");
+  assert.equal(astraPidVerdict(["codex -m gpt-6-astra"]).ok, true);
+});
+
+test("paneRefusal: flash wrapper prefix may run in a shell", () => {
+  const line = flashSendLine("x");
+  assert.equal(
+    paneRefusal("bash", "/home/person/Projects/minecraft-server-project", "/home/person/Projects/minecraft-server-project", {
+      allowFlashShell: true,
+      line,
+    }),
+    null,
+  );
+  assert.ok(
+    paneRefusal("bash", "/home/person/Projects/minecraft-server-project", "/home/person/Projects/minecraft-server-project"),
+  );
 });
 
 test("parseDispatchArgs: refusals never become a bare goal", () => {
