@@ -2157,7 +2157,9 @@ grok --version   # expect 1.0.x; re-probe the flags after every upgrade
 /usr/local/bin/spectre-goal-supervisor --dry-run          # positions + planned actions
 /usr/local/bin/spectre-slack-bridge --dispatch resume <a tmux worker> --dry-run
 #   expect dispatch_dry_run in /work/logs/slack-bridge.log, nothing typed
-systemctl --user enable --now goal-supervisor.timer
+# Do not enable. Occupancy handoff is spectre-loop; this timer stays installed-off
+# even if grok reappears (bootstrap will not enable it; doctor flags it if on).
+# systemctl --user enable --now goal-supervisor.timer
 journalctl --user -u goal-supervisor.service -n 20
 cat /work/logs/goal-supervisor.log   # one line per scan: actions, acted, spend_today
 ```
@@ -2371,7 +2373,9 @@ from this repo, not the older flat tree under
 
 **Retired with the cutover** (disabled 2026-09-19; unit files kept in
 `~/.config/systemd/user/legacy-backup-20260919T213903/` and
-`…T214033/`, scripts untouched in the deploy tree):
+`…T214033/`, scripts untouched in the deploy tree). `bootstrap.sh`
+`disable --now`s this list on every run, including deploy-tree timers
+that reappeared on the box after 2026-09-19:
 
 - `qoder-continuity.timer` — idle-budget failover; it resumed off wall-clock
   age alone and was still firing `resume` at workers the resolver sees as
@@ -2382,7 +2386,14 @@ from this repo, not the older flat tree under
   forbids TUI-only lifecycle transitions.
 - `grokbot-goal-event.timer` + `.path` — classified `UpdateGoal`/
   `goal_complete` from session jsonl and published independently. That is the
-  §21 guard violation; the replacement is the §7.16 supervisor, still off.
+  §21 guard violation. Occupancy handoff is spectre-loop (control plane),
+  not a grok CLI reviewer.
+- `local-listener-reaper.timer`, `qoder-idle-reaper.timer`,
+  `native-worker-pin-sync.timer` — deploy-tree units; the repo reaper/pin-sync
+  replace them. Disable until those land.
+
+`goal-supervisor.timer` stays **installed-off** even if `grok` reappears.
+Do not enable it from bootstrap.
 
 The `worker_state/legacy.py` classifier is the one remaining raw-event reader
 and it is shadow-only; `tests/test_worker_state_guard.py` fails CI if any
@@ -2406,7 +2417,8 @@ systemctl --user enable --now spectre-worker-state.service \
   qoder-goal-watch.timer spectre-continuity.timer
 ```
 
-`bootstrap.sh` installs these units and disables the four legacy timers above.
+`bootstrap.sh` installs these units and disables the retired classifiers
+above. It never enables `goal-supervisor.timer`.
 
 Checks (run on Spectre 2026-09-19 21:40 KST; each is read-only):
 
@@ -2672,7 +2684,7 @@ spectre-goal-supervisor --dry-run                  # positions + planned actions
 spectre-goal-supervisor --worker qoder --dry-run   # expect gate reviewable for a parked worker
 spectre-slack-bridge --dispatch resume qoder --dry-run   # dispatch_dry_run, nothing typed
 cat /work/logs/goal-supervisor.log | tail -5       # scan lines + any grok failure detail
-systemctl --user is-enabled goal-supervisor.timer  # enabled only once grok + profile exist
+systemctl --user is-enabled goal-supervisor.timer  # not enabled (installed off)
 grep -c '^Environment=SPECTRE_GOAL_SUPERVISOR=1' ~/.config/systemd/user/goal-supervisor.service
 ```
 

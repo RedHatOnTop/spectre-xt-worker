@@ -313,13 +313,9 @@ if [[ -f "${slack_env}" ]]; then
     warn "grok not installed — goal supervisor has no reviewer (handoff stays manual)"
   fi
   if RUN_AS_USER systemctl --user is-enabled goal-supervisor.timer >/dev/null 2>&1; then
-    if grep -qs '^Environment=SPECTRE_GOAL_SUPERVISOR=1' "${TARGET_HOME}/.config/systemd/user/goal-supervisor.service" 2>/dev/null; then
-      ok "goal-supervisor.timer enabled (autonomous handoff on)"
-    else
-      warn "goal-supervisor.timer enabled but the unit's kill switch is off (no-op)"
-    fi
+    bad "goal-supervisor.timer enabled — Grok CLI supervisor stays installed-off (control plane)"
   else
-    warn "goal-supervisor.timer disabled — parked goals wait for you"
+    ok "goal-supervisor.timer disabled (installed off)"
   fi
 else
   warn "slack.env missing — Slack community not configured (RUNBOOK 7.10)"
@@ -359,7 +355,10 @@ fi
 # Retired with the cutover: each of these classified occupancy on its own and
 # could type a second, contradictory goal. Enabled again = a regression.
 for ws_legacy in qoder-nudge.timer qoder-continuity.timer \
-                 codex-goal-healer.timer grokbot-goal-event.timer; do
+                 codex-goal-healer.timer grokbot-goal-event.timer \
+                 grokbot-goal-event.path \
+                 local-listener-reaper.timer qoder-idle-reaper.timer \
+                 native-worker-pin-sync.timer; do
   ws_legacy_state="$(RUN_AS_USER systemctl --user is-enabled "${ws_legacy}" 2>/dev/null || true)"
   if [[ "${ws_legacy_state}" == "enabled" ]]; then
     bad "${ws_legacy} enabled — retired classifier back on (RUNBOOK 7.17)"
@@ -369,9 +368,9 @@ for ws_legacy in qoder-nudge.timer qoder-continuity.timer \
 done
 ws_gs="$(RUN_AS_USER systemctl --user is-enabled goal-supervisor.timer 2>/dev/null || true)"
 if [[ "${ws_gs}" == "enabled" ]]; then
-  ok "goal-supervisor.timer enabled (Grokbot active, RUNBOOK 7.16)"
+  bad "goal-supervisor.timer enabled — Grok CLI supervisor stays installed-off (control plane)"
 else
-  warn "goal-supervisor.timer disabled — Grokbot advances nothing (installed off)"
+  ok "goal-supervisor.timer disabled (installed off)"
 fi
 
 echo "== codex CLI + session handoff (RUNBOOK 7.11, 7.15) =="
