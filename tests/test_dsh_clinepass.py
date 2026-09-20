@@ -29,7 +29,10 @@ class WrapperTest(unittest.TestCase):
             key.write_text("not-a-real-key\n", encoding="utf-8")
             key.chmod(0o600)
             fake_dsh = Path(tmp) / "dsh"
-            fake_dsh.write_text("#!/bin/sh\nexec sleep 30\n", encoding="utf-8")
+            fake_dsh.write_text(
+                "#!" + sys.executable + "\nimport time\ntime.sleep(30)\n",
+                encoding="utf-8",
+            )
             fake_dsh.chmod(0o755)
             packet = Path(tmp) / "abc.txt"
             packet.write_text("do the work\n", encoding="utf-8")
@@ -56,7 +59,7 @@ class WrapperTest(unittest.TestCase):
             key.write_text("not-a-real-key\n", encoding="utf-8")
             key.chmod(0o600)
             fake_dsh = Path(tmp) / "dsh"
-            fake_dsh.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            fake_dsh.write_text("#!" + sys.executable + "\nimport sys\nsys.exit(0)\n", encoding="utf-8")
             fake_dsh.chmod(0o755)
             packet = Path(tmp) / "ok.txt"
             packet.write_text("done\n", encoding="utf-8")

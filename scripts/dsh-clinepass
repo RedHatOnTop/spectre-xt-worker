@@ -38,7 +38,7 @@ def main(argv: list[str] | None = None) -> int:
     if not packet.is_file():
         write_exit(packet, 2)
         return 2
-    if not KEY_FILE.is_file() or oct(KEY_FILE.stat().st_mode)[-3:] != "600":
+    if not KEY_FILE.is_file() or (KEY_FILE.stat().st_mode & 0o777) != 0o600:
         write_exit(packet, 2)
         return 2
     task = packet.read_text(encoding="utf-8")
@@ -68,7 +68,7 @@ def main(argv: list[str] | None = None) -> int:
                 proc.kill()
             write_exit(packet, 124)
             return 124
-        time.sleep(1)
+        time.sleep(0.05)
     code = int(proc.returncode or 0)
     if code < 0:
         code = 1

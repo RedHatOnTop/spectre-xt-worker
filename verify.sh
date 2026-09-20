@@ -77,8 +77,8 @@ fi
 section "unit tests"
 test_out="$(python3 -m unittest discover -s tests 2>&1)"
 rc=$?
-echo "${test_out}" | tail -3
 if [[ ${rc} -ne 0 ]]; then
+  echo "${test_out}"
   echo "FAIL  unit tests"
   failed=1
 elif ! echo "${test_out}" | grep -q "^OK"; then

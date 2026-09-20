@@ -17,7 +17,8 @@ _LAST_SEQ: dict[str, int] = {}
 
 def dsh_session_dir(cwd: str) -> str:
     """Harness encoding: -- + absolute-path-with-dashes + --."""
-    abs_path = str(Path(cwd).resolve()) if cwd else ""
+    raw = str(cwd or "")
+    abs_path = raw if raw.startswith("/") else str(Path(raw).resolve())
     dashed = abs_path.rstrip("/").replace("/", "-")
     return f"--{dashed}--"
 
