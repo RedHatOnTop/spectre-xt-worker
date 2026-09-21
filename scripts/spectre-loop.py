@@ -96,14 +96,42 @@ def plan_tick(
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = argv if argv is not None else sys.argv[1:]
+    args = list(argv if argv is not None else sys.argv[1:])
     dry = "--dry-run" in args
     if not loop_enabled():
         print(json.dumps({"ok": True, "disabled": True, "dry_run": dry}))
         return 0
-    workers = load_workers(workers_path())
+    snapshots = None
+    workers_override = None
+    if "--snapshot-file" in args:
+        idx = args.index("--snapshot-file")
+        snapshots = json.loads(Path(args[idx + 1]).read_text(encoding="utf-8"))
+    if "--workers-file" in args:
+        idx = args.index("--workers-file")
+        workers_override = Path(args[idx + 1])
+    if snapshots is not None:
+        workers = {}
+        if workers_override:
+            workers = load_workers(workers_override)
+        else:
+            workers = {name: {} for name in snapshots}
+        prev: dict[str, Any] = {}
+        actions = [
+            plan_tick(
+                name,
+                workers.get(name) or {},
+                snapshots[name],
+                loop_on=True,
+                astra_on=astra_enabled(),
+                prev=prev,
+            )
+            for name in sorted(snapshots)
+        ]
+        print(json.dumps({"ok": True, "dry_run": dry, "actions": actions}, indent=2, sort_keys=True))
+        return 0
+    workers = load_workers(workers_override or workers_path())
     client = StateClient()
-    prev: dict[str, Any] = {}
+    prev = {}
     if STATE_PATH.is_file():
         try:
             prev = json.loads(STATE_PATH.read_text(encoding="utf-8"))
@@ -117,7 +145,7 @@ def main(argv: list[str] | None = None) -> int:
                 name,
                 entry,
                 snap,
-                loop_on=loop_enabled() or dry,
+                loop_on=True,
                 astra_on=astra_enabled(),
                 prev=prev,
             )

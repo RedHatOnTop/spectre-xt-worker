@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import sys
+from pathlib import Path
 from typing import Any
 
 ALLOW_PORTS = {6768, 7676, 9222, 9091}
@@ -72,9 +73,31 @@ def decide(
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = argv if argv is not None else sys.argv[1:]
+    args = list(argv if argv is not None else sys.argv[1:])
     apply = "--apply" in args
-    print(json.dumps({"ok": True, "dry_run": not apply, "decisions": []}, sort_keys=True))
+    fixture = None
+    if "--fixture" in args:
+        idx = args.index("--fixture")
+        if idx + 1 >= len(args):
+            print(json.dumps({"ok": False, "error": "usage: --fixture FILE"}))
+            return 2
+        fixture = Path(args[idx + 1])
+    decisions: list[dict[str, Any]] = []
+    if fixture is not None:
+        payload = json.loads(fixture.read_text(encoding="utf-8"))
+        listen_ports = {int(p) for p in (payload.get("listen_ports") or [])}
+        pins = {str(p) for p in (payload.get("pins") or [])}
+        flash_done_age = payload.get("flash_done_age")
+        for proc in payload.get("procs") or []:
+            action = decide(
+                proc,
+                listen_ports=listen_ports,
+                pins=pins,
+                flash_done_age=flash_done_age,
+                apply=apply,
+            )
+            decisions.append({"cmd": proc.get("cmd"), "handle": proc.get("handle"), "action": action})
+    print(json.dumps({"ok": True, "dry_run": not apply, "decisions": decisions}, sort_keys=True))
     return 0
 
 

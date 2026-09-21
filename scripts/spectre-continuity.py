@@ -23,18 +23,11 @@ BRIDGE_BIN = "spectre-slack-bridge"
 REPO_BRIDGE = HERE / "slack-bridge.mjs"
 
 
-def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(prog="spectre-continuity")
-    parser.add_argument("--dry-run", action="store_true")
-    parser.add_argument("--workers-file", default=None)
-    parser.add_argument("--bridge-bin", default=BRIDGE_BIN)
-    args = parser.parse_args(argv)
-    path = Path(args.workers_file).expanduser() if args.workers_file else workers_path()
-    workers = load_workers(path)
-    client = StateClient()
+def plan_actions(snapshots: dict[str, dict]) -> list[dict]:
+    """Pure: snapshot.policy → resume/skip. No I/O."""
     actions = []
-    for name in sorted(workers):
-        snap = client.snapshot(name, time())
+    for name in sorted(snapshots):
+        snap = snapshots[name] if isinstance(snapshots.get(name), dict) else {}
         pos = snapshot_to_pos(snap)
         policy = pos.get("policy") or {}
         if snap.get("debug", {}).get("unavailable"):
@@ -42,8 +35,6 @@ def main(argv: list[str] | None = None) -> int:
             continue
         if policy.get("continuity_recovery_allowed"):
             actions.append({"worker": name, "action": "resume", "reason": snap.get("reason")})
-            if not args.dry_run:
-                _resume(args.bridge_bin, name)
         else:
             actions.append(
                 {
@@ -53,6 +44,30 @@ def main(argv: list[str] | None = None) -> int:
                     "state": pos.get("goal_state") or pos.get("state"),
                 }
             )
+    return actions
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="spectre-continuity")
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--workers-file", default=None)
+    parser.add_argument("--snapshot-file", default=None)
+    parser.add_argument("--bridge-bin", default=BRIDGE_BIN)
+    args = parser.parse_args(argv)
+    if args.snapshot_file:
+        snapshots = json.loads(Path(args.snapshot_file).read_text(encoding="utf-8"))
+        actions = plan_actions(snapshots)
+        print(json.dumps({"actions": actions}, indent=2, sort_keys=True))
+        return 0
+    path = Path(args.workers_file).expanduser() if args.workers_file else workers_path()
+    workers = load_workers(path)
+    client = StateClient()
+    snapshots = {name: client.snapshot(name, time()) for name in workers}
+    actions = plan_actions(snapshots)
+    if not args.dry_run:
+        for item in actions:
+            if item.get("action") == "resume":
+                _resume(args.bridge_bin, item["worker"])
     print(json.dumps({"actions": actions}, indent=2, sort_keys=True))
     return 0
 

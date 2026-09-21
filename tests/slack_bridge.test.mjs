@@ -23,6 +23,7 @@ import {
   debateMerged,
   debateMergeRecord,
   astraPidVerdict,
+  dispatchAction,
   dispatchAllowed,
   dispatchLine,
   flashSendLine,
@@ -406,6 +407,12 @@ test("controlDispatchArgs: Slack dispatch carries the classified worker", () => 
   assert.equal(controlDispatchArgs({ kind: "control", command: "why is the proxy down?" }).builtin, null);
 });
 
+test("dispatchAction: plan is not a goal inject", () => {
+  assert.equal(dispatchAction("plan"), "plan");
+  assert.equal(dispatchAction("goal"), "dispatch_goal");
+  assert.equal(dispatchAction("resume"), "resume");
+});
+
 test("dispatchAllowed: policy flags only, fail-closed without policy", () => {
   const closed = dispatchAllowed({ state: "idle" });
   assert.equal(closed.ok, false);
@@ -441,6 +448,19 @@ test("dispatchAllowed: policy flags only, fail-closed without policy", () => {
       goal: { state: "PARKED", park_reason: "goal_budget" },
       policy: { can_dispatch_goal: false, can_resume: true },
     }, "dispatch_goal").ok,
+    false,
+  );
+
+  const planOk = dispatchAllowed({
+    goal: { state: "COMPLETED" },
+    policy: { grokbot_may_advance: true, can_dispatch_goal: true },
+  }, "plan");
+  assert.equal(planOk.ok, true);
+  assert.equal(
+    dispatchAllowed({
+      goal: { state: "RUNNING" },
+      policy: { grokbot_may_advance: false, can_dispatch_goal: false },
+    }, "plan").ok,
     false,
   );
 
@@ -1058,6 +1078,30 @@ function runBridge(args, env) {
   });
   return { code: proc.status, stdout: proc.stdout || "", stderr: proc.stderr || "" };
 }
+
+test("dispatch CLI: plan plus-burn refuses without terminal create", () => {
+  const dir = mkdtempSync(join(tmpdir(), "spectre-plan-"));
+  try {
+    const workers = join(dir, "workers.json");
+    writeFileSync(
+      workers,
+      JSON.stringify({ workers: { minecraft: { cwd: dir, tmux: null, terminal: "term_a" } } }),
+    );
+    const src = readFileSync(BRIDGE_SCRIPT, "utf8");
+    assert.equal(src.includes("terminal create"), false);
+    const plus = runBridge(
+      ["--dispatch", "plan", "minecraft", "next packet", "--dry-run", "--workers-file", workers],
+      { SPECTRE_ASTRA_CMDLINES: "codex -m gpt-6-astra -c model_provider=openai" },
+    );
+    assert.equal(plus.code, 1, plus.stdout);
+    const verdict = JSON.parse(plus.stdout.trim());
+    assert.equal(verdict.evt, "dispatch_astra_plus_burn");
+    assert.match(verdict.detail, /not creating a terminal/);
+    assert.equal(src.includes("orca-ide terminal create"), false);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
 
 test("dispatch CLI: usage and unknown workers exit non-zero with a JSON verdict", () => {
   const usage = runBridge(["--dispatch"]);

@@ -97,5 +97,64 @@ class PlanTickTest(unittest.TestCase):
         self.assertEqual(out["reason"], "continuity")
 
 
+class LoopCliTest(unittest.TestCase):
+    def test_snapshot_file_skips_planner_when_astra_off(self) -> None:
+        import json
+        import os
+        import subprocess
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            snaps = Path(tmp) / "snaps.json"
+            workers = Path(tmp) / "workers.json"
+            snaps.write_text(
+                json.dumps(
+                    {
+                        "minecraft": {
+                            "goal": {"state": "COMPLETED", "goal_id": "g1"},
+                            "policy": {"grokbot_may_advance": True},
+                            "debug": {},
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            workers.write_text(
+                json.dumps(
+                    {
+                        "workers": {
+                            "minecraft": {
+                                "cwd": tmp,
+                                "planner": {"terminal": "term_a"},
+                            }
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            env = os.environ.copy()
+            env["SPECTRE_LOOP"] = "1"
+            env.pop("ASTRA_ENABLED", None)
+            proc = subprocess.run(
+                [
+                    sys.executable,
+                    str(ROOT / "scripts" / "spectre-loop.py"),
+                    "--dry-run",
+                    "--snapshot-file",
+                    str(snaps),
+                    "--workers-file",
+                    str(workers),
+                ],
+                capture_output=True,
+                text=True,
+                env=env,
+                check=False,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            payload = json.loads(proc.stdout)
+            self.assertEqual(payload["actions"][0]["action"], "skip")
+            self.assertEqual(payload["actions"][0]["reason"], "planner_pin")
+
+
 if __name__ == "__main__":
     unittest.main()

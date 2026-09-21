@@ -26,6 +26,7 @@ import {
   appendFileSync,
   existsSync,
   mkdirSync,
+  readdirSync,
   readFileSync,
   realpathSync,
   renameSync,
@@ -463,7 +464,9 @@ export function controlDispatchArgs(decision) {
 // permission dialog — blind keystrokes could select a dialog option, so the
 // operator must approve that one in the orca UI.
 export function dispatchAction(builtin) {
-  return builtin === "resume" ? "resume" : "dispatch_goal";
+  if (builtin === "resume") return "resume";
+  if (builtin === "plan") return "plan";
+  return "dispatch_goal";
 }
 
 export function dispatchAllowed(pos, action = "dispatch_goal") {
@@ -471,7 +474,11 @@ export function dispatchAllowed(pos, action = "dispatch_goal") {
   if (!policy || typeof policy !== "object") {
     return { ok: false, detail: "state api unavailable (no policy) — refusing to type blind" };
   }
-  const flag = action === "resume" ? "can_resume" : "can_dispatch_goal";
+  const flag = action === "resume"
+    ? "can_resume"
+    : action === "plan"
+      ? "grokbot_may_advance"
+      : "can_dispatch_goal";
   if (policy[flag] === true) return { ok: true };
   const park = (pos.goal && pos.goal.park_reason) || pos.park_reason || pos.reason;
   const state = (pos.goal && pos.goal.state) || pos.goal_state || pos.state || "UNKNOWN";
@@ -592,6 +599,35 @@ export function astraPidVerdict(cmdlines) {
     return { ok: false, evt: "dispatch_astra_busy", count: astra.length };
   }
   return { ok: true };
+}
+
+export function astraCmdlinesFromEnv(env = process.env) {
+  const raw = env.SPECTRE_ASTRA_CMDLINES;
+  if (raw == null || String(raw).trim() === "") return null;
+  return String(raw).split("\n").filter(Boolean);
+}
+
+export function listAstraCmdlines(env = process.env, procRoot = "/proc") {
+  const fromEnv = astraCmdlinesFromEnv(env);
+  if (fromEnv) return fromEnv;
+  const out = [];
+  let ents = [];
+  try {
+    ents = readdirSync(procRoot, { withFileTypes: true });
+  } catch {
+    return out;
+  }
+  for (const ent of ents) {
+    if (!ent.isDirectory() || !/^\d+$/.test(ent.name)) continue;
+    try {
+      const raw = readFileSync(join(procRoot, ent.name, "cmdline"));
+      const cmd = String(raw).replace(/\0/g, " ");
+      if (cmd.includes("gpt-6-astra")) out.push(cmd);
+    } catch {
+      // unreadable pid
+    }
+  }
+  return out;
 }
 
 // CLI parsing for `--dispatch` (the goal supervisor's path; needs no Slack).
@@ -1423,6 +1459,22 @@ async function dispatchCli(argv) {
     return { ok: false, evt: "dispatch_unknown_worker", detail: `unknown worker ${opts.worker} (known: ${known})`, code: 1 };
   }
 
+  if (opts.builtin === "plan") {
+    const cmdlines = listAstraCmdlines();
+    const astra = astraPidVerdict(cmdlines);
+    if (!astra.ok) {
+      audit({ evt: astra.evt, worker: opts.worker, origin: opts.operator, count: astra.count });
+      return {
+        ok: false,
+        evt: astra.evt,
+        detail: astra.evt === "dispatch_astra_plus_burn"
+          ? "plus-burn gpt-6-astra pid present — refusing plan, not creating a terminal"
+          : "astra pid count is not 1 — refusing plan, not creating a terminal",
+        code: 1,
+      };
+    }
+  }
+
   let injected;
   const targetName = opts.target || "efficient";
   if (opts.builtin === "plan") {
@@ -1501,7 +1553,9 @@ async function dispatchCli(argv) {
       audit({ evt: "dispatch_dry_run", ...base, line: injected });
       return { ok: true, evt: "dispatch_dry_run", ...base, line: injected };
     }
-    const claimed = await claimDispatch(opts.worker, opts.builtin, probe.payload, targetName);
+    const claimed = opts.builtin === "plan"
+      ? { ok: true, claim: { action_id: null } }
+      : await claimDispatch(opts.worker, opts.builtin, probe.payload, targetName);
     if (!claimed.ok) {
       audit({ evt: "dispatch_claim_failed", worker: opts.worker, origin: opts.operator, error: claimed.error });
       return { ok: false, evt: "dispatch_claim_failed", detail: `claim refused for ${opts.worker}: ${claimed.error}`, code: 1 };
@@ -1550,7 +1604,9 @@ async function dispatchCli(argv) {
     audit({ evt: "dispatch_dry_run", ...base, line: injected });
     return { ok: true, evt: "dispatch_dry_run", ...base, line: injected };
   }
-  const claimed = await claimDispatch(opts.worker, opts.builtin, probe.payload, targetName);
+  const claimed = opts.builtin === "plan"
+    ? { ok: true, claim: { action_id: null } }
+    : await claimDispatch(opts.worker, opts.builtin, probe.payload, targetName);
   if (!claimed.ok) {
     audit({ evt: "dispatch_claim_failed", worker: opts.worker, origin: opts.operator, error: claimed.error });
     return { ok: false, evt: "dispatch_claim_failed", detail: `claim refused for ${opts.worker}: ${claimed.error}`, code: 1 };
