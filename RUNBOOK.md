@@ -2082,7 +2082,7 @@ stopped /goal unit
   watcher's 120 s tick, so a park is classified before the review reads it).
 - `#lobby`/`#fleet` identity `grok` (`:crystal_ball:`) in
   `config/slack-agents.json` — one Slack app, nine identities now; the notify
-  self-test reports `OK (4 channels, 9 agents)`.
+  self-test reports `OK (4 channels, 10 agents)`.
 - A failed review logs a bounded, single-line, token-redacted tail of the CLI's
   stderr (`one_line_log`) to `/work/logs/goal-supervisor.log`. Without it a
   rejected argument is invisible — how the tool-name abort below was found.
@@ -2681,7 +2681,7 @@ stat -c %y ~/.local/state/remote-agent/heartbeat  # < 2 min old
 # slack agent community (optional, RUNBOOK 7.10)
 systemctl --user is-active slack-bridge.service   # active
 stat -c '%a %n' ~/.config/remote-agent/slack.env  # 600
-spectre-slack-notify --self-test                  # OK (4 channels, 9 agents)
+spectre-slack-notify --self-test                  # OK (4 channels, 10 agents)
 test -x ~/.local/bin/qoder-efficient              # executor present (cost-gated wrapper)
 test -f /usr/local/share/remote-agent/slack-executor-settings.json  # executor profile
 # and the full probe list from 7.10 (write/secret/subagent) after every qodercli upgrade

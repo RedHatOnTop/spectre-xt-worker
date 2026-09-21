@@ -14,41 +14,71 @@ from . import dsh_jsonl, process, qoder_jsonl
 from .http_api import MAX_BODY, handle
 from .shadow import compare, load_old_classifier
 from .store import Store
-from .types import iso_from
+from .types import Event, iso_from
 
 _POLL_LOG = Path("/work/logs/worker-state.log")
-_FLASH_SEEN_ALIVE: dict[str, bool] = {}
-_FLASH_DIED_AT: dict[str, float] = {}
 _PACKETS = Path.home() / ".local/state/remote-agent/packets"
+_TERMINAL = frozenset({"COMPLETED", "FAILED", "IDLE"})
 
 
-def _ingest_dsh_exit(store: Store, name: str, now: float) -> None:
+def _flash_died_at(events: list[Event], dispatch_id: str, now: float) -> float | None:
+    """First dead process.sample after an alive sample in this dispatch epoch.
+
+    Never-seen pid (no alive sample after inject) returns None — not gone.
+    Still-alive after an alive sample also returns None.
+    """
+    seen_alive = False
+    died_at: float | None = None
+    in_epoch = False
+    for event in events:
+        payload = event.payload or {}
+        if event.kind == "terminal_write.succeeded" and (
+            event.dispatch_id == dispatch_id or payload.get("dispatch_id") == dispatch_id
+        ):
+            in_epoch = True
+            seen_alive = False
+            died_at = None
+            continue
+        if not in_epoch or event.kind != "process.sample":
+            continue
+        ts = event.source_ts
+        if ts is None:
+            ts = now
+        if payload.get("alive"):
+            seen_alive = True
+            died_at = None
+        elif seen_alive and died_at is None:
+            died_at = ts
+    if not seen_alive:
+        return None
+    return died_at
+
+
+def _ingest_dsh_exit(
+    store: Store,
+    name: str,
+    now: float,
+    *,
+    packets_dir: Path | None = None,
+) -> None:
     snap = store.snapshot(name, now, rebuild=True)
     execution = snap.get("execution") or {}
     goal = snap.get("goal") or {}
     dispatch_id = str(goal.get("dispatch_id") or "")
     if not dispatch_id or str(execution.get("target") or "") != "flash":
         return
-    alive = bool(execution.get("process_alive"))
-    if alive:
-        _FLASH_SEEN_ALIVE[name] = True
-        _FLASH_DIED_AT.pop(name, None)
+    if str(goal.get("state") or "") in _TERMINAL:
         return
-    if not _FLASH_SEEN_ALIVE.get(name):
-        return
-    died_at = _FLASH_DIED_AT.get(name)
+    died_at = _flash_died_at(store.events_for(name), dispatch_id, now)
     if died_at is None:
-        _FLASH_DIED_AT[name] = now
-        died_at = now
-    path = _PACKETS / f"{dispatch_id}.exit"
+        return
+    path = (packets_dir or _PACKETS) / f"{dispatch_id}.exit"
     code = dsh_jsonl.parse_exit_file(path)
-    if code is None and now - died_at < 30:
+    if code is None and now - float(died_at) < 30:
         return
     if code is None:
         code = 1
     store.ingest(dsh_jsonl.dsh_exit_event(name, dispatch_id, code, snap, now), now)
-    _FLASH_SEEN_ALIVE.pop(name, None)
-    _FLASH_DIED_AT.pop(name, None)
 
 
 def _poll_log(text: str) -> None:
@@ -138,14 +168,20 @@ def ingest_workers(
     *,
     shadow: bool = True,
     shadow_log: Path | None = None,
+    proc_root: Path | None = None,
+    packets_dir: Path | None = None,
 ) -> dict[str, Any]:
     old = load_old_classifier() if shadow else None
+    proc = proc_root or Path("/proc")
+    packets = packets_dir or _PACKETS
     results: dict[str, Any] = {}
     for name, entry in workers.items():
         prior = store.snapshot(name, now, rebuild=True)
         target = str((prior.get("execution") or {}).get("target") or "efficient")
         cwd = str(entry.get("cwd") or "")
-        for event in process.evidence_for_worker(name, entry, now):
+        for event in process.evidence_for_worker(
+            name, entry, now, target=target, proc_root=proc
+        ):
             store.ingest(event, now)
         if target == "flash":
             injected = (prior.get("goal") or {}).get("injected_at")
@@ -156,7 +192,7 @@ def ingest_workers(
                 name, cwd, now, injected_at=inj_ts
             ):
                 store.ingest(event, now)
-            _ingest_dsh_exit(store, name, now)
+            _ingest_dsh_exit(store, name, now, packets_dir=packets)
         else:
             for event in qoder_jsonl.collect_worker_evidence(name, entry, sessions_root):
                 store.ingest(event, now)

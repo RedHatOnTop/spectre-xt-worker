@@ -2,7 +2,7 @@
 // Unit tests for the Slack Socket Mode bridge policy and guards.
 import assert from "node:assert/strict";
 import { execFileSync, spawn, spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { test } from "node:test";
@@ -27,7 +27,12 @@ import {
   dispatchAllowed,
   dispatchLine,
   flashSendLine,
+  flashReady,
+  flashPin,
+  finalizeFlashInjection,
   injectionLine,
+  pinTreeHasDsh,
+  writeFlashPacket,
   formatThreadContext,
   isPassText,
   isRecoveryText,
@@ -976,6 +981,63 @@ test("injectionLine: flash never types /goal; efficient does", () => {
   assert.ok(efficient.includes("fix parser"));
 });
 
+test("writeFlashPacket: names the file after the claimed dispatch_id", () => {
+  const dir = mkdtempSync(join(tmpdir(), "spectre-packet-"));
+  try {
+    const env = { SPECTRE_PACKET_DIR: dir };
+    const written = writeFlashPacket("d-claimed1", "fix   the nether\nnext", env);
+    assert.equal(written.ok, true);
+    assert.equal(written.path, join(dir, "d-claimed1.txt"));
+    assert.equal(readFileSync(written.path, "utf8"), "fix the nether next\n");
+    const made = finalizeFlashInjection({ claim: { dispatch_id: "d-claimed1" } }, "fix the nether", env);
+    assert.equal(made.ok, true);
+    assert.equal(made.dispatch_id, "d-claimed1");
+    assert.equal(made.line, flashSendLine("d-claimed1", env));
+    assert.ok(!made.line.includes("fix the nether"));
+    assert.equal(finalizeFlashInjection({ claim: {} }, "x", env).ok, false);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("flashReady: fail-closes missing wrapper/key/dsh/pin and busy pin-tree dsh", () => {
+  const dir = mkdtempSync(join(tmpdir(), "spectre-flash-ready-"));
+  try {
+    const wrapper = join(dir, "dsh-clinepass");
+    const key = join(dir, "key");
+    const dsh = join(dir, "dsh");
+    const proc = join(dir, "proc");
+    mkdirSync(proc);
+    writeFileSync(wrapper, "#!/bin/sh\n", { mode: 0o644 });
+    chmodSync(wrapper, 0o644);
+    writeFileSync(key, "secret\n", { mode: 0o600 });
+    chmodSync(key, 0o600);
+    writeFileSync(dsh, "#!/bin/sh\n", { mode: 0o755 });
+    chmodSync(dsh, 0o755);
+    const env = {
+      SPECTRE_DSH_WRAPPER: wrapper,
+      SPECTRE_DSH_KEY: key,
+      SPECTRE_DSH_BIN: dsh,
+      SPECTRE_PROC_ROOT: proc,
+    };
+    assert.equal(flashReady({}, env).evt, "dispatch_flash_unavailable");
+    const entry = { targets: { flash: { terminal: "term_flash" } } };
+    assert.match(flashReady(entry, env).detail, /755/);
+    chmodSync(wrapper, 0o755);
+    assert.equal(flashReady(entry, env).ok, true);
+    assert.equal(flashPin(entry), "term_flash");
+
+    mkdirSync(join(proc, "42"));
+    writeFileSync(join(proc, "42", "cmdline"), "dsh\0--profile\0headless\0task");
+    writeFileSync(join(proc, "42", "environ"), "ORCA_TERMINAL_HANDLE=term_flash\0");
+    writeFileSync(join(proc, "42", "stat"), "42 (dsh) S 1 0 0 0 0 0 0 0 0 0 10 5 0 0 0 0 0\n");
+    assert.equal(pinTreeHasDsh("term_flash", proc), true);
+    assert.equal(flashReady(entry, env).evt, "dispatch_flash_busy");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("astraPidVerdict: plus-burn and busy", () => {
   assert.equal(
     astraPidVerdict(["codex -m gpt-6-astra -c model_provider=openai"]).evt,
@@ -1078,6 +1140,128 @@ function runBridge(args, env) {
   });
   return { code: proc.status, stdout: proc.stdout || "", stderr: proc.stderr || "" };
 }
+
+function writeFlashBits(dir) {
+  const wrapper = join(dir, "dsh-clinepass");
+  const key = join(dir, "cline_api_key");
+  const dsh = join(dir, "dsh");
+  const proc = join(dir, "proc");
+  const packets = join(dir, "packets");
+  mkdirSync(proc, { recursive: true });
+  mkdirSync(packets, { recursive: true });
+  writeFileSync(wrapper, "#!/bin/sh\nexit 0\n");
+  chmodSync(wrapper, 0o755);
+  writeFileSync(key, "not-a-real-key\n");
+  chmodSync(key, 0o600);
+  writeFileSync(dsh, "#!/bin/sh\nexit 0\n");
+  chmodSync(dsh, 0o755);
+  return {
+    wrapper,
+    key,
+    dsh,
+    proc,
+    packets,
+    env: {
+      SPECTRE_DSH_WRAPPER: wrapper,
+      SPECTRE_DSH_KEY: key,
+      SPECTRE_DSH_BIN: dsh,
+      SPECTRE_PROC_ROOT: proc,
+      SPECTRE_PACKET_DIR: packets,
+    },
+  };
+}
+
+test("dispatch CLI: flash dry-run refuses missing wrapper and never types /goal", () => {
+  const dir = mkdtempSync(join(tmpdir(), "spectre-flash-dry-"));
+  const state = startStateServer(dir, "");
+  try {
+    const workers = join(dir, "workers.json");
+    writeFileSync(
+      workers,
+      JSON.stringify({
+        workers: {
+          minecraft: {
+            cwd: dir,
+            tmux: null,
+            terminal: "term_eff",
+            targets: { flash: { terminal: "term_flash" } },
+          },
+        },
+      }),
+    );
+    const missing = runBridge(
+      ["--dispatch", "goal", "minecraft", "fix the nether", "--target", "flash", "--dry-run", "--workers-file", workers],
+      { ...state.env, SPECTRE_PROC_ROOT: join(dir, "no-proc") },
+    );
+    assert.equal(missing.code, 1, missing.stdout);
+    const verdict = JSON.parse(missing.stdout.trim());
+    assert.equal(verdict.evt, "dispatch_flash_unavailable");
+    assert.ok(!String(verdict.line || "").includes("/goal"));
+  } finally {
+    state.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("dispatch CLI: flash claims first, writes packets/<dispatch_id>.txt, sends that line", () => {
+  const dir = mkdtempSync(join(tmpdir(), "spectre-flash-send-"));
+  const bin = join(dir, "bin");
+  const state = startStateServer(dir, "");
+  const bits = writeFlashBits(dir);
+  try {
+    mkdirSync(bin, { recursive: true });
+    const workers = join(dir, "workers.json");
+    writeFileSync(
+      workers,
+      JSON.stringify({
+        workers: {
+          minecraft: {
+            cwd: dir,
+            tmux: null,
+            terminal: "term_eff",
+            targets: { flash: { terminal: "term_flash" } },
+          },
+        },
+      }),
+    );
+    const sentLog = join(dir, "sent.log");
+    writeFileSync(
+      join(bin, "orca-ide"),
+      "#!/bin/sh\n" +
+        'if [ "$1" = "terminal" ] && [ "$2" = "list" ]; then\n' +
+        `  printf '%s' '{"ok":true,"result":{"terminals":[{"handle":"term_flash","worktreePath":"${dir}","connected":true,"writable":true},{"handle":"term_eff","worktreePath":"${dir}","connected":true,"writable":true}]}}'\n` +
+        "else\n" +
+        `  printf '%s\\n' "$*" >> "${sentLog}"\n` +
+        "  printf '%s' '{\"ok\":true}'\n" +
+        "fi\n",
+      { mode: 0o755 },
+    );
+    const env = { PATH: `${bin}:${process.env.PATH}`, ...state.env, ...bits.env };
+    const ok = runBridge(
+      ["--dispatch", "goal", "minecraft", "fix the nether", "--target", "flash", "--workers-file", workers],
+      env,
+    );
+    assert.equal(ok.code, 0, `${ok.stderr}${ok.stdout}`);
+    const verdict = JSON.parse(ok.stdout.trim());
+    assert.equal(verdict.evt, "dispatch_sent");
+    assert.equal(verdict.terminal, "term_flash");
+    assert.ok(verdict.dispatch_id, verdict);
+    assert.match(verdict.line, /^\/usr\/local\/bin\/dsh-clinepass --file /);
+    assert.ok(!verdict.line.includes("/goal"));
+    assert.ok(!verdict.line.includes("fix the nether"));
+    const packet = join(bits.packets, `${verdict.dispatch_id}.txt`);
+    assert.equal(readFileSync(packet, "utf8").trim(), "fix the nether");
+    const sent = readFileSync(sentLog, "utf8");
+    assert.match(sent, new RegExp(`--terminal term_flash`));
+    assert.match(sent, new RegExp(`${verdict.dispatch_id}\\.txt`));
+    assert.equal(sent.includes("/goal"), false);
+    const names = readdirSync(bits.packets).filter((n) => n.endsWith(".txt"));
+    assert.deepEqual(names, [`${verdict.dispatch_id}.txt`]);
+  } finally {
+    state.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
 
 test("dispatch CLI: plan plus-burn refuses without terminal create", () => {
   const dir = mkdtempSync(join(tmpdir(), "spectre-plan-"));

@@ -30,6 +30,7 @@ import {
   readFileSync,
   realpathSync,
   renameSync,
+  statSync,
   writeFileSync,
 } from "node:fs";
 import { homedir } from "node:os";
@@ -574,10 +575,163 @@ export function dispatchLine(builtin, goalText, clauseText) {
 
 export const FLASH_FILE_PREFIX = "/usr/local/bin/dsh-clinepass --file ";
 export const FLASH_PACKET_DIR = "/home/person/.local/state/remote-agent/packets";
+export const FLASH_WRAPPER = "/usr/local/bin/dsh-clinepass";
+export const FLASH_KEY_DEFAULT = join(homedir(), ".config/fullmoon-agent-control/cline_api_key");
+export const FLASH_DSH_DEFAULT = join(homedir(), ".local/share/deepseek-harness-venv/bin/dsh");
 
-export function flashSendLine(dispatchId) {
-  const id = String(dispatchId || "dry-run").replace(/[^A-Za-z0-9._-]/g, "");
-  return `${FLASH_FILE_PREFIX}${FLASH_PACKET_DIR}/${id}.txt`;
+export function packetDir(env = process.env) {
+  const override = String((env && env.SPECTRE_PACKET_DIR) || "").trim();
+  return override || FLASH_PACKET_DIR;
+}
+
+export function sanitizeDispatchId(dispatchId) {
+  return String(dispatchId || "").replace(/[^A-Za-z0-9._-]/g, "");
+}
+
+export function flashSendLine(dispatchId, env = process.env) {
+  const id = sanitizeDispatchId(dispatchId) || "dry-run";
+  return `${FLASH_FILE_PREFIX}${packetDir(env)}/${id}.txt`;
+}
+
+export function flashPin(entry) {
+  const flash = entry && entry.targets && entry.targets.flash;
+  return String((flash && flash.terminal) || "");
+}
+
+export function writeFlashPacket(dispatchId, text, env = process.env) {
+  const id = sanitizeDispatchId(dispatchId);
+  if (!id) return { ok: false, error: "missing dispatch_id" };
+  const dir = packetDir(env);
+  try {
+    mkdirSync(dir, { recursive: true });
+    const dest = join(dir, `${id}.txt`);
+    const tmp = join(dir, `${id}.txt.tmp`);
+    writeFileSync(tmp, `${oneLine(text)}\n`, { encoding: "utf8", mode: 0o600 });
+    renameSync(tmp, dest);
+    return { ok: true, path: dest };
+  } catch (err) {
+    return { ok: false, error: String((err && err.message) || err) };
+  }
+}
+
+function _readProcCmd(procRoot, pid) {
+  try {
+    return String(readFileSync(join(procRoot, String(pid), "cmdline"))).replace(/\0/g, " ");
+  } catch {
+    return "";
+  }
+}
+
+function _readProcHandle(procRoot, pid) {
+  try {
+    const raw = String(readFileSync(join(procRoot, String(pid), "environ")));
+    const m = raw.match(/ORCA_TERMINAL_HANDLE=([^\0]*)/);
+    return m ? m[1] : "";
+  } catch {
+    return "";
+  }
+}
+
+function _readProcPpid(procRoot, pid) {
+  try {
+    const text = readFileSync(join(procRoot, String(pid), "stat"), "utf8");
+    const rparen = text.lastIndexOf(")");
+    const fields = text.slice(rparen + 2).trim().split(/\s+/);
+    return parseInt(fields[1], 10);
+  } catch {
+    return null;
+  }
+}
+
+function _cmdIsDsh(cmd) {
+  return /\bdsh\b/.test(cmd) && /--profile\s+(headless|tui)/.test(cmd);
+}
+
+export function pinTreeHasDsh(pin, procRoot = "/proc") {
+  const wanted = String(pin || "");
+  if (!wanted) return true;
+  let ents;
+  try {
+    ents = readdirSync(procRoot, { withFileTypes: true });
+  } catch {
+    return true;
+  }
+  const pids = ents.filter((e) => e.isDirectory() && /^\d+$/.test(e.name)).map((e) => e.name);
+  const tree = new Set();
+  for (const pid of pids) {
+    if (_readProcHandle(procRoot, pid) === wanted) tree.add(pid);
+  }
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const pid of pids) {
+      if (tree.has(pid)) continue;
+      const ppid = _readProcPpid(procRoot, pid);
+      if (ppid != null && tree.has(String(ppid))) {
+        tree.add(pid);
+        changed = true;
+      }
+    }
+  }
+  for (const pid of tree) {
+    if (_cmdIsDsh(_readProcCmd(procRoot, pid))) return true;
+  }
+  return false;
+}
+
+export function flashReady(entry, env = process.env) {
+  const wrapper = String(env.SPECTRE_DSH_WRAPPER || FLASH_WRAPPER);
+  const key = String(env.SPECTRE_DSH_KEY || FLASH_KEY_DEFAULT);
+  const dsh = String(env.SPECTRE_DSH_BIN || FLASH_DSH_DEFAULT);
+  const pin = flashPin(entry);
+  if (!pin) {
+    return { ok: false, evt: "dispatch_flash_unavailable", detail: "flash pin missing (targets.flash.terminal)" };
+  }
+  try {
+    const st = statSync(wrapper);
+    if ((st.mode & 0o777) !== 0o755) {
+      return {
+        ok: false,
+        evt: "dispatch_flash_unavailable",
+        detail: `wrapper mode ${(st.mode & 0o777).toString(8)} is not 755`,
+      };
+    }
+  } catch {
+    return { ok: false, evt: "dispatch_flash_unavailable", detail: `wrapper missing (${wrapper})` };
+  }
+  try {
+    const st = statSync(key);
+    if ((st.mode & 0o777) !== 0o600) {
+      return {
+        ok: false,
+        evt: "dispatch_flash_unavailable",
+        detail: `key mode ${(st.mode & 0o777).toString(8)} is not 600`,
+      };
+    }
+  } catch {
+    return { ok: false, evt: "dispatch_flash_unavailable", detail: "cline key missing" };
+  }
+  try {
+    const st = statSync(dsh);
+    if (!(st.mode & 0o111)) {
+      return { ok: false, evt: "dispatch_flash_unavailable", detail: `dsh not executable (${dsh})` };
+    }
+  } catch {
+    return { ok: false, evt: "dispatch_flash_unavailable", detail: `dsh missing (${dsh})` };
+  }
+  const procRoot = String(env.SPECTRE_PROC_ROOT || "/proc");
+  if (pinTreeHasDsh(pin, procRoot)) {
+    return { ok: false, evt: "dispatch_flash_busy", detail: "dsh already in the Flash pin tree" };
+  }
+  return { ok: true, pin, wrapper, key, dsh };
+}
+
+export function finalizeFlashInjection(claimed, goalText, env = process.env) {
+  const id = claimed && claimed.claim && claimed.claim.dispatch_id;
+  if (!id) return { ok: false, error: "claim missing dispatch_id" };
+  const written = writeFlashPacket(id, goalText, env);
+  if (!written.ok) return written;
+  return { ok: true, line: flashSendLine(id, env), dispatch_id: id, packet: written.path };
 }
 
 export function injectionLine({ builtin, target, goalText, clauseText, dispatchId }) {
@@ -1395,6 +1549,18 @@ async function claimDispatch(worker, builtin, snapshot, target) {
   }
 }
 
+async function bindFlashAfterClaim(opts, targetName, claimed, injected) {
+  if (!(opts.builtin === "goal" && targetName === "flash")) {
+    return { ok: true, injected, dispatch_id: null };
+  }
+  const made = finalizeFlashInjection(claimed, opts.text);
+  if (!made.ok) {
+    await finishClaim(claimed.claim, false, made.error);
+    return { ok: false, evt: "dispatch_flash_packet_failed", error: made.error };
+  }
+  return { ok: true, injected: made.line, dispatch_id: made.dispatch_id, packet: made.packet };
+}
+
 async function sendKeysToWorker(target, text) {
   const literal = await runCommandCapture(TMUX_BIN, ["send-keys", "-l", "-t", target, text], 10_000);
   if (!literal.ok) return { ok: false, error: literal.error };
@@ -1475,16 +1641,22 @@ async function dispatchCli(argv) {
     }
   }
 
-  let injected;
   const targetName = opts.target || "efficient";
+  if (opts.builtin === "goal" && targetName === "flash") {
+    const ready = flashReady(entry);
+    if (!ready.ok) {
+      audit({ evt: ready.evt, worker: opts.worker, origin: opts.operator, detail: ready.detail });
+      return { ok: false, evt: ready.evt, detail: ready.detail, code: 1 };
+    }
+  }
+
+  let injected;
   if (opts.builtin === "plan") {
     injected = injectionLine({ builtin: "plan", goalText: opts.text });
   } else if (opts.builtin === "goal" && targetName === "flash") {
-    injected = injectionLine({
-      builtin: "goal",
-      target: "flash",
-      dispatchId: opts.text || "dry-run",
-    });
+    // Placeholder for paneRefusal / dry-run. Live send overwrites after claim
+    // writes packets/<dispatch_id>.txt named after the claimed id.
+    injected = flashSendLine("dry-run");
   } else if (opts.builtin === "goal") {
     const clause = loadClause();
     if (!clause.text) {
@@ -1535,7 +1707,8 @@ async function dispatchCli(argv) {
       audit({ evt: "dispatch_orca_failed", worker: opts.worker, origin: opts.operator, error: listed.error });
       return { ok: false, evt: "dispatch_orca_failed", detail: `cannot list orca terminals for ${opts.worker}: ${listed.error}`, code: 1 };
     }
-    const pick = pickNativeTerminal(listed.terminals, entry.cwd, entry.terminal);
+    const pin = targetName === "flash" ? flashPin(entry) : entry.terminal;
+    const pick = pickNativeTerminal(listed.terminals, entry.cwd, pin);
     if (!pick.ok) {
       audit({ evt: "dispatch_orca_refused", worker: opts.worker, origin: opts.operator, detail: pick.detail });
       return { ok: false, evt: "dispatch_orca_refused", detail: pick.detail, code: 1 };
@@ -1560,6 +1733,14 @@ async function dispatchCli(argv) {
       audit({ evt: "dispatch_claim_failed", worker: opts.worker, origin: opts.operator, error: claimed.error });
       return { ok: false, evt: "dispatch_claim_failed", detail: `claim refused for ${opts.worker}: ${claimed.error}`, code: 1 };
     }
+    const bound = await bindFlashAfterClaim(opts, targetName, claimed, injected);
+    if (!bound.ok) {
+      audit({ evt: bound.evt, worker: opts.worker, origin: opts.operator, error: bound.error });
+      return { ok: false, evt: bound.evt, detail: bound.error, code: 1 };
+    }
+    injected = bound.injected;
+    if (bound.dispatch_id) base.dispatch_id = bound.dispatch_id;
+    base.chars = injected.length;
     const sent = await sendToNativeTerminal(pick.terminal.handle, injected);
     await finishClaim(claimed.claim, sent.ok, sent.error);
     if (!sent.ok) {
@@ -1611,6 +1792,14 @@ async function dispatchCli(argv) {
     audit({ evt: "dispatch_claim_failed", worker: opts.worker, origin: opts.operator, error: claimed.error });
     return { ok: false, evt: "dispatch_claim_failed", detail: `claim refused for ${opts.worker}: ${claimed.error}`, code: 1 };
   }
+  const bound = await bindFlashAfterClaim(opts, targetName, claimed, injected);
+  if (!bound.ok) {
+    audit({ evt: bound.evt, worker: opts.worker, origin: opts.operator, error: bound.error });
+    return { ok: false, evt: bound.evt, detail: bound.error, code: 1 };
+  }
+  injected = bound.injected;
+  if (bound.dispatch_id) base.dispatch_id = bound.dispatch_id;
+  base.chars = injected.length;
   const sent = await sendKeysToWorker(target, injected);
   await finishClaim(claimed.claim, sent.ok, sent.error);
   if (!sent.ok) {
