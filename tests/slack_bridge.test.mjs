@@ -2,7 +2,7 @@
 // Unit tests for the Slack Socket Mode bridge policy and guards.
 import assert from "node:assert/strict";
 import { execFileSync, spawn, spawnSync } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { test } from "node:test";
@@ -989,6 +989,7 @@ test("writeFlashPacket: names the file after the claimed dispatch_id", () => {
     assert.equal(written.ok, true);
     assert.equal(written.path, join(dir, "d-claimed1.txt"));
     assert.equal(readFileSync(written.path, "utf8"), "fix the nether next\n");
+    assert.equal(statSync(written.path).mode & 0o777, 0o600);
     const made = finalizeFlashInjection({ claim: { dispatch_id: "d-claimed1" } }, "fix the nether", env);
     assert.equal(made.ok, true);
     assert.equal(made.dispatch_id, "d-claimed1");

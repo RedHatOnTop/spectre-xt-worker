@@ -24,6 +24,7 @@
 import { execFile, spawn } from "node:child_process";
 import {
   appendFileSync,
+  chmodSync,
   existsSync,
   mkdirSync,
   readdirSync,
@@ -606,7 +607,8 @@ export function writeFlashPacket(dispatchId, text, env = process.env) {
     mkdirSync(dir, { recursive: true });
     const dest = join(dir, `${id}.txt`);
     const tmp = join(dir, `${id}.txt.tmp`);
-    writeFileSync(tmp, `${oneLine(text)}\n`, { encoding: "utf8", mode: 0o600 });
+    writeFileSync(tmp, `${oneLine(text)}\n`, { encoding: "utf8" });
+    chmodSync(tmp, 0o600);
     renameSync(tmp, dest);
     return { ok: true, path: dest };
   } catch (err) {
