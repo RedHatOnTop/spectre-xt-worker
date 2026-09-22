@@ -19,11 +19,21 @@ def worker_state(state: dict, worker: str, value: dict) -> dict:
 
 
 def validate_workers(workers: dict) -> None:
+    allowed_class = {'toplevel', 'side'}
     for name, entry in workers.items():
         if not isinstance(entry, dict) or not Path(entry.get('cwd', '')).is_absolute():
             raise ValueError(f'{name}: absolute cwd required')
+        worker_class = entry.get('class')
+        if worker_class is None:
+            worker_class = 'toplevel' if (entry.get('planner') or entry.get('seat')) else 'side'
+        if worker_class not in allowed_class:
+            raise ValueError(f'{name}: class must be toplevel or side')
         if entry.get('planner') and name != 'minecraft':
             raise ValueError('planner is legal only on minecraft')
+        if entry.get('planner') and worker_class != 'toplevel':
+            raise ValueError('planner requires class=toplevel')
+        if entry.get('seat') and worker_class != 'toplevel':
+            raise ValueError('seat is legal only on toplevel workers')
 
 
 def notify(run, env: dict, worker: str, reason: str, *, channel='lobby') -> dict:

@@ -2573,6 +2573,11 @@ account. Kimi free (24h window from first call, unpublished ceiling — track vi
 `control_plane/cline_free.py`) outranks Plus. Plus is last resort (astra xhigh
 burns the 5h window in under 30 minutes). Side-project top-level stays ChatGPT
 via the Devcodex connector plus Grokbot — kimi seat is minecraft-only.
+Seat ownership lives in `control_plane/seat.py` (`toplevel/<worker>/seat.json`
++ `brief.md`); warm handoff is capped at 2/day and is brief-based, never a
+cross-harness resume. Registry workers carry `class: toplevel|side`. Free-tier
+burn policy is `control_plane/quota.py` (free first for implement/mechanical
+only; review/blocker stay paid).
 
 In `~/.codex/modes/providers.json`, both `anyrouter` and `agentrouter` require an
 HTTPS `base_url`, `wire_api` (`responses` or `chat`), and an explicitly configured

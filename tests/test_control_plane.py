@@ -89,7 +89,8 @@ class LoopRuntimeTest(unittest.TestCase):
         self.store = Store(self.root / 'state.sqlite')
         self.client = StoreClient(self.store)
         self.path = self.root / 'loop.json'
-        self.entry = {'cwd': str(self.root), 'planner': {'terminal': 'term_astra'}}
+        self.entry = {'cwd': str(self.root), 'class': 'toplevel',
+                      'planner': {'terminal': 'term_astra'}}
         self.env = {'SPECTRE_LOOP': '1', 'ASTRA_ENABLED': '1',
                     'SPECTRE_PACKET_DIR': str(self.root / 'packets'),
                     'SPECTRE_PROVIDER_STATE': str(self.root / 'provider.json')}
