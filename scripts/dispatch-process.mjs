@@ -15,8 +15,8 @@ export function processRole(argv) {
   const model = option(argv, ["-m", "--model"]);
   if (["codex", "codex-cli", "codex.js"].includes(exe) && model === "gpt-6-astra") return "astra";
   if (["qodercli", "qoder", "qoder-efficient"].includes(exe) && String(model).toLowerCase() === "efficient") return "efficient";
-  if (exe === "dsh" && ["headless", "tui", "minimal"].includes(option(argv, ["--profile"]))) return "flash";
-  if (["mimo", "mimocode"].includes(exe)) return "mimo";
+  if (exe === "dsh-clinepass" || (exe === "dsh" && ["headless", "tui", "minimal"].includes(option(argv, ["--profile"])))) return "flash";
+  if (["mimo-clinepass", "mimo", "mimocode"].includes(exe)) return "mimo";
   if (["bash", "sh", "zsh", "fish", "dash"].includes(exe)) return "shell";
   return null;
 }

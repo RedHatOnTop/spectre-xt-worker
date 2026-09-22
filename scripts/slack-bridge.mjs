@@ -22,18 +22,7 @@
 // Pure helpers are exported for tests/slack_bridge.test.mjs.
 
 import { execFile, spawn } from "node:child_process";
-import {
-  appendFileSync,
-  chmodSync,
-  existsSync,
-  mkdirSync,
-  readdirSync,
-  readFileSync,
-  realpathSync,
-  renameSync,
-  statSync,
-  writeFileSync,
-} from "node:fs";
+import { appendFileSync, chmodSync, existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -618,8 +607,10 @@ export function mimoReady(entry, env = process.env) {
   const wrapper = String(env.SPECTRE_MIMO_WRAPPER || MIMO_WRAPPER);
   const bin = String(env.SPECTRE_MIMO_BIN || join(homedir(), ".mimocode/bin/mimo"));
   const pin = mimoPin(entry);
-  if (!pin) {
-    return { ok: false, evt: "dispatch_mimo_unavailable", detail: "mimo pin missing (targets.mimo.terminal)" };
+  if (!pin && packetSurface(env) === "job") {
+    // job surface creates its own terminal; a registry pin is optional
+  } else if (!pin) {
+    return { ok: false, evt: "dispatch_mimo_unavailable", detail: "mimo pin missing (targets.mimo.terminal) — run ensurePacketPin" };
   }
   try {
     const st = statSync(wrapper);
@@ -639,6 +630,118 @@ export function mimoReady(entry, env = process.env) {
   }
   return { ok: true, line: mimoSendLine("dry-run", env), pin };
 }
+
+export const PACKET_SHELL_TITLES = { flash: "flash-packets", mimo: "mimo-packets" };
+
+export function packetSurface(env = process.env) {
+  const raw = String(env.SPECTRE_PACKET_SURFACE || "pin").trim().toLowerCase();
+  return raw === "job" ? "job" : "pin";
+}
+
+export function packetShellTitle(role) {
+  return PACKET_SHELL_TITLES[String(role)] || `${String(role || "packet")}-packets`;
+}
+
+export function packetJobTitle(role, dispatchId) {
+  const id = sanitizeDispatchId(dispatchId) || "pending";
+  return `${String(role || "packet")} ${id}`;
+}
+
+async function createOrcaTerminal({ cwd, title, command, focus = true }) {
+  const args = ["terminal", "create", "--worktree", `path:${cwd}`, "--title", String(title || ""), "--command", String(command || ""), "--json"];
+  if (focus) args.splice(args.length - 1, 0, "--focus");
+  const result = await runCommandCapture(ORCA_BIN, args, 20_000);
+  if (!result.ok) return { ok: false, error: result.error || "orca create failed" };
+  let payload = null;
+  try {
+    payload = JSON.parse(result.stdout.trim());
+  } catch {
+    return { ok: false, error: "bad orca create response" };
+  }
+  const resultBody = (payload && payload.result) || {};
+  const handle = (resultBody.terminal || resultBody).handle;
+  if (typeof handle !== "string" || !handle.startsWith("term_")) {
+    return { ok: false, error: "orca_handle_missing; inspect terminal list before retry" };
+  }
+  return { ok: true, handle, payload };
+}
+
+async function switchOrcaTerminal(handle) {
+  if (!handle) return { ok: true, skipped: true };
+  const result = await runCommandCapture(ORCA_BIN, ["terminal", "switch", "--terminal", String(handle), "--json"], 15_000);
+  return result.ok ? { ok: true } : { ok: false, error: result.error };
+}
+
+/** Live pin for a packet role, creating a visible Orca shell when missing. */
+export async function ensurePacketPin(entry, role, cwd) {
+  const listed = await listOrcaTerminals();
+  if (!listed.ok) return { ok: false, evt: "dispatch_orca_failed", detail: listed.error };
+  const wanted = role === "mimo" ? mimoPin(entry) : flashPin(entry);
+  const title = packetShellTitle(role);
+  const live = listed.terminals.filter(
+    (term) => term && term.worktreePath === cwd && term.connected === true && term.writable === true,
+  );
+  const byPin = wanted ? live.find((term) => term.handle === wanted) : null;
+  if (byPin) return { ok: true, handle: byPin.handle, created: false };
+  const byTitle = live.find((term) => String(term.title || "") === title);
+  if (byTitle) return { ok: true, handle: byTitle.handle, created: false };
+  const created = await createOrcaTerminal({
+    cwd,
+    title,
+    command: "bash",
+    focus: true,
+  });
+  if (!created.ok) {
+    return { ok: false, evt: "dispatch_orca_failed", detail: created.error };
+  }
+  return { ok: true, handle: created.handle, created: true, title };
+}
+
+/** Per-packet visible job tab running the wrapper itself. */
+export async function startPacketJob({ role, cwd, line, dispatchId }) {
+  const title = packetJobTitle(role, dispatchId);
+  const created = await createOrcaTerminal({ cwd, title, command: line, focus: true });
+  if (!created.ok) {
+    return { ok: false, evt: "dispatch_orca_failed", detail: created.error };
+  }
+  return { ok: true, handle: created.handle, title, created: true };
+}
+
+export function applyPacketPin(entry, role, handle) {
+  const targets = { ...((entry && entry.targets) || {}) };
+  const current = { ...((targets && targets[role]) || {}), terminal: handle };
+  if (role === "flash" && !current.wrapper) {
+    current.wrapper = MIMO_WRAPPER.replace("mimo-clinepass", "dsh-clinepass");
+    current.harness = "dsh-clinepass";
+    current.profile = "headless";
+    current.model = current.model || "cline-pass/deepseek-v4.1-flash";
+  }
+  if (role === "mimo" && !current.wrapper) {
+    current.wrapper = MIMO_WRAPPER;
+    current.harness = "mimo-clinepass";
+    current.model = current.model || "mimo-v2.6-pro";
+  }
+  targets[role] = current;
+  return { ...entry, targets };
+}
+
+function persistWorkersPin(workersFile, workerName, entry) {
+  if (!workersFile) return { ok: false, error: "no workers file" };
+  try {
+    const payload = JSON.parse(readFileSync(workersFile, "utf8"));
+    if (!payload || typeof payload.workers !== "object" || !payload.workers) {
+      return { ok: false, error: "no workers map" };
+    }
+    const next = { ...payload, workers: { ...payload.workers, [workerName]: entry } };
+    const tmp = `${workersFile}.tmp`;
+    writeFileSync(tmp, `${JSON.stringify(next, null, 2)}\n`, { mode: 0o600 });
+    renameSync(tmp, workersFile);
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, error: String((err && err.message) || err) };
+  }
+}
+
 
 export function writeFlashPacket(dispatchId, text, env = process.env) {
   const id = sanitizeDispatchId(dispatchId);
@@ -727,8 +830,10 @@ export function flashReady(entry, env = process.env) {
   const key = String(env.SPECTRE_DSH_KEY || FLASH_KEY_DEFAULT);
   const dsh = String(env.SPECTRE_DSH_BIN || FLASH_DSH_DEFAULT);
   const pin = flashPin(entry);
-  if (!pin) {
-    return { ok: false, evt: "dispatch_flash_unavailable", detail: "flash pin missing (targets.flash.terminal)" };
+  if (!pin && packetSurface(env) === "job") {
+    // job surface creates its own terminal; a registry pin is optional
+  } else if (!pin) {
+    return { ok: false, evt: "dispatch_flash_unavailable", detail: "flash pin missing (targets.flash.terminal) — run ensurePacketPin or spectre-pin-sync --flash-terminal" };
   }
   try {
     const st = statSync(wrapper);
@@ -1666,7 +1771,7 @@ async function dispatchCli(argv) {
       code: 1,
     };
   }
-  const entry = workers[opts.worker];
+  let entry = workers[opts.worker];
   if (!entry) {
     const known = Object.keys(workers).sort().join(", ");
     return { ok: false, evt: "dispatch_unknown_worker", detail: `unknown worker ${opts.worker} (known: ${known})`, code: 1 };
@@ -1689,8 +1794,25 @@ async function dispatchCli(argv) {
   }
 
   const targetName = opts.target || "efficient";
+  const surface = packetSurface();
+  let ensuredPin = null;
+  if (opts.builtin === "goal" && (targetName === "flash" || targetName === "mimo") && surface === "pin") {
+    const existingPin = targetName === "mimo" ? mimoPin(entry) : flashPin(entry);
+    if (existingPin) {
+      ensuredPin = existingPin;
+    } else {
+      const ensured = await ensurePacketPin(entry, targetName, entry.cwd);
+      if (!ensured.ok) {
+        audit({ evt: ensured.evt, worker: opts.worker, origin: opts.operator, detail: ensured.detail });
+        return { ok: false, evt: ensured.evt, detail: ensured.detail, code: 1 };
+      }
+      ensuredPin = ensured.handle;
+      entry = applyPacketPin(entry, targetName, ensured.handle);
+      persistWorkersPin(opts.workersFile || workersFile, opts.worker, entry);
+    }
+  }
   if (opts.builtin === "goal" && (targetName === "flash" || targetName === "mimo")) {
-    const ready = targetName === "mimo" ? mimoReady(entry) : flashReady(entry);
+    const ready = targetName === "mimo" ? mimoReady(entry, process.env) : flashReady(entry, process.env);
     if (!ready.ok) {
       audit({ evt: ready.evt, worker: opts.worker, origin: opts.operator, detail: ready.detail });
       return { ok: false, evt: ready.evt, detail: ready.detail, code: 1 };
@@ -1769,8 +1891,8 @@ async function dispatchCli(argv) {
       return { ok: false, evt: "dispatch_orca_failed", detail: `cannot list orca terminals for ${opts.worker}: ${listed.error}`, code: 1 };
     }
     const pin = opts.builtin === "plan" ? entry.planner.terminal
-      : targetName === "flash" ? flashPin(entry)
-      : targetName === "mimo" ? mimoPin(entry)
+      : targetName === "flash" ? (ensuredPin || flashPin(entry))
+      : targetName === "mimo" ? (ensuredPin || mimoPin(entry))
       : (entry.targets?.efficient?.terminal || entry.terminal);
     const pick = pickNativeTerminal(listed.terminals, entry.cwd, pin);
     if (!pick.ok) {
@@ -1819,10 +1941,35 @@ async function dispatchCli(argv) {
     injected = bound.injected;
     if (bound.dispatch_id) base.dispatch_id = bound.dispatch_id;
     base.chars = injected.length;
-    const sent = await sendToNativeTerminal(pick.terminal.handle, injected);
-    await finishClaim(claimed.claim, sent.ok, sent.error);
+    let sent = { ok: false, error: "not sent" };
+    let usedTerminal = pick.terminal.handle;
+    if (opts.builtin === "goal" && (targetName === "flash" || targetName === "mimo") && surface === "job") {
+      const job = await startPacketJob({
+        role: targetName,
+        cwd: entry.cwd,
+        line: injected,
+        dispatchId: bound.dispatch_id,
+      });
+      if (!job.ok) {
+        await finishClaim(claimed.claim, false, job.detail || job.error);
+        return { ok: false, evt: job.evt || "dispatch_orca_failed", detail: job.detail || job.error, code: 1 };
+      }
+      usedTerminal = job.handle;
+      base.terminal = usedTerminal;
+      base.surface = "job";
+      sent = { ok: true };
+      await finishClaim(claimed.claim, true, null);
+    } else {
+      sent = await sendToNativeTerminal(pick.terminal.handle, injected);
+      await finishClaim(claimed.claim, sent.ok, sent.error);
+      // Reveal only packet harness tabs (flash/mimo). Plan/efficient must not steal focus.
+      if (sent.ok && (targetName === "flash" || targetName === "mimo")) {
+        base.surface = "pin";
+        await switchOrcaTerminal(pick.terminal.handle);
+      }
+    }
     if (!sent.ok) {
-      audit({ evt: "dispatch_send_failed", worker: opts.worker, terminal: pick.terminal.handle, origin: opts.operator, error: sent.error });
+      audit({ evt: "dispatch_send_failed", worker: opts.worker, terminal: usedTerminal, origin: opts.operator, error: sent.error });
       return { ok: false, evt: "dispatch_send_failed", detail: `orca terminal send failed for ${pick.terminal.handle}: ${sent.error}`, code: 1 };
     }
     audit({ evt: "dispatch_sent", ...base, action_id: claimed.claim.action_id });

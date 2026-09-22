@@ -241,7 +241,9 @@ class InventoryTest(unittest.TestCase):
         self.assertIsNone(inventory.model(['bash', '-c', 'codex -m gpt-6-astra']))
         self.assertIsNone(inventory.model(['qodercli', '-m', 'Auto', 'Efficient']))
         self.assertEqual(inventory.model(['dsh', '--profile', 'headless']), 'flash')
+        self.assertEqual(inventory.model(['dsh-clinepass', '--file', 'x.txt']), 'flash')
         self.assertEqual(inventory.model(['mimo', 'run', 'task']), 'mimo')
+        self.assertEqual(inventory.model(['mimo-clinepass', '--file', 'x.txt']), 'mimo')
 
 
 if __name__ == '__main__':

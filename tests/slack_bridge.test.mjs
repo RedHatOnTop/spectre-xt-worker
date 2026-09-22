@@ -31,6 +31,12 @@ import {
   flashPin,
   finalizeFlashInjection,
   injectionLine,
+  ensurePacketPin,
+  startPacketJob,
+  packetSurface,
+  packetShellTitle,
+  packetJobTitle,
+  applyPacketPin,
   pinTreeHasDsh,
   writeFlashPacket,
   formatThreadContext,
@@ -966,6 +972,57 @@ test("parseDispatchArgs: supervisor CLI shape", () => {
   assert.equal(parseDispatchArgs(["goal", "q", "fix --dry-run bug"]).text, "fix --dry-run bug");
 });
 
+test("packetSurface: pin by default, job opt-in", () => {
+  assert.equal(packetSurface({}), "pin");
+  assert.equal(packetSurface({ SPECTRE_PACKET_SURFACE: "job" }), "job");
+  assert.equal(packetSurface({ SPECTRE_PACKET_SURFACE: "nope" }), "pin");
+  assert.equal(packetShellTitle("flash"), "flash-packets");
+  assert.equal(packetShellTitle("mimo"), "mimo-packets");
+  assert.equal(packetJobTitle("mimo", "d-1"), "mimo d-1");
+  const entry = applyPacketPin({ targets: {} }, "mimo", "term_9");
+  assert.equal(entry.targets.mimo.terminal, "term_9");
+  assert.equal(entry.targets.mimo.wrapper, "/usr/local/bin/mimo-clinepass");
+});
+
+test("ensurePacketPin: reuses a live pin and creates flash-packets when missing", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "spectre-pin-ensure-"));
+  const bin = join(dir, "bin");
+  mkdirSync(bin);
+  const log = join(dir, "orca.log");
+  const created = join(dir, "created");
+  const script = [
+    "#!/bin/sh",
+    'printf "%s\\n" "$*" >> ' + JSON.stringify(log),
+    'if [ "$1" = "terminal" ] && [ "$2" = "list" ]; then',
+    '  if [ -f ' + JSON.stringify(created) + ' ]; then',
+    "    printf '%s' " + JSON.stringify(JSON.stringify({ ok: true, result: { terminals: [{ handle: "term_new", worktreePath: dir, connected: true, writable: true, title: "flash-packets" }] } })),
+    "  else",
+    "    printf '%s' " + JSON.stringify(JSON.stringify({ ok: true, result: { terminals: [] } })),
+    "  fi",
+    'elif [ "$1" = "terminal" ] && [ "$2" = "create" ]; then',
+    '  touch ' + JSON.stringify(created),
+    "  printf '%s' " + JSON.stringify(JSON.stringify({ ok: true, result: { terminal: { handle: "term_new" } } })),
+    "else",
+    "  printf '%s' '{\"ok\":true}'",
+    "fi",
+  ].join("\n");
+  writeFileSync(join(bin, "orca-ide"), script, { mode: 0o755 });
+  const prev = process.env.PATH;
+  process.env.PATH = `${bin}:${prev}`;
+  try {
+    const first = await ensurePacketPin({}, "flash", dir);
+    assert.equal(first.ok, true, JSON.stringify(first));
+    assert.equal(first.created, true);
+    assert.equal(first.handle, "term_new");
+    const second = await ensurePacketPin({ targets: { flash: { terminal: "term_new" } } }, "flash", dir);
+    assert.equal(second.ok, true, JSON.stringify(second));
+    assert.equal(second.created, false);
+  } finally {
+    process.env.PATH = prev;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("injectionLine: mimo never types /goal and targets mimo-clinepass", () => {
   const mimo = injectionLine({ builtin: "goal", target: "mimo", dispatchId: "m1" });
   assert.ok(mimo.startsWith("/usr/local/bin/mimo-clinepass --file "));
@@ -1290,7 +1347,8 @@ test("dispatch CLI: plan plus-burn refuses without terminal create", () => {
       JSON.stringify({ workers: { minecraft: { cwd: dir, tmux: null, terminal: "term_a" } } }),
     );
     const src = readFileSync(BRIDGE_SCRIPT, "utf8");
-    assert.equal(src.includes("terminal create"), false);
+    assert.equal(src.includes("astra-planner"), false);
+    assert.equal(src.includes("orca-ide terminal create"), false);
     const plus = runBridge(
       ["--dispatch", "plan", "minecraft", "next packet", "--dry-run", "--workers-file", workers],
       { SPECTRE_ASTRA_CMDLINES: "codex -m gpt-6-astra -c model_provider=openai" },

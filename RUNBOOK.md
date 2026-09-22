@@ -2599,7 +2599,17 @@ Provider health never hot-switches a running planner: `provider_restart_required
 requires operator shutdown and relaunch. After an observed Plus rate limit,
 `spectre-codex-provider-health --plus-rate-limited` records the five-hour cooldown.
 
-Create the persistent Flash shell **in Orca**, using the registry's actual cwd:
+Flash and Mimo work surfaces are **auto-provisioned visible Orca terminals**.
+`SPECTRE_PACKET_SURFACE=pin` (default) creates a long-lived `flash-packets` /
+`mimo-packets` bash tab in the worker's worktree on first use (`orca-ide
+terminal create --worktree path:<cwd> --title … --command bash --focus`), then
+types the wrapper line and `terminal switch`es to that tab so the harness
+output is on screen. `SPECTRE_PACKET_SURFACE=job` instead creates one tab per
+packet (`--title "flash <dispatch_id>"` `--command "…/dsh-clinepass --file …"`)
+so each job is its own visible session. Never a bare tmux session.
+
+Create the persistent Flash shell **in Orca** by hand only if auto-provision is
+disabled, using the registry's actual cwd:
 
 ```bash
 orca-ide terminal create --worktree path:<minecraft-cwd> --title flash-packets --command bash
