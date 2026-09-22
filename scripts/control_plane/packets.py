@@ -57,12 +57,16 @@ def validate_packet(item: dict) -> None:
         raise ValueError('invalid packet id')
     if set(item) != {'id', 'assignee', 'kind', 'goal', 'acceptance', 'requires_astra_review'}:
         raise ValueError('unexpected packet fields')
-    if item.get('assignee') not in {'flash', 'efficient'}:
+    if item.get('assignee') not in {'flash', 'mimo', 'efficient'}:
         raise ValueError('invalid packet assignee')
     if item.get('kind') not in {'implement', 'mechanical', 'review', 'blocker'}:
         raise ValueError('invalid packet kind')
     if item['assignee'] == 'efficient' and item['kind'] != 'mechanical':
         raise ValueError('Efficient accepts mechanical packets only')
+    if item['assignee'] == 'flash' and item['kind'] not in {'implement', 'mechanical', 'blocker'}:
+        raise ValueError('Flash accepts implement, mechanical, or blocker')
+    if item['assignee'] == 'mimo' and item['kind'] == 'mechanical':
+        raise ValueError('Mimo does not take mechanical; use flash or efficient')
     if not valid_goal(item.get('goal')):
         raise ValueError('invalid packet goal')
     acceptance = item.get('acceptance')

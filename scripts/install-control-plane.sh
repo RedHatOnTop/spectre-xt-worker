@@ -26,7 +26,8 @@ done
 install -m 0755 "${ROOT}/scripts/native-worker-pin-sync.py" "${DEST}/usr/local/bin/spectre-pin-sync"
 install -m 0755 "${ROOT}/scripts/codex-provider-health.py" "${DEST}/usr/local/bin/spectre-codex-provider-health"
 install -m 0755 "${ROOT}/scripts/slack-bridge.mjs" "${DEST}/usr/local/bin/spectre-slack-bridge"
-install -m 0755 "${ROOT}/scripts/dsh-clinepass" "${ROOT}/scripts/spectre-astra" "${DEST}/usr/local/bin/"
+install -m 0755 "${ROOT}/scripts/dsh-clinepass" "${ROOT}/scripts/mimo-clinepass" \
+  "${ROOT}/scripts/spectre-astra" "${DEST}/usr/local/bin/"
 install -m 0644 "${ROOT}/scripts/worker-state-client.mjs" "${ROOT}/scripts/planner-dispatch.mjs" \
   "${ROOT}/scripts/dispatch-process.mjs" "${DEST}/usr/local/bin/"
 install -m 0644 "${ROOT}/config/astra-plan-prompt.md" "${ROOT}/config/astra-packet.schema.json" \

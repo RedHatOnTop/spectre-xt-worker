@@ -7,7 +7,7 @@ import os
 from pathlib import Path
 import time
 
-from . import providers, runtime
+from . import cline_free, providers, runtime
 from .io import read_json, write_json
 from worker_state.client import StateClient
 from worker_state.qoder_jsonl import load_workers, workers_path
@@ -60,8 +60,11 @@ def provider_main(argv=None):
             output = {**previous, 'ok': False, 'id': 'openai', 'checked_at': now,
                       'cooldown_until': now + providers.PLUS_COOLDOWN}
         else:
+            def kimi_status():
+                return cline_free.status(cline_free.load(), now)
             output = providers.choose(read_json(args.modes / 'providers.json'), previous, now,
-                                      lambda row: providers.probe(row, args.modes))
+                                      lambda row: providers.probe(row, args.modes),
+                                      kimi_fn=kimi_status)
         write_json(args.state, output)
     except (OSError, ValueError) as exc:
         output = {'ok': False, 'error': type(exc).__name__}

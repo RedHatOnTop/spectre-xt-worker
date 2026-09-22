@@ -15,7 +15,8 @@ export function processRole(argv) {
   const model = option(argv, ["-m", "--model"]);
   if (["codex", "codex-cli", "codex.js"].includes(exe) && model === "gpt-6-astra") return "astra";
   if (["qodercli", "qoder", "qoder-efficient"].includes(exe) && String(model).toLowerCase() === "efficient") return "efficient";
-  if (exe === "dsh" && ["headless", "tui"].includes(option(argv, ["--profile"]))) return "flash";
+  if (exe === "dsh" && ["headless", "tui", "minimal"].includes(option(argv, ["--profile"]))) return "flash";
+  if (["mimo", "mimocode"].includes(exe)) return "mimo";
   if (["bash", "sh", "zsh", "fish", "dash"].includes(exe)) return "shell";
   return null;
 }
@@ -45,8 +46,9 @@ export function processes(root = process.env.SPECTRE_PROC_ROOT || "/proc") {
 
 export function nativeProcessGuard(pin, cwd, target, rows = processes()) {
   const tree = rows.filter((row) => row.handle === pin);
-  const wanted = target === "flash" ? "shell" : target;
+  const packetTargets = ["flash", "mimo"];
+  const wanted = packetTargets.includes(target) ? "shell" : target;
   const matched = tree.some((row) => row.role === wanted && row.cwd === cwd);
-  const wrongAgent = tree.some((row) => ["astra", "efficient", "flash"].includes(row.role) && row.role !== wanted);
+  const wrongAgent = tree.some((row) => ["astra", "efficient", "flash", "mimo"].includes(row.role) && row.role !== wanted);
   return matched && !wrongAgent;
 }

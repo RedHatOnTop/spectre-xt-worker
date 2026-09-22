@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run one Flash packet visibly; only the wall timeout terminates its process group."""
+"""Run one Mimo packet visibly; only the wall timeout terminates its process group."""
 from __future__ import annotations
 
 import argparse
@@ -13,9 +13,7 @@ import sys
 import tempfile
 
 WALL_SEC = 6 * 3600
-KEY_FILE = Path.home() / '.config/fullmoon-agent-control/cline_api_key'
-DSH_BIN = Path.home() / '.local/share/deepseek-harness-venv/bin/dsh'
-DSH_HOME = Path.home() / '.local/share/fullmoon-dsh'
+MIMO_BIN = Path.home() / '.mimocode/bin/mimo'
 PACKET_DIR = Path.home() / '.local/state/remote-agent/packets'
 MAX_PACKET_BYTES = 64 * 1024
 
@@ -58,12 +56,11 @@ def stop_group(proc: subprocess.Popen) -> None:
 
 
 def execute(packet: Path, task: str, env: dict, wall: float) -> int:
-    binary = os.environ.get('SPECTRE_DSH_BIN', str(DSH_BIN))
-    profile = os.environ.get('SPECTRE_DSH_PROFILE', 'headless')
+    binary = os.environ.get('SPECTRE_MIMO_BIN', str(MIMO_BIN))
     try:
-        proc = subprocess.Popen([binary, '--profile', profile, task], env=env, start_new_session=True)
+        proc = subprocess.Popen([binary, 'run', task], env=env, start_new_session=True)
     except OSError:
-        print('dsh-clinepass: cannot start dsh', file=sys.stderr)
+        print('mimo-clinepass: cannot start mimo', file=sys.stderr)
         return 127
     def interrupted(signum, frame):
         stop_group(proc)
@@ -80,46 +77,39 @@ def execute(packet: Path, task: str, env: dict, wall: float) -> int:
 
 
 def prepare(packet: Path) -> tuple[str, dict, float]:
-    key = Path(os.environ.get('SPECTRE_DSH_KEY', str(KEY_FILE)))
-    if key.is_symlink() or key.stat().st_mode & 0o777 != 0o600:
-        raise ValueError('ClinePass key must be a private regular file with mode 600')
-    value = key.read_text(encoding='utf-8').strip()
-    if not value:
-        raise ValueError('ClinePass key is empty')
     if packet.stat().st_size > MAX_PACKET_BYTES:
         raise ValueError('packet is too large')
     task = packet.read_text(encoding='utf-8').strip()
     if not task or '\x00' in task:
         raise ValueError('packet text is empty or invalid')
-    wall = float(os.environ.get('SPECTRE_DSH_WALL_SEC', WALL_SEC))
+    wall = float(os.environ.get('SPECTRE_MIMO_WALL_SEC', WALL_SEC))
     if not math.isfinite(wall) or wall <= 0:
         raise ValueError('wall timeout must be positive and finite')
-    env = {**os.environ, 'DSH_HOME': os.environ.get('SPECTRE_DSH_HOME', str(DSH_HOME)),
-           'DSH_TELEMETRY_MODE': 'DISABLED', 'DSH_PERMISSION_MODE': 'danger-full-access',
-           'DSH_REASONING_EFFORT': os.environ.get('SPECTRE_DSH_EFFORT', 'max'),
-           'CLINE_API_KEY': value}
+    env = {**os.environ,
+           'MIMO_TELEMETRY_MODE': 'DISABLED',
+           'MIMO_PERMISSION_MODE': os.environ.get('SPECTRE_MIMO_PERMISSION_MODE', 'danger-full-access')}
     return task, env, wall
 
 
 def main(argv=None) -> int:
-    parser = argparse.ArgumentParser(prog='dsh-clinepass')
+    parser = argparse.ArgumentParser(prog='mimo-clinepass')
     parser.add_argument('--file', required=True)
     args = parser.parse_args(argv)
     try:
         packet = packet_path(args.file)
     except ValueError as exc:
-        print(f'dsh-clinepass: {exc}', file=sys.stderr)
+        print(f'mimo-clinepass: {exc}', file=sys.stderr)
         return 2
     try:
         task, env, wall = prepare(packet)
         code = execute(packet, task, env, wall)
     except (OSError, ValueError):
-        print('dsh-clinepass: invalid packet, key, or timeout configuration', file=sys.stderr)
+        print('mimo-clinepass: invalid packet or timeout configuration', file=sys.stderr)
         code = 2
     try:
         write_exit(packet, code)
     except OSError:
-        print('dsh-clinepass: cannot publish exit status', file=sys.stderr)
+        print('mimo-clinepass: cannot publish exit status', file=sys.stderr)
         return 2
     return code
 

@@ -46,6 +46,7 @@
           "assignee": {
             "enum": [
               "flash",
+              "mimo",
               "efficient"
             ]
           },
@@ -89,6 +90,46 @@
               "properties": {
                 "kind": {
                   "const": "mechanical"
+                }
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "assignee": {
+                  "const": "mimo"
+                }
+              }
+            },
+            "then": {
+              "properties": {
+                "kind": {
+                  "enum": [
+                    "implement",
+                    "review",
+                    "blocker"
+                  ]
+                }
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "assignee": {
+                  "const": "flash"
+                }
+              }
+            },
+            "then": {
+              "properties": {
+                "kind": {
+                  "enum": [
+                    "implement",
+                    "mechanical",
+                    "blocker"
+                  ]
                 }
               }
             }

@@ -35,6 +35,8 @@ class BoundaryTest(unittest.TestCase):
                         {'acceptance': []}, {'acceptance': [42]}, {'requires_astra_review': 'false'}):
             with self.assertRaises(ValueError):
                 packets.validate({**value, 'packets': [{**value['packets'][0], **changed}]}, 'r1')
+        mimo = {**value, 'packets': [{**value['packets'][0], 'assignee': 'mimo', 'kind': 'review'}]}
+        self.assertEqual(packets.validate(mimo, 'r1')[0]['assignee'], 'mimo')
         with self.assertRaises(ValueError):
             packets.validate([], 'r1')
         with self.assertRaises(ValueError):
@@ -100,9 +102,31 @@ class ProviderBoundaryTest(unittest.TestCase):
             with self.assertRaises(ValueError):
                 providers.probe_request(self.provider(**changed))
         registry = {'providers': [{'id': name} for name in providers.RELAYS]}
-        result = providers.choose(registry, {}, 100, lambda row: {'ok': False, 'configured': True})
+        result = providers.choose(registry, {}, 100,
+                                  lambda row: {'ok': False, 'configured': True},
+                                  kimi_fn=lambda: {'ok': False, 'configured': True, 'exhausted': True})
         self.assertEqual(result['id'], 'openai')
         self.assertIsNone(providers.NoRedirect().redirect_request(None, None, 302, '', {}, 'https://evil'))
+
+
+class ClineFreeTest(unittest.TestCase):
+    def test_24h_window_first_429_and_status(self):
+        from control_plane import cline_free
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'usage.json'
+            now = 1_000.0
+            state = cline_free.record(path, now, 200)
+            self.assertEqual(state['calls_today'], 1)
+            state = cline_free.record(path, now + 5, 200)
+            self.assertEqual(state['calls_today'], 2)
+            state = cline_free.record(path, now + 9, 429)
+            self.assertEqual(state['first_429_at'], now + 9)
+            live = cline_free.status(state, now + 10)
+            self.assertTrue(live['exhausted'])
+            self.assertEqual(live['est_limit'], 2)
+            fresh = cline_free.status(state, now + 24 * 3600 + 100)
+            self.assertFalse(fresh['exhausted'])
+            self.assertIsNone(fresh.get('first_429_at') or None)
 
 
 class CliBoundaryTest(unittest.TestCase):
@@ -124,11 +148,11 @@ class CliBoundaryTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp, redirect_stdout(io.StringIO()):
             root = Path(tmp)
             state = root / 'provider.json'
-            write_json(root / 'providers.json', {'providers': [{'id': 'anyrouter'}]})
+            write_json(root / 'providers.json', {'providers': [{'id': 'agentrouter'}]})
             args = ['--modes', tmp, '--state', str(state)]
             with patch('control_plane.cli.providers.probe', return_value={'ok': True, 'status': 200}):
                 self.assertEqual(cli.provider_main(args), 0)
-            self.assertEqual(read_json(state)['id'], 'anyrouter')
+            self.assertEqual(read_json(state)['id'], 'agentrouter')
             self.assertEqual(cli.provider_main([*args, '--plus-rate-limited']), 1)
             self.assertGreater(read_json(state)['cooldown_until'], read_json(state)['checked_at'])
             (root / 'providers.json').write_text('{')

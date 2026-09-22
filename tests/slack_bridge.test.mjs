@@ -966,6 +966,14 @@ test("parseDispatchArgs: supervisor CLI shape", () => {
   assert.equal(parseDispatchArgs(["goal", "q", "fix --dry-run bug"]).text, "fix --dry-run bug");
 });
 
+test("injectionLine: mimo never types /goal and targets mimo-clinepass", () => {
+  const mimo = injectionLine({ builtin: "goal", target: "mimo", dispatchId: "m1" });
+  assert.ok(mimo.startsWith("/usr/local/bin/mimo-clinepass --file "));
+  assert.ok(!mimo.includes("/goal"));
+  assert.equal(parseDispatchArgs(["goal", "minecraft", "hi", "--target", "mimo"]).target, "mimo");
+  assert.ok(parseDispatchArgs(["goal", "minecraft", "hi", "--target", "gemini"]).error);
+});
+
 test("injectionLine: flash never types /goal; efficient does", () => {
   const flash = injectionLine({ builtin: "goal", target: "flash", dispatchId: "abc" });
   assert.equal(flash, flashSendLine("abc"));

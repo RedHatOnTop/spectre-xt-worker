@@ -166,14 +166,15 @@ def record_dispatch(worker, item, state, out, env, run):
     queue = ws.get('queue') or []
     rest = [row for row in queue if row.get('id') != item.get('id')]
     if not out.get('ok') and not ambiguous:
-        unavailable = verdict.get('evt') == 'dispatch_flash_unavailable'
+        unavailable = verdict.get('evt') in {
+            'dispatch_flash_unavailable', 'dispatch_mimo_unavailable'}
         if unavailable and item['kind'] == 'mechanical':
             updated = {**ws, 'active': None, 'last_fingerprint': None,
                        'queue': [{**item, 'assignee': 'efficient'}, *rest]}
         elif unavailable:
-            reason = f"flash_unavailable:{item.get('id', '')}"
-            # Keep the packet behind the rest of the batch so Efficient work
-            # still runs; never fall back to Efficient for non-mechanical.
+            reason = f"{verdict.get('evt', 'dispatch_unavailable').removeprefix('dispatch_')}:{item.get('id', '')}"
+            # Keep the packet behind the rest of the batch so other work still
+            # runs; never fall back to Efficient for non-mechanical.
             updated, _ = escalation(worker, {**ws, 'active': None, 'last_fingerprint': None,
                                              'queue': [*rest, item]}, reason, run, env)
             if updated.get('notified') != reason:

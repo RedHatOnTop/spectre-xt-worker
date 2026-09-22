@@ -601,6 +601,45 @@ export function flashPin(entry) {
   return String((flash && flash.terminal) || "");
 }
 
+export const MIMO_WRAPPER = "/usr/local/bin/mimo-clinepass";
+export const MIMO_FILE_PREFIX = `${MIMO_WRAPPER} --file `;
+
+export function mimoPin(entry) {
+  const mimo = entry && entry.targets && entry.targets.mimo;
+  return String((mimo && mimo.terminal) || "");
+}
+
+export function mimoSendLine(dispatchId, env = process.env) {
+  const id = sanitizeDispatchId(dispatchId) || "dry-run";
+  return `${MIMO_FILE_PREFIX}${packetDir(env)}/${id}.txt`;
+}
+
+export function mimoReady(entry, env = process.env) {
+  const wrapper = String(env.SPECTRE_MIMO_WRAPPER || MIMO_WRAPPER);
+  const bin = String(env.SPECTRE_MIMO_BIN || join(homedir(), ".mimocode/bin/mimo"));
+  const pin = mimoPin(entry);
+  if (!pin) {
+    return { ok: false, evt: "dispatch_mimo_unavailable", detail: "mimo pin missing (targets.mimo.terminal)" };
+  }
+  try {
+    const st = statSync(wrapper);
+    if ((st.mode & 0o777) !== 0o755) {
+      return { ok: false, evt: "dispatch_mimo_unavailable", detail: `wrapper mode ${(st.mode & 0o777).toString(8)} is not 755` };
+    }
+  } catch {
+    return { ok: false, evt: "dispatch_mimo_unavailable", detail: `wrapper missing (${wrapper})` };
+  }
+  try {
+    const st = statSync(bin);
+    if (!st.isFile() || (st.mode & 0o111) === 0) {
+      return { ok: false, evt: "dispatch_mimo_unavailable", detail: `mimo not executable (${bin})` };
+    }
+  } catch {
+    return { ok: false, evt: "dispatch_mimo_unavailable", detail: `mimo missing (${bin})` };
+  }
+  return { ok: true, line: mimoSendLine("dry-run", env), pin };
+}
+
 export function writeFlashPacket(dispatchId, text, env = process.env) {
   const id = sanitizeDispatchId(dispatchId);
   if (!id) return { ok: false, error: "missing dispatch_id" };
@@ -743,6 +782,9 @@ export function injectionLine({ builtin, target, goalText, clauseText, dispatchI
   if (builtin === "goal" && String(target || "efficient") === "flash") {
     return flashSendLine(dispatchId);
   }
+  if (builtin === "goal" && String(target || "") === "mimo") {
+    return mimoSendLine(dispatchId);
+  }
   if (builtin === "resume") return dispatchLine("resume", "", "");
   return dispatchLine("goal", goalText, clauseText);
 }
@@ -825,7 +867,7 @@ export function parseDispatchArgs(argv) {
   } else if (builtin === "goal" && !out.text) {
     out.error = "usage: --dispatch goal <worker> <goal text>";
   }
-  if (!["flash", "efficient"].includes(out.target) || (builtin === "resume" && out.target !== "efficient")) {
+  if (!["flash", "mimo", "efficient"].includes(out.target) || (builtin === "resume" && out.target !== "efficient")) {
     out.error = "invalid target for dispatch";
   }
   return out;
@@ -1553,15 +1595,17 @@ async function claimDispatch(worker, builtin, snapshot, target, terminal) {
 }
 
 async function bindFlashAfterClaim(opts, targetName, claimed, injected) {
-  if (!(opts.builtin === "goal" && targetName === "flash")) {
+  const packetTarget = targetName === "flash" || targetName === "mimo";
+  if (!(opts.builtin === "goal" && packetTarget)) {
     return { ok: true, injected, dispatch_id: null };
   }
   const made = finalizeFlashInjection(claimed, opts.text);
   if (!made.ok) {
     await finishClaim(claimed.claim, false, made.error);
-    return { ok: false, evt: "dispatch_flash_packet_failed", error: made.error };
+    return { ok: false, evt: `dispatch_${targetName}_packet_failed`, error: made.error };
   }
-  return { ok: true, injected: made.line, dispatch_id: made.dispatch_id, packet: made.packet };
+  const line = targetName === "mimo" ? mimoSendLine(made.dispatch_id) : made.line;
+  return { ok: true, injected: line, dispatch_id: made.dispatch_id, packet: made.packet };
 }
 
 async function sendKeysToWorker(target, text) {
@@ -1645,8 +1689,8 @@ async function dispatchCli(argv) {
   }
 
   const targetName = opts.target || "efficient";
-  if (opts.builtin === "goal" && targetName === "flash") {
-    const ready = flashReady(entry);
+  if (opts.builtin === "goal" && (targetName === "flash" || targetName === "mimo")) {
+    const ready = targetName === "mimo" ? mimoReady(entry) : flashReady(entry);
     if (!ready.ok) {
       audit({ evt: ready.evt, worker: opts.worker, origin: opts.operator, detail: ready.detail });
       return { ok: false, evt: ready.evt, detail: ready.detail, code: 1 };
@@ -1656,10 +1700,10 @@ async function dispatchCli(argv) {
   let injected;
   if (opts.builtin === "plan") {
     injected = "";
-  } else if (opts.builtin === "goal" && targetName === "flash") {
+  } else if (opts.builtin === "goal" && (targetName === "flash" || targetName === "mimo")) {
     // Placeholder for paneRefusal / dry-run. Live send overwrites after claim
     // writes packets/<dispatch_id>.txt named after the claimed id.
-    injected = flashSendLine("dry-run");
+    injected = targetName === "mimo" ? mimoSendLine("dry-run") : flashSendLine("dry-run");
   } else if (opts.builtin === "goal") {
     const clause = loadClause();
     if (!clause.text) {
@@ -1725,7 +1769,9 @@ async function dispatchCli(argv) {
       return { ok: false, evt: "dispatch_orca_failed", detail: `cannot list orca terminals for ${opts.worker}: ${listed.error}`, code: 1 };
     }
     const pin = opts.builtin === "plan" ? entry.planner.terminal
-      : targetName === "flash" ? flashPin(entry) : (entry.targets?.efficient?.terminal || entry.terminal);
+      : targetName === "flash" ? flashPin(entry)
+      : targetName === "mimo" ? mimoPin(entry)
+      : (entry.targets?.efficient?.terminal || entry.terminal);
     const pick = pickNativeTerminal(listed.terminals, entry.cwd, pin);
     if (!pick.ok) {
       audit({ evt: "dispatch_orca_refused", worker: opts.worker, origin: opts.operator, detail: pick.detail });

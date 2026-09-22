@@ -67,6 +67,7 @@ class InputTest(unittest.TestCase):
         self.assertEqual(packets.validate(value, 'r1'), [packet()])
         for changed in ({'request_id': '../r1'}, {'worker': 'qoder'},
                         {'packets': [packet(assignee='efficient')]},
+                        {'packets': [packet(assignee='mimo', kind='mechanical')]},
                         {'packets': [packet(), packet()]}, {'packets': []}):
             with self.assertRaises(ValueError):
                 packets.validate({**value, **changed}, 'r1')
@@ -178,7 +179,7 @@ class LoopRuntimeTest(unittest.TestCase):
 
 
 class ProviderTest(unittest.TestCase):
-    def test_relays_in_order_and_no_plus_before_both_fail(self):
+    def test_agentrouter_preferred_and_probed_first(self):
         calls = []
         registry = {'providers': [{'id': name} for name in providers.RELAYS]}
         def probe(row):
@@ -186,13 +187,41 @@ class ProviderTest(unittest.TestCase):
             return {'ok': row['id'] == 'agentrouter', 'status': 200}
         result = providers.choose(registry, {}, NOW, probe)
         self.assertEqual(result['id'], 'agentrouter')
-        self.assertEqual(calls, ['anyrouter', 'agentrouter'])
+        # Both relays are probed for health; rank prefers agentrouter when alive.
+        self.assertEqual(calls, ['agentrouter', 'anyrouter'])
+        self.assertEqual(calls[0], 'agentrouter')
+
+    def test_anyrouter_is_fallback_when_agentrouter_down(self):
+        calls = []
+        registry = {'providers': [{'id': name} for name in providers.RELAYS]}
+        def probe(row):
+            calls.append(row['id'])
+            return {'ok': row['id'] == 'anyrouter', 'status': 200}
+        result = providers.choose(registry, {}, NOW, probe)
+        self.assertEqual(result['id'], 'anyrouter')
+        self.assertEqual(calls, ['agentrouter', 'anyrouter'])
+
+    def test_kimi_free_outranks_plus_and_plus_needs_kimi_exhausted(self):
+        registry = {'providers': [{'id': name} for name in providers.RELAYS]}
+        dead = lambda row: {'ok': False, 'configured': True, 'status': None,
+                            'upstream_quota': False}
+        kimi_live = lambda: {'ok': True, 'configured': True, 'exhausted': False}
+        kimi_out = lambda: {'ok': False, 'configured': True, 'exhausted': True}
+        picked = providers.choose(registry, {}, NOW, dead, kimi_fn=kimi_live)
+        self.assertEqual(picked['id'], providers.KIMI_FREE)
+        plus = providers.choose(registry, {}, NOW, dead, kimi_fn=kimi_out)
+        self.assertEqual(plus['id'], providers.LAST_RESORT)
 
     def test_plus_cooldown_is_retained(self):
         result = providers.choose({'providers': []}, {'cooldown_until': NOW + 60}, NOW,
                                   lambda row: {'ok': False})
         self.assertFalse(result['ok'])
         self.assertEqual(result['cooldown_until'], NOW + 60)
+
+    def test_402_is_upstream_quota_not_dead_account(self):
+        hit = {'ok': False, 'configured': True, 'status': 402, 'upstream_quota': True}
+        self.assertEqual(providers.upstream_retry_at(hit, NOW), NOW + providers.UPSTREAM_QUOTA_BACKOFF)
+        self.assertEqual(providers.upstream_retry_at({'status': 500}, NOW), NOW)
 
     def test_no_heavy_model_probe_and_one_token_body(self):
         with self.assertRaises(ValueError):
@@ -212,6 +241,7 @@ class InventoryTest(unittest.TestCase):
         self.assertIsNone(inventory.model(['bash', '-c', 'codex -m gpt-6-astra']))
         self.assertIsNone(inventory.model(['qodercli', '-m', 'Auto', 'Efficient']))
         self.assertEqual(inventory.model(['dsh', '--profile', 'headless']), 'flash')
+        self.assertEqual(inventory.model(['mimo', 'run', 'task']), 'mimo')
 
 
 if __name__ == '__main__':
@@ -350,6 +380,31 @@ class RecoveryTest(unittest.TestCase):
         self.assertEqual(flash_targets, ['flash', 'efficient'])
         self.assertIn('Rename a symbol', self.sent[-1][4])
         self.assertNotIn('Fix the parser', self.sent[-1][4])
+
+    def test_mimo_unavailable_keeps_packet_and_escalates(self):
+        completed(self.store)
+        head = packet('p1', assignee='mimo', kind='review')
+        tail = packet('p2', assignee='efficient', kind='mechanical', goal='Rename a symbol')
+        write_json(self.path, {'workers': {'minecraft': {'queue': [head, tail]}}})
+        targets = []
+        def mimo_down(argv, **kwargs):
+            self.sent.append(argv)
+            if argv[:2] == ['spectre-slack-bridge', '--dispatch'] and 'goal' in argv:
+                target = argv[argv.index('--target') + 1]
+                targets.append(target)
+                if target == 'mimo':
+                    return {'ok': False, 'parsed': {'evt': 'dispatch_mimo_unavailable'}}
+            return {'ok': True, 'parsed': {'ok': True, 'evt': 'dispatch_sent'}}
+        self.run_command = mimo_down
+        self.tick()
+        state = read_json(self.path)['workers']['minecraft']
+        self.assertEqual([row['id'] for row in state['queue']], ['p2', 'p1'])
+        self.assertEqual(state['queue'][1]['assignee'], 'mimo')
+        self.assertFalse(any('efficient' == t and 'Fix the parser' in
+                             (self.sent[i][4] if len(self.sent[i]) > 4 else '')
+                             for i, t in enumerate(targets)))
+        self.tick(now=NOW + 120)
+        self.assertEqual(targets, ['mimo', 'efficient'])
 
     def test_uncertain_send_error_is_never_blindly_retried(self):
         completed(self.store, 'qoder')

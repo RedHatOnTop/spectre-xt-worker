@@ -32,8 +32,10 @@ def model(argv: list[str]) -> str | None:
         return 'astra'
     if exe in {'qodercli', 'qoder', 'qoder-efficient'} and str(selected).lower() == 'efficient':
         return 'efficient'
-    if exe == 'dsh' and option(argv, '--profile') in {'headless', 'tui'}:
+    if exe == 'dsh' and option(argv, '--profile') in {'headless', 'tui', 'minimal'}:
         return 'flash'
+    if exe in {'mimo', 'mimocode'}:
+        return 'mimo'
     return None
 
 

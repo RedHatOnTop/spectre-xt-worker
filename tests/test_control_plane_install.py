@@ -21,7 +21,8 @@ class InstallTest(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             binaries = root / 'usr/local/bin'
             for command in ('spectre-loop', 'spectre-state', 'spectre-astra', 'spectre-reaper',
-                            'spectre-pin-sync', 'spectre-codex-provider-health', 'dsh-clinepass'):
+                            'spectre-pin-sync', 'spectre-codex-provider-health', 'dsh-clinepass',
+                            'mimo-clinepass'):
                 help_ = subprocess.run([str(binaries / command), '--help'], env=env,
                                        cwd=tmp, capture_output=True, text=True)
                 self.assertEqual(help_.returncode, 0, command + ': ' + help_.stderr)

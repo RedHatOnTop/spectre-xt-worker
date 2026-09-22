@@ -1,15 +1,29 @@
-"""Bounded relay probes; never log credentials, headers, or response bodies."""
+"""Bounded relay probes and top-level provider rank.
+
+Rank (locked 2026-09-22): agentrouter → anyrouter → kimi_free → openai(Plus).
+Never log credentials, headers, or response bodies.
+"""
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 import urllib.error
 import urllib.parse
 import urllib.request
 
-RELAYS = ('anyrouter', 'agentrouter')
+# Preference order. agentrouter is faster and wins when alive; anyrouter is the
+# slow-TTFT fallback that is often down but has generous balance.
+RELAYS = ('agentrouter', 'anyrouter')
+KIMI_FREE = 'kimi_free'
+LAST_RESORT = 'openai'
 PROBE_TIMEOUT = 5
 PLUS_COOLDOWN = 5 * 3600
+# Anyrouter can be alive yet unusable. Soft gate only — a degraded relay still
+# beats Plus, but a healthy preferred relay preempts it on the next tick.
+TTFT_DEGRADED_MS = 15_000
+# 402 on agentrouter is upstream refill/crowding, not an account death.
+UPSTREAM_QUOTA_BACKOFF = 10 * 60
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -51,6 +65,7 @@ def probe(provider: dict, modes: Path) -> dict:
         return {'ok': False, 'configured': False, 'status': None}
     request = urllib.request.Request(url, data=json.dumps(body).encode(), method='POST',
         headers={'Authorization': f'Bearer {key}', 'Content-Type': 'application/json'})
+    started = time.monotonic()
     try:
         opener = urllib.request.build_opener(NoRedirect())
         with opener.open(request, timeout=PROBE_TIMEOUT) as response:
@@ -59,33 +74,67 @@ def probe(provider: dict, modes: Path) -> dict:
             good = isinstance(payload, dict) and not payload.get('error') and (
                 payload.get('object') in {'response', 'chat.completion'} or
                 isinstance(payload.get('choices'), list))
-            return {'ok': status == 200 and good, 'configured': True, 'status': status}
+            ttft_ms = int((time.monotonic() - started) * 1000)
+            ok = status == 200 and good
+            return {'ok': ok, 'configured': True, 'status': status, 'ttft_ms': ttft_ms,
+                    'degraded': ok and ttft_ms > TTFT_DEGRADED_MS,
+                    'upstream_quota': False}
     except urllib.error.HTTPError as exc:
         exc.close()
-        return {'ok': False, 'configured': True, 'status': exc.code}
+        return {'ok': False, 'configured': True, 'status': exc.code, 'ttft_ms': None,
+                'degraded': False, 'upstream_quota': exc.code == 402}
     except (OSError, ValueError, urllib.error.URLError):
-        return {'ok': False, 'configured': True, 'status': None}
+        return {'ok': False, 'configured': True, 'status': None, 'ttft_ms': None,
+                'degraded': False, 'upstream_quota': False}
 
 
-def choose(registry: dict, previous: dict, now: float, probe_fn) -> dict:
+def rank(probes: dict) -> str | None:
+    """Best healthy astra relay, else None. Preference order is RELAYS."""
+    for ident in RELAYS:
+        result = probes.get(ident) or {}
+        if result.get('ok'):
+            return ident
+    return None
+
+
+def choose(registry: dict, previous: dict, now: float, probe_fn, kimi_fn=None) -> dict:
     rows = {row.get('id'): row for row in registry.get('providers', []) if isinstance(row, dict)}
     results = {}
     for ident in RELAYS:
         result = probe_fn(rows[ident]) if ident in rows else {
             'ok': False, 'configured': False, 'status': None}
         results = {**results, ident: result}
-        if result.get('ok'):
-            return selected(ident, previous, now, results)
+    best = rank(results)
+    if best:
+        return selected(best, previous, now, results)
+    kimi = (kimi_fn or _kimi_unavailable)()
+    results = {**results, KIMI_FREE: kimi}
+    if kimi.get('ok') and not kimi.get('exhausted'):
+        return selected(KIMI_FREE, previous, now, results)
     cooldown = max(previous.get('cooldown_until', 0), previous.get('plus_cooldown_until', 0))
-    configured = all(result.get('configured', True) for result in results.values())
+    configured = all(result.get('configured', True) for result in results.values()
+                     if isinstance(result, dict) and 'configured' in result)
     if cooldown > now or not configured:
         return {**previous, 'ok': False, 'checked_at': now, 'probes': results,
-                'cooldown_until': cooldown, 'reason': 'cooldown' if cooldown > now else 'probe_configuration'}
-    return selected('openai', previous, now, results)
+                'cooldown_until': cooldown,
+                'reason': 'cooldown' if cooldown > now else 'probe_configuration'}
+    return selected(LAST_RESORT, previous, now, results)
+
+
+def _kimi_unavailable() -> dict:
+    return {'ok': False, 'configured': False, 'exhausted': True, 'status': None}
 
 
 def selected(ident: str, previous: dict, now: float, probes: dict) -> dict:
     return {'ok': True, 'id': ident, 'checked_at': now, 'cooldown_until': 0,
-            'plus_cooldown_until': max(previous.get('plus_cooldown_until', 0), previous.get('cooldown_until', 0)),
+            'plus_cooldown_until': max(previous.get('plus_cooldown_until', 0),
+                                      previous.get('cooldown_until', 0)),
             'changed_at': previous.get('changed_at', now) if previous.get('id') == ident else now,
             'probes': probes}
+
+
+def upstream_retry_at(result: dict, now: float) -> float:
+    """402 is temporary. Do not treat it as a dead account."""
+    if result.get('upstream_quota') or result.get('status') == 402:
+        return now + UPSTREAM_QUOTA_BACKOFF
+    return now
