@@ -1,0 +1,100 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "request_id",
+    "worker",
+    "wake_reason",
+    "packets"
+  ],
+  "properties": {
+    "request_id": {
+      "type": "string",
+      "pattern": "^[a-zA-Z0-9][a-zA-Z0-9_-]{0,95}$"
+    },
+    "worker": {
+      "const": "minecraft"
+    },
+    "wake_reason": {
+      "enum": [
+        "completed",
+        "failed",
+        "hard_decision"
+      ]
+    },
+    "packets": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 4,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "assignee",
+          "kind",
+          "goal",
+          "acceptance",
+          "requires_astra_review"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^[a-zA-Z0-9][a-zA-Z0-9_-]{0,95}$"
+          },
+          "assignee": {
+            "enum": [
+              "flash",
+              "efficient"
+            ]
+          },
+          "kind": {
+            "enum": [
+              "implement",
+              "mechanical",
+              "review",
+              "blocker"
+            ]
+          },
+          "goal": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 600
+          },
+          "acceptance": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 8,
+            "items": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 600
+            }
+          },
+          "requires_astra_review": {
+            "type": "boolean"
+          }
+        },
+        "allOf": [
+          {
+            "if": {
+              "properties": {
+                "assignee": {
+                  "const": "efficient"
+                }
+              }
+            },
+            "then": {
+              "properties": {
+                "kind": {
+                  "const": "mechanical"
+                }
+              }
+            }
+          }
+        ]
+      }
+    }
+  }
+}
