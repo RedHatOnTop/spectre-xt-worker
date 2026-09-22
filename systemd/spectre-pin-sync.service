@@ -1,0 +1,11 @@
+[Unit]
+Description=Inspect Spectre native worker pins (dry-run)
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/spectre-pin-sync
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+Environment=HOME=%h
+NoNewPrivileges=true
+TimeoutStartSec=30
+Nice=10

@@ -1,0 +1,283 @@
+"""One bounded tick: claim, persist intent, then invoke the sole terminal writer."""
+from __future__ import annotations
+
+from pathlib import Path
+import time
+
+from . import budget, packets, planning
+from .io import locked, read_json, write_json, run as run_command
+
+TICK_SECONDS = 45
+
+
+def enabled(env: dict, key: str) -> bool:
+    return str(env.get(key, '')).lower().strip() in {'1', 'true', 'yes', 'on'}
+
+
+def worker_state(state: dict, worker: str, value: dict) -> dict:
+    return {**state, 'workers': {**state.get('workers', {}), worker: value}}
+
+
+def validate_workers(workers: dict) -> None:
+    for name, entry in workers.items():
+        if not isinstance(entry, dict) or not Path(entry.get('cwd', '')).is_absolute():
+            raise ValueError(f'{name}: absolute cwd required')
+        if entry.get('planner') and name != 'minecraft':
+            raise ValueError('planner is legal only on minecraft')
+
+
+def notify(run, env: dict, worker: str, reason: str, *, channel='lobby') -> dict:
+    return run([env.get('SPECTRE_NOTIFY_BIN', 'spectre-slack-notify'), '--agent', 'loop',
+        '--channel', channel, '--text', f'{worker}: {reason}'], environ=env, timeout=5)
+
+
+def dispatch(run, env: dict, argv: list[str]) -> dict:
+    return run([env.get('SPECTRE_DISPATCH_BIN', 'spectre-slack-bridge'), '--dispatch', *argv],
+               environ=env, timeout=8)
+
+
+def escalation(worker, ws, reason, run, env):
+    if ws.get('notified') == reason:
+        return ws, {'worker': worker, 'action': 'sit', 'reason': reason}
+    channel = 'fleet' if reason.startswith('idle_slo:') else 'lobby'
+    out = notify(run, env, worker, reason, channel=channel)
+    updated = {**ws, 'notified': reason} if out.get('ok') else ws
+    return updated, {'worker': worker, 'action': 'escalate', 'reason': reason, 'io': out}
+
+
+def dry_action(worker, entry, snapshot, env):
+    policy = snapshot.get('policy', {})
+    if entry.get('planner') and not enabled(env, 'ASTRA_ENABLED'):
+        return {'worker': worker, 'action': 'skip', 'reason': 'planner_pin'}
+    if policy.get('grokbot_may_advance'):
+        return {'worker': worker, 'action': 'plan' if entry.get('planner') else 'goal'}
+    return {'worker': worker, 'action': 'skip', 'reason': snapshot.get('goal', {}).get('state')}
+
+
+def start_plan(worker, entry, snapshot, state, path, client, env, now, run):
+    ws = state.get('workers', {}).get(worker, {})
+    provider_path = Path(env.get('SPECTRE_PROVIDER_STATE', Path.home() / '.local/state/remote-agent/codex-provider.json'))
+    provider = read_json(provider_path)
+    active_provider = entry.get('planner', {}).get('provider')
+    reason = ('provider_restart_required' if active_provider and active_provider != provider.get('id')
+              else budget.planner_refusal(state, provider, now, snapshot['goal']['state'] == 'FAILED'))
+    if reason:
+        new_ws, action = escalation(worker, ws, reason, run, env)
+        return worker_state(state, worker, new_ws), action
+    current = planning.request(snapshot, now)
+    state = worker_state(state, worker, {**ws, 'planning': current})
+    write_json(path, state)
+    claim = planning.advance(client, worker, snapshot, current['request_id'])
+    current = {**current, 'action_id': claim['action_id'], 'status': 'sending'}
+    state = worker_state(state, worker, {**ws, 'planning': current})
+    write_json(path, state)
+    planning.event(client, worker, 'assignment.started', current, now)
+    plans = [row for row in state.get('plans', []) if row['at'] > now - budget.PLUS_WINDOW]
+    state = {**state, 'plans': [*plans, {'at': now, 'provider': provider.get('id'),
+                                       'critical': snapshot['goal']['state'] == 'FAILED'}]}
+    write_json(path, state)
+    out = dispatch(run, env, ['plan', worker, '--request-id', current['request_id']])
+    current = {**current, 'status': 'waiting', 'delivery': out}
+    return worker_state(state, worker, {**ws, 'planning': current}), {
+        'worker': worker, 'action': 'plan', 'request_id': current['request_id'], 'io': out}
+
+
+def finish_plan(worker, ws, state, client, env, now, run):
+    current = ws['planning']
+    snapshot = client.snapshot(worker)
+    if planning.identity(snapshot) != current['origin']:
+        updated = {**ws, 'planning': None, 'queue': []}
+        return worker_state(state, worker, updated), {'worker': worker, 'action': 'skip', 'reason': 'superseded_assignment'}
+    if 'action_id' not in current:
+        snapshot = client.snapshot(worker)
+        claim = planning.advance(client, worker, snapshot, current['request_id'])
+        current = {**current, 'action_id': claim['action_id']}
+    planning.event(client, worker, 'assignment.started', current, now)
+    directory = Path(env.get('SPECTRE_PACKET_DIR', Path.home() / '.local/state/remote-agent/packets'))
+    result = planning.result(directory, current, now)
+    if result['action'] == 'ready':
+        planning.event(client, worker, 'assignment.finished', current, now)
+        updated = {**ws, 'planning': None, 'queue': result['packets'],
+                   'request_id': current['request_id'], 'notified': None}
+        return worker_state(state, worker, updated), None
+    if result['action'] == 'timeout':
+        planning.event(client, worker, 'assignment.failed', current, now)
+        updated = {**ws, 'planning': None, 'retry_after': now + ASSIGNMENT_RETRY,
+                   'issue': f"assignment_timeout:{current['request_id']}"}
+        updated, action = escalation(worker, updated, updated['issue'], run, env)
+        return worker_state(state, worker, updated), action
+    updated = {**ws, 'planning': {**current, **{key: result[key] for key in ('file_stamp',) if key in result}}}
+    return worker_state(state, worker, updated), {'worker': worker, 'action': 'waiting'}
+
+
+ASSIGNMENT_RETRY = 300
+
+
+def next_packet(worker, entry, snapshot, ws):
+    queue = ws.get('queue') or []
+    if queue:
+        return queue[0]
+    if entry.get('planner'):
+        return None
+    goal = packets.next_goal(entry['cwd'])
+    return {'goal': goal, 'assignee': 'efficient', 'kind': 'mechanical'} if goal else None
+
+
+def execute_packet(worker, item, snapshot, state, path, client, env, now, run):
+    ws = state.get('workers', {}).get(worker, {})
+    reason = budget.refusal(state, worker, item['goal'], now)
+    if reason:
+        if reason == 'dispatch_spacing':
+            return state, {'worker': worker, 'action': 'skip', 'reason': reason}
+        updated, action = escalation(worker, ws, reason, run, env)
+        return worker_state(state, worker, updated), action
+    origin = planning.identity(snapshot)
+    state = budget.reserve(state, worker, item['goal'], now)
+    ws = state['workers'][worker]
+    active = {'origin': origin, 'packet': item, 'status': 'prepared',
+              'request_id': f"goal-{snapshot['snapshot_version']}",
+              'advance': snapshot['policy'].get('grokbot_may_advance', False)}
+    state = worker_state(state, worker, {**ws, 'active': active})
+    write_json(path, state)
+    return send_prepared(worker, snapshot, state, path, client, env, run)
+
+
+def send_prepared(worker, snapshot, state, path, client, env, run):
+    ws = state['workers'][worker]
+    active = ws['active']
+    item = active['packet']
+    if active.get('advance'):
+        planning.advance(client, worker, snapshot, active['request_id'])
+    state = worker_state(state, worker, {**ws, 'active': {**active, 'status': 'sending'}})
+    write_json(path, state)
+    out = dispatch(run, env, ['goal', worker, packet_text(item), '--target', item['assignee']])
+    return record_dispatch(worker, item, state, out, env, run)
+
+
+def packet_text(item):
+    acceptance = item.get('acceptance')
+    return item['goal'] if not acceptance else item['goal'] + '\nAcceptance:\n' + '\n'.join(acceptance)
+
+
+def record_dispatch(worker, item, state, out, env, run):
+    ws = state['workers'][worker]
+    verdict = out.get('parsed') or {}
+    ambiguous = out.get('uncertain') or verdict.get('evt') == 'dispatch_send_failed'
+    queue = ws.get('queue') or []
+    rest = [row for row in queue if row.get('id') != item.get('id')]
+    if not out.get('ok') and not ambiguous:
+        unavailable = verdict.get('evt') == 'dispatch_flash_unavailable'
+        if unavailable and item['kind'] == 'mechanical':
+            updated = {**ws, 'active': None, 'last_fingerprint': None,
+                       'queue': [{**item, 'assignee': 'efficient'}, *rest]}
+        elif unavailable:
+            reason = f"flash_unavailable:{item.get('id', '')}"
+            # Keep the packet behind the rest of the batch so Efficient work
+            # still runs; never fall back to Efficient for non-mechanical.
+            updated, _ = escalation(worker, {**ws, 'active': None, 'last_fingerprint': None,
+                                             'queue': [*rest, item]}, reason, run, env)
+            if updated.get('notified') != reason:
+                updated = {**updated, 'pending_notice': reason}
+        else:
+            updated = {**ws, 'active': None, 'last_fingerprint': None,
+                       'issue': verdict.get('evt', 'dispatch_failed')}
+        return worker_state(state, worker, updated), {'worker': worker, 'action': 'refused', 'io': out}
+    updated = {**ws, 'queue': rest,
+               'active': {**ws['active'], 'status': 'sent' if out.get('ok') else 'uncertain'}}
+    return worker_state(state, worker, updated), {'worker': worker, 'action': 'goal', 'io': out}
+
+
+def progress(worker, entry, snapshot, state, path, client, env, now, run):
+    ws = state.get('workers', {}).get(worker, {})
+    if snapshot['goal']['state'] == 'PARKED':
+        reason = f"parked:{snapshot['goal'].get('park_reason')}:{planning.identity(snapshot)}"
+        updated, action = escalation(worker, ws, reason, run, env)
+        return worker_state(state, worker, updated), action
+    notice_action = None
+    if ws.get('pending_notice'):
+        updated, notice_action = escalation(worker, ws, ws['pending_notice'], run, env)
+        if updated.get('notified') == ws['pending_notice']:
+            updated = {**updated, 'pending_notice': None}
+        state = worker_state(state, worker, updated)
+        ws = updated
+    if ws.get('planning'):
+        state, action = finish_plan(worker, ws, state, client, env, now, run)
+        if action:
+            return state, action
+        snapshot = client.snapshot(worker)
+        ws = state['workers'][worker]
+    active = ws.get('active')
+    if active:
+        if planning.identity(snapshot) == active['origin']:
+            if active['status'] == 'prepared' and snapshot['policy'].get('can_dispatch_goal'):
+                return send_prepared(worker, snapshot, state, path, client, env, run)
+            return state, {'worker': worker, 'action': 'waiting', 'reason': 'dispatch_confirmation'}
+        if not snapshot['policy'].get('can_dispatch_goal'):
+            return state, {'worker': worker, 'action': 'waiting', 'reason': 'implementer'}
+        queue = ws.get('queue') or []
+        if active['status'] == 'sending':
+            queue = [row for row in queue if row.get('id') != active['packet'].get('id')]
+        ws = {**ws, 'active': None, 'queue': queue}
+        if active['packet'].get('requires_astra_review') or snapshot['goal']['state'] == 'FAILED':
+            ws = {**ws, 'queue': []}
+        state = worker_state(state, worker, ws)
+    item = next_packet(worker, entry, snapshot, ws)
+    authorized = ws.get('queue') or ws.get('awaiting_next') or ws.get('issue') or snapshot['policy'].get('grokbot_may_advance')
+    if item and authorized and snapshot['policy'].get('can_dispatch_goal'):
+        return execute_packet(worker, item, snapshot, state, path, client, env, now, run)
+    if ws.get('retry_after', 0) > now:
+        updated, action = escalation(worker, ws, ws.get('issue', 'retry_backoff'), run, env)
+        return worker_state(state, worker, updated), action
+    if snapshot['policy'].get('grokbot_may_advance'):
+        if entry.get('planner'):
+            return start_plan(worker, entry, snapshot, state, path, client, env, now, run)
+        ws = {**ws, 'awaiting_next': planning.identity(snapshot), 'notified': None,
+              'advance_request': f"missing-{planning.identity(snapshot)}"}
+        state = worker_state(state, worker, ws)
+        write_json(path, state)
+    if ws.get('advance_request') and ws['awaiting_next'] == planning.identity(snapshot):
+        planning.advance(client, worker, snapshot, ws['advance_request'])
+        ws = {**ws, 'advance_request': None}
+        state = worker_state(state, worker, ws)
+    if ws.get('awaiting_next'):
+        updated, action = escalation(worker, ws, f"no_next_goal:{ws['awaiting_next']}", run, env)
+        return worker_state(state, worker, updated), action
+    if snapshot['policy'].get('idle_slo_violated'):
+        updated, action = escalation(worker, ws, f"idle_slo:{planning.identity(snapshot)}", run, env)
+        return worker_state(state, worker, updated), action
+    return state, notice_action or {'worker': worker, 'action': 'skip'}
+
+
+def tick(workers, client, path, env, *, now=None, dry=False, run=run_command):
+    if not enabled(env, 'SPECTRE_LOOP'):
+        return {'ok': True, 'disabled': True, 'dry_run': dry}
+    validate_workers(workers)
+    now = time.time() if now is None else now
+    if dry:
+        return {'ok': True, 'dry_run': True, 'actions': [dry_action(name, entry,
+            client.snapshot(name), env) for name, entry in sorted(workers.items())]}
+    with locked(path.with_suffix('.lock')):
+        return live_tick(workers, client, path, env, now, run)
+
+
+def live_tick(workers, client, path, env, now, run):
+    state = read_json(path)
+    actions = []
+    deadline = time.monotonic() + TICK_SECONDS
+    for worker, entry in sorted(workers.items()):
+        if time.monotonic() >= deadline:
+            actions = [*actions, {'worker': worker, 'action': 'deferred'}]
+            break
+        snapshot = client.snapshot(worker)
+        policy = snapshot.get('policy', {})
+        if snapshot.get('goal', {}).get('state') == 'UNKNOWN' or policy.get('continuity_recovery_allowed'):
+            actions = [*actions, {'worker': worker, 'action': 'skip', 'reason': 'occupancy'}]
+            continue
+        if entry.get('planner') and not enabled(env, 'ASTRA_ENABLED'):
+            actions = [*actions, {'worker': worker, 'action': 'skip', 'reason': 'planner_pin'}]
+            continue
+        state, action = progress(worker, entry, snapshot, state, path, client, env, now, run)
+        write_json(path, state)
+        actions = [*actions, action]
+    return {'ok': all(a.get('io', {}).get('ok', True) for a in actions),
+            'dry_run': False, 'actions': actions}

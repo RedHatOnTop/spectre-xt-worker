@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Unattended control-plane tick; installed off until on-box verification."""
+"""Select a healthy relay without switching a running Codex process."""
 from pathlib import Path
 import sys
 
@@ -9,7 +9,7 @@ for parent in (Path(__file__).resolve().parent, Path(__file__).resolve().parent.
         sys.path.insert(0, str(parent))
         break
 
-from control_plane.cli import loop_main
+from control_plane.cli import provider_main
 
 if __name__ == '__main__':
-    raise SystemExit(loop_main())
+    raise SystemExit(provider_main())

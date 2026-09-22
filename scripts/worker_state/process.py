@@ -233,6 +233,26 @@ def _dead_sample(pid: int | None) -> dict[str, Any]:
     }
 
 
+def find_efficient_pid(entry: dict, proc_root: Path) -> int | None:
+    pin = (entry.get("targets", {}).get("efficient") or {}).get("terminal") or entry.get("terminal")
+    if not pin:
+        return None
+    matches = set()
+    for path in proc_root.iterdir():
+        if not path.name.isdigit() or _environ_handle(int(path.name), proc_root) != pin:
+            continue
+        for pid in _tree_pids(int(path.name), proc_root):
+            args = _cmdline(pid, proc_root).split()
+            if not args or not any(Path(arg).name in {"qodercli", "qoder-efficient"} for arg in args[:2]):
+                continue
+            efficient = any(arg in {"-m", "--model"} and index + 1 < len(args)
+                            and args[index + 1].lower() == "efficient" for index, arg in enumerate(args))
+            if efficient and _cwd_matches(_cwd(pid, proc_root), entry.get("cwd")):
+                matches.add(pid)
+    leaves = matches - {pid for pid in matches if set(_children(pid, proc_root)) & matches}
+    return next(iter(leaves)) if len(leaves) == 1 else None
+
+
 def evidence_for_worker(
     name: str,
     entry: dict,
@@ -261,7 +281,7 @@ def evidence_for_worker(
     elif entry.get("terminal") or entry.get("_pid"):
         source = "process"
         raw = entry.get("_pid")
-        pid = int(raw) if raw else None
+        pid = int(raw) if raw else find_efficient_pid(entry, root)
     else:
         return []
     events: list[dict[str, Any]] = []
@@ -291,7 +311,7 @@ def evidence_for_worker(
             "kind": kind,
             "source": source,
             "source_timestamp": iso_from(now),
-            "payload": {"kind": "tmux" if tmux else "dsh"},
+            "payload": {"kind": "tmux" if tmux else "dsh" if target == "flash" else "orca"},
         }
     )
     if tree is not None:

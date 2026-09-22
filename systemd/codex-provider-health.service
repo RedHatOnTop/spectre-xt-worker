@@ -1,0 +1,11 @@
+[Unit]
+Description=Spectre bounded Codex relay health probes
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/spectre-codex-provider-health
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+Environment=HOME=%h
+NoNewPrivileges=true
+TimeoutStartSec=25
+Nice=10

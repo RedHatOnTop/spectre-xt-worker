@@ -23,6 +23,9 @@ def workers_path() -> Path:
     override = os.environ.get("QODER_WORKERS_FILE", "").strip()
     if override:
         return Path(override)
+    local = Path.home() / ".config/remote-agent/qoder-workers.json"
+    if local.is_file():
+        return local
     if BOX_WORKERS_FILE.is_file():
         return BOX_WORKERS_FILE
     return REPO_WORKERS_FILE

@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 import socket
+from socketserver import TCPServer
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -103,7 +104,9 @@ class UnixHTTPServer(ThreadingHTTPServer):
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         if os.path.exists(path):
             os.unlink(path)
-        super().server_bind()
+        TCPServer.server_bind(self)
+        self.server_name = "localhost"
+        self.server_port = 0
         os.chmod(path, 0o600)
 
     def get_request(self):

@@ -39,8 +39,8 @@ class ApiTest(unittest.TestCase):
         self.assertTrue(body["ok"])
         code, body = handle(self.store, "GET", "/v1/workers/pugc/snapshot", None, NOW)
         self.assertEqual(code, 200)
-        self.assertEqual(body["goal"]["state"], "IDLE")
-        self.assertTrue(body["policy"]["can_dispatch_goal"])
+        self.assertEqual(body["goal"]["state"], "UNKNOWN")
+        self.assertFalse(body["policy"]["can_dispatch_goal"])
 
     def test_post_evidence(self):
         code, body = handle(
@@ -153,3 +153,11 @@ class ApiTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class UnixBindTest(unittest.TestCase):
+    def test_unix_bind_never_resolves_a_hostname(self):
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch('socket.getfqdn', side_effect=AssertionError('UDS bind performed DNS')):
+                server = UnixHTTPServer(str(Path(tmp) / 'state.sock'), Handler)
+                server.server_close()

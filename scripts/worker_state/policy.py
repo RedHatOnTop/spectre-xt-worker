@@ -21,7 +21,7 @@ def policy_for(
     if goal_state == "PARKED" and park_reason == "goal_budget":
         policy["can_resume"] = True
         policy["grokbot_may_advance"] = True
-    if goal_state == "COMPLETED" and completion_open:
+    if goal_state in {"COMPLETED", "FAILED"} and completion_open:
         policy["grokbot_may_advance"] = True
     if goal_state in {
         "INJECTED",

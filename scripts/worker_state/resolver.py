@@ -42,6 +42,7 @@ def resolve(
         "state": "IDLE",
         "park_reason": None,
         "injected_at": None,
+        "assignment_id": None,
     }
     execution: dict[str, Any] = {
         "progress_seq": 0,
@@ -109,14 +110,14 @@ def resolve(
         goal["state"],
         execution,
         now,
-        completion_open=completion_open and goal["state"] == "COMPLETED",
+        completion_open=completion_open and goal["state"] in {"COMPLETED", "FAILED"},
     )
     policy = policy_for(
         goal_state=goal["state"],
         park_reason=goal["park_reason"],
         stalled=bool(execution["stalled"]),
         waiting=waiting,
-        completion_open=completion_open and goal["state"] == "COMPLETED",
+        completion_open=completion_open and goal["state"] in {"COMPLETED", "FAILED"},
         target=str(execution.get("target") or "efficient"),
         idle_slo=idle_slo,
     )
@@ -137,6 +138,7 @@ def resolve(
             "state": goal["state"],
             "park_reason": goal["park_reason"],
             "injected_at": goal["injected_at"],
+            "assignment_id": goal["assignment_id"],
         },
         "transport": transport,
         "observation": {"state": observation},
@@ -263,15 +265,18 @@ def _apply_kind(
 
     if kind == "assignment.started":
         goal["state"] = "ASSIGNING"
+        goal["assignment_id"] = payload.get("request_id")
         goal["park_reason"] = None
         reasons.append("assigning")
         return
     if kind == "assignment.failed":
         goal["state"] = "COMPLETED"
+        goal["assignment_id"] = None
         reasons.append("assignment failed")
         return
     if kind == "assignment.finished":
         goal["state"] = "COMPLETED"
+        goal["assignment_id"] = None
         reasons.append("assignment finished")
         return
     if kind == "advance.completed":
@@ -515,7 +520,7 @@ def apply_now_effects(snapshot: dict[str, Any], now: float) -> dict[str, Any]:
         execution,
         now,
         completion_open=bool((out.get("policy") or {}).get("grokbot_may_advance"))
-        and goal.get("state") == "COMPLETED",
+        and goal.get("state") in {"COMPLETED", "FAILED"},
     )
     out["goal"] = goal
     out["execution"] = execution
@@ -526,7 +531,7 @@ def apply_now_effects(snapshot: dict[str, Any], now: float) -> dict[str, Any]:
         stalled=bool(execution.get("stalled")),
         waiting=waiting,
         completion_open=bool((snapshot.get("policy") or {}).get("grokbot_may_advance"))
-        and goal.get("state") == "COMPLETED",
+        and goal.get("state") in {"COMPLETED", "FAILED"},
         target=str(execution.get("target") or "efficient"),
         idle_slo=idle_slo,
     )

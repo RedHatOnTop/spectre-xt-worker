@@ -49,6 +49,11 @@ class Store:
         self._conn.execute("PRAGMA foreign_keys=ON")
         self._conn.execute("PRAGMA busy_timeout=5000")
         self._migrate()
+        rows = self._conn.execute(
+            "SELECT worker_id, snapshot_json FROM worker_snapshots WHERE resolver_version = ?",
+            (RESOLVER_VERSION,),
+        ).fetchall()
+        self._published = {row["worker_id"]: json.loads(row["snapshot_json"]) for row in rows}
 
     def close(self) -> None:
         with self._lock:
@@ -114,6 +119,8 @@ class Store:
                     (event_id,),
                 ).fetchone()
                 if existing is None:
+                    if kind.startswith("assignment."):
+                        self._validate_assignment(raw, payload, worker, now)
                     self._conn.execute(
                         """
                         INSERT INTO evidence_journal (
@@ -137,10 +144,10 @@ class Store:
                             json.dumps(payload),
                         ),
                     )
-                    if kind == "goal.completed":
+                    if kind in {"goal.completed", "goal.failed"}:
                         self._claim_completion(raw, worker, now)
                 snapshot = self._rebuild_locked(worker, now)
-                self._conn.execute("COMMIT")
+                self._commit(worker)
             except Exception:
                 self._conn.execute("ROLLBACK")
                 raise
@@ -152,22 +159,16 @@ class Store:
                 self._conn.execute("BEGIN IMMEDIATE")
                 try:
                     self._rebuild_locked(worker, now)
-                    self._conn.execute("COMMIT")
+                    self._commit(worker)
                 except Exception:
                     self._conn.execute("ROLLBACK")
                     raise
                 folded = copy.deepcopy(self._published[worker])
             return apply_now_effects(folded, now)
-        with self._lock:
-            row = self._conn.execute(
-                "SELECT snapshot_json FROM worker_snapshots WHERE worker_id = ?",
-                (worker,),
-            ).fetchone()
-            if row:
-                folded = json.loads(row["snapshot_json"])
-            else:
-                folded = resolve([], now, worker, apply_time=False)
-        return apply_now_effects(folded, now)
+        published = self._published.get(worker)
+        if published is None:
+            return fail_closed_snapshot(worker, "snapshot not published", iso_from(now))
+        return apply_now_effects(copy.deepcopy(published), now)
 
     def replay(self, worker: str, now: float) -> dict[str, Any]:
         return self.snapshot(worker, now, rebuild=True)
@@ -206,7 +207,7 @@ class Store:
                     (idempotency_key,),
                 ).fetchone()
                 if reused:
-                    self._conn.execute("COMMIT")
+                    self._commit(worker)
                     return _claim_to_dict(reused, reused=True)
                 if int(snapshot["snapshot_version"]) != int(expected_snapshot_version):
                     raise StoreError(
@@ -279,7 +280,7 @@ class Store:
                     "SELECT * FROM action_claims WHERE action_id = ?",
                     (action_id,),
                 ).fetchone()
-                self._conn.execute("COMMIT")
+                self._commit(worker)
                 return _claim_to_dict(row, reused=False)
             except StoreError:
                 self._conn.execute("ROLLBACK")
@@ -300,8 +301,9 @@ class Store:
                 ).fetchone()
                 if row is None:
                     raise StoreError("action_id", "unknown action_id", 404)
+                worker = row["worker_id"]
                 if row["state"] != "claimed":
-                    self._conn.execute("COMMIT")
+                    self._commit(worker)
                     return _claim_to_dict(row, reused=True)
                 worker = row["worker_id"]
                 result = {"ok": bool(ok), "error": error}
@@ -361,7 +363,7 @@ class Store:
                     "SELECT * FROM action_claims WHERE action_id = ?",
                     (action_id,),
                 ).fetchone()
-                self._conn.execute("COMMIT")
+                self._commit(worker)
                 out = _claim_to_dict(row, reused=False)
                 out["snapshot"] = snapshot
                 return out
@@ -467,7 +469,7 @@ class Store:
                         now,
                     )
                 snapshot = self._rebuild_locked(worker, now)
-                self._conn.execute("COMMIT")
+                self._commit(worker)
                 return snapshot
             except Exception:
                 self._conn.execute("ROLLBACK")
@@ -545,7 +547,7 @@ class Store:
 
     def _completion_open(self, worker: str, snapshot: dict) -> bool:
         goal = snapshot.get("goal") or {}
-        if goal.get("state") != "COMPLETED":
+        if goal.get("state") not in {"COMPLETED", "FAILED"}:
             return False
         row = self._conn.execute(
             """
@@ -563,9 +565,9 @@ class Store:
             """
             SELECT 1 FROM action_claims
             WHERE worker_id = ? AND action = 'advance' AND state IN ('succeeded', 'claimed')
-              AND goal_id = ?
+              AND goal_id = ? AND COALESCE(attempt_id, 0) = ?
             """,
-            (worker, goal.get("goal_id")),
+            (worker, goal.get("goal_id"), int(goal.get("attempt_id") or 0)),
         ).fetchone()
         return row is not None and claimed is None
 
@@ -624,8 +626,44 @@ class Store:
                 iso_from(now),
             ),
         )
-        self._published[worker] = snapshot
         return snapshot
+
+    def _commit(self, worker: str) -> None:
+        row = self._conn.execute(
+            "SELECT snapshot_json FROM worker_snapshots WHERE worker_id = ?", (worker,)
+        ).fetchone()
+        published = json.loads(row["snapshot_json"]) if row else None
+        self._conn.execute("COMMIT")
+        if published is not None:
+            self._published = {**self._published, worker: published}
+
+    def _validate_assignment(self, raw: dict, payload: dict, worker: str, now: float) -> None:
+        if raw.get("source") != "api" or worker != "minecraft":
+            raise StoreError("assignment", "assignment requires the minecraft API owner", 409)
+        row = self._conn.execute(
+            "SELECT * FROM action_claims WHERE action_id = ?", (payload.get("action_id"),)
+        ).fetchone()
+        if row is None or row["worker_id"] != worker or row["action"] != "advance" or row["state"] != "succeeded":
+            raise StoreError("assignment", "assignment requires a succeeded advance", 409)
+        snapshot = self._rebuild_locked(worker, now)
+        goal = snapshot["goal"]
+        if (goal.get("goal_id") != row["goal_id"] or goal.get("attempt_id") != row["attempt_id"]
+                or raw.get("goal_id") != row["goal_id"] or raw.get("attempt_id") != row["attempt_id"]):
+            raise StoreError("assignment", "stale assignment identity", 409)
+        request_id = payload.get("request_id")
+        if not isinstance(request_id, str) or not request_id or len(request_id) > 96:
+            raise StoreError("assignment", "request_id required")
+        if raw["kind"] == "assignment.started":
+            if goal["state"] not in {"COMPLETED", "FAILED"}:
+                raise StoreError("assignment", "worker is occupied", 409)
+        elif raw["kind"] in {"assignment.finished", "assignment.failed"}:
+            if goal["state"] != "ASSIGNING" or goal.get("assignment_id") != request_id:
+                raise StoreError("assignment", "assignment is not active", 409)
+            if raw["kind"] == "assignment.failed":
+                self._conn.execute("UPDATE action_claims SET state = 'failed' WHERE action_id = ?",
+                                   (row["action_id"],))
+        else:
+            raise StoreError("assignment", "unknown assignment event")
 
     def _claimed_payload_locked(self, action_id: str) -> dict[str, Any]:
         row = self._conn.execute(

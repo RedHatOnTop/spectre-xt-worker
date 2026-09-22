@@ -26,10 +26,10 @@ class StoreTest(unittest.TestCase):
         self.store.close()
         self.tmp.cleanup()
 
-    def test_get_unseen_worker_is_idle_without_rebuild(self):
+    def test_get_unseen_worker_is_unknown_without_rebuild(self):
         snap = self.store.snapshot("pugc", NOW, rebuild=False)
-        self.assertEqual(snap["goal"]["state"], "IDLE")
-        self.assertTrue(snap["policy"]["can_dispatch_goal"])
+        self.assertEqual(snap["goal"]["state"], "UNKNOWN")
+        self.assertFalse(snap["policy"]["can_dispatch_goal"])
 
     def test_get_does_not_begin_immediate(self):
         self.store.snapshot("pugc", NOW, rebuild=True)
@@ -294,3 +294,53 @@ class StoreTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class PublishedSnapshotTest(unittest.TestCase):
+    setUp = StoreTest.setUp
+    tearDown = StoreTest.tearDown
+
+    def test_stale_resolver_cache_is_not_published_on_restart(self):
+        self.store.snapshot('pugc', NOW)
+        self.store._conn.execute("UPDATE worker_snapshots SET resolver_version = 'old'")
+        self.store.close()
+        self.store = Store(Path(self.tmp.name) / 'state.sqlite')
+        self.assertEqual(self.store.snapshot('pugc', NOW, rebuild=False)['goal']['state'], 'UNKNOWN')
+        self.assertEqual(self.store.replay('pugc', NOW)['goal']['state'], 'IDLE')
+
+    def test_completion_advance_is_scoped_to_attempt(self):
+        event = {'worker': 'minecraft', 'kind': 'goal.completed', 'source': 'qoder_jsonl',
+                 'goal_id': 'g1', 'turn_id': 't1', 'attempt_id': 1, 'payload': {}}
+        snapshot = self.store.ingest({**event, 'event_id': 'first'}, NOW)
+        claim = self.store.claim('minecraft', 'advance', snapshot['snapshot_version'], 'first', NOW)
+        self.store.action_result(claim['action_id'], True, NOW)
+        self.store.ingest({**event, 'event_id': 'resume', 'kind': 'input.resume', 'source': 'api',
+                           'turn_id': 't2', 'attempt_id': 2}, NOW + 1)
+        next_ = self.store.ingest({**event, 'event_id': 'second', 'turn_id': 't2', 'attempt_id': 2}, NOW + 1)
+        self.assertTrue(next_['policy']['grokbot_may_advance'])
+
+    def test_get_does_not_wait_for_writer_lock_or_read_sqlite(self):
+        self.store.snapshot('pugc', NOW)
+        done = threading.Event()
+        with self.store._lock:
+            thread = threading.Thread(target=lambda: (
+                self.store.snapshot('pugc', NOW + 1, rebuild=False), done.set()))
+            thread.start()
+            self.assertTrue(done.wait(0.5), 'GET waits for the SQLite writer lock')
+        thread.join()
+
+    def test_assignment_requires_current_advance_and_failure_reopens(self):
+        self.store.ingest({'event_id': 'complete', 'worker': 'minecraft',
+            'kind': 'goal.completed', 'source': 'qoder_jsonl', 'goal_id': 'g1',
+            'attempt_id': 1, 'payload': {}}, NOW)
+        snap = self.store.snapshot('minecraft', NOW)
+        claim = self.store.claim('minecraft', 'advance', snap['snapshot_version'], 'advance:g1', NOW)
+        self.store.action_result(claim['action_id'], True, NOW)
+        base = {'worker': 'minecraft', 'source': 'api', 'goal_id': 'g1', 'attempt_id': 1,
+                'payload': {'action_id': claim['action_id'], 'request_id': 'r1'}}
+        assigning = self.store.ingest({**base, 'event_id': 'start', 'kind': 'assignment.started'}, NOW)
+        self.assertEqual(assigning['goal']['state'], 'ASSIGNING')
+        self.assertEqual(assigning['goal']['assignment_id'], 'r1')
+        failed = self.store.ingest({**base, 'event_id': 'fail', 'kind': 'assignment.failed'}, NOW + 301)
+        self.assertTrue(failed['policy']['grokbot_may_advance'])
+        with self.assertRaises(StoreError):
+            self.store.ingest({**base, 'event_id': 'late', 'kind': 'assignment.finished'}, NOW + 302)

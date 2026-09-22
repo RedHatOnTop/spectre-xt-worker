@@ -9,7 +9,7 @@ SCHEMA_VERSION = 1
 # 1.0.1: session.phase.finished is no longer a turn boundary, and hook.finished
 # no longer raises IDLE to RUNNING (design I3). Both changes alter resolved
 # output for the same journal, so the version moves with them.
-RESOLVER_VERSION = "1.1.0"
+RESOLVER_VERSION = "1.2.0"
 
 # API-down / never-asked. Distinct from IDLE (unseen worker, dispatch allowed).
 GOAL_STATES = (

@@ -2445,7 +2445,7 @@ left (`worker_state/legacy.py` is shadow-only). Still unverified: survival
 across a box reboot, and the first real `spectre-continuity` resume when a
 genuine stall appears — no stall has occurred since the cutover.
 
-**Known limitation — read latency (measured 2026-09-19 22:30 KST).** Every
+**Historical limitation — read latency (measured 2026-09-19 22:30 KST).** Every
 snapshot request rebuilds from the journal inside `BEGIN IMMEDIATE`
 (`Store.snapshot`), so a read takes the write lock and clashes with the 2 s
 poller. On the box at load ~40 (unrelated stress tests + minecraft JVMs):
@@ -2455,30 +2455,172 @@ surfaces as `state api unavailable: timed out` → UNKNOWN → fail-closed (no
 dispatch, no resume, no continuity). That is the designed failure direction,
 but it means Slack `/goal` can be refused while the box is loaded. A cheaper
 read path (serve the cached row and apply `now`-dependent effects at read time,
-or drop the write from GET) is not implemented.
+or drop the write from GET) was not implemented at that measurement. The local
+1.2.0 implementation below replaces this path; its on-box latency is unverified.
 
 ---
 
-## 7.18 Control plane (since 2026-09-21)
+## 7.18 Control plane (continued 2026-09-22)
 
-One occupancy authority (`spectre-state`) and one typer (`spectre-slack-bridge
---dispatch`). GET copies a published snapshot and applies now-dependent stall /
-UNCONFIRMED effects without `BEGIN IMMEDIATE`; a cache miss is UNKNOWN
-(fail-closed). Efficient `/goal` lines still go through the clause; Flash
-packets send only `/usr/local/bin/dsh-clinepass --file $HOME/.local/state/remote-agent/packets/<id>.txt`.
-`SPECTRE_LOOP` and `ASTRA_ENABLED` stay unset (installed-off) until the operator
-enables them after the store tests for `advance` vs `terminal_write.succeeded`
-are green. `goal-supervisor.timer` stays installed-off even if grok reappears.
+**Status:** implemented and tested locally; not deployed or verified on Spectre.
+SSH is blocked by the Tailscale check-mode approval (§7). No model calls,
+service restarts, timer enablement, or real worker input were performed during
+this continuation. The local integration tests use the real UDS daemon and
+bridge with fake Orca I/O, not a live planner or Slack connection.
 
-Verify (host):
+### Runtime contract
+
+- `spectre-state` remains the only occupancy authority; `spectre-slack-bridge
+  --dispatch` remains the only terminal writer. Resolver 1.2.0 copies published
+  snapshots without the SQLite writer lock. Missing or older-resolver caches
+  return UNKNOWN until the poller republishes them. SQLite schema stays v1.
+- `spectre-loop` persists private atomic intent before claiming or typing.
+  Assignment IDs bind the advance, ASSIGNING state, planner pin, result file,
+  and once-only `.sent` reservation. A crash with uncertain delivery never
+  blindly retypes a packet. Inspect the authority and terminal before recovery;
+  do not delete the loop state or `.sent` markers to force a retry.
+- Minecraft alone has a planner. `ASTRA_ENABLED=0` skips it completely, rather
+  than reading `next_goal.json` into Efficient. One planner turn yields 1–4
+  schema-valid packets, stable across two polls; only one packet is dispatched
+  per tick. FAILED or `requires_astra_review` discards the remaining batch and
+  requests a new plan after authoritative completion. Assignment timeout is
+  300 seconds, followed by a 300-second retry backoff and a Slack escalation.
+- Flash uses the pinned persistent shell and `dsh-clinepass --file <packet>`;
+  it never receives `/goal`. Progress remains visible in Orca. The wrapper
+  publishes a private atomic `.exit`, including wall timeout 124 at six hours,
+  and terminates the process group on timeout or interruption.
+- Efficient accepts mechanical packets only. Missing Flash permits fallback
+  only for mechanical work. Other packets are escalated and retained at the
+  back of the same batch — never assigned to Efficient. Queued mechanical work
+  still runs ahead of that retry. Missing/invalid/blocked
+  `next_goal.json` on other workers escalates once per completion; failed Slack
+  notifications are retried and do not block the rest of the batch. Goal text
+  must be a string of at most 600 chars.
+  Efficient lines exceeding 4,000 chars including acceptance and the protocol
+  clause are refused intact, never truncated.
+- Storm limits reserve conservatively before I/O: 60-second worker spacing,
+  96 worker dispatches/day, 256 globally/day, and no consecutive identical goal
+  fingerprint. Plus permits three normal and one failed-work wake per five
+  hours. API relays are not charged against that Plus wake cap.
+- PARKED states escalate once without consuming an advance or typing. In
+  particular `plan_gate` is operator-only, and `goal_budget` remains resumable
+  through the bridge, not a false completion. This deliberately resolves the
+  original plan's conflict between `grokbot_may_advance` on PARKED and the
+  assignment API's COMPLETED/FAILED-only ownership check.
+
+### Install without enabling automation
+
+Run from the updated checkout **on Spectre**, not the daily driver:
 
 ```bash
-python3 -m unittest discover -s tests -p 'test_*.py'
-node --test tests/slack_bridge.test.mjs
+bash verify.sh
+sudo bash scripts/install-control-plane.sh
+systemctl --user daemon-reload
 ```
 
-On the box, do not enable `spectre-loop.timer` or `ASTRA_ENABLED` in this slice.
-Retired classifiers must stay disabled (`spectre-doctor` / `systemctl --user is-enabled`).
+The targeted installer installs the Python packages, bridge helpers, executable
+wrappers, prompt/schema, and units. It does not restart services, overwrite the
+worker registry, enable timers, change feature flags, or contact a model. For an
+isolated packaging check on any host, set `DESTDIR` and an absolute
+`PERSON_HOME`; `tests/test_control_plane_install.py` executes the installed CLIs
+without source-tree imports.
+
+Use **one writable registry** at
+`~/.config/remote-agent/qoder-workers.json` for every consumer. Seed it from the
+box's current live registry, not blindly from the repository template. Preserve
+all existing workers, cwd values, tmux sessions, and terminal pins. Add the
+Minecraft `planner` and `targets` metadata from `config/qoder-workers.json`,
+keeping `terminal` and `targets.efficient.terminal` equal to the observed
+Efficient pin; planner/Flash handles remain null until actually observed.
+`QODER_WORKERS_FILE` overrides this location. Remove or align any older explicit
+`--workers-file` override in service drop-ins so the daemon, bridge, loop,
+launcher, and pin sync all read the same registry.
+
+After backing up the registry and reviewing the install, restart only the
+state daemon and bridge. Terminal agents are not part of this reload:
+
+```bash
+systemctl --user restart spectre-worker-state.service slack-bridge.service
+spectre-state health
+spectre-state get minecraft
+spectre-pin-sync                         # inspection only; ambiguity is an error
+spectre-pin-sync --apply                 # updates only observed unambiguous pins
+SPECTRE_LOOP=1 ASTRA_ENABLED=0 spectre-loop --dry-run
+spectre-reaper                          # dry-run; inspect every proposed target
+```
+
+The reaper reads `/proc`, process-owned `ss -ltnpH`, one Orca inventory, and SSOT
+snapshots. Unknown occupancy, incomplete listener ownership, or an unavailable
+inventory prevents unsafe reaping. Pin shells, Astra, control-plane listeners
+(6768/7676/9222/9091), control daemons, and foreign DSH TUI sessions are protected.
+Descendant listeners protect their ancestors. Unpinned duplicate CLIs and
+untitled shells require a 300-second age; heavy processes, Minecraft clients,
+and review servers are also candidates. A completed/failed Flash headless
+process is eligible after 300 seconds, never its pin's shell. Thresholds may be
+overridden with positive `SPECTRE_REAPER_RSS_MIB` (default 256) and
+`SPECTRE_REAPER_CPU_PERCENT` (default 5, two samples). `--apply` sends identity-
+checked pidfd SIGTERM and posts a fleet audit; it deliberately does not escalate
+to SIGKILL. Keep it dry-run for at least one reviewed week before considering
+`--apply`. Do not run fixture inputs with `--apply`.
+
+### Planner and Flash setup (operator action, after the gates)
+
+In `~/.codex/modes/providers.json`, both `anyrouter` and `agentrouter` require an
+HTTPS `base_url`, `wire_api` (`responses` or `chat`), and an explicitly configured
+cheap non-Astra `probe_model` supported by that relay. Keys remain in private
+mode-600 `~/.codex/modes/keys/<id>` files; never print or paste them. Health sends
+at most one output token per probe, without redirects, `/models`, or
+`codex-mode probe-payload`. Missing configuration fails closed; it does not
+spend Plus quota. Valid relay failures permit last-resort ChatGPT selection.
+
+```bash
+spectre-codex-provider-health             # real, bounded relay requests
+spectre-astra --dry-run                  # refuses if any Astra already runs
+spectre-astra                            # creates one visible Orca planner
+orca-ide terminal list --json
+```
+
+The launcher selects the provider via `codex-mode` before atomically recording
+`active-provider`, then creates an Orca-managed terminal in the Minecraft
+worktree and records its real handle. It refuses existing Astra processes and
+requires the Efficient pin to be identified before creating a second terminal.
+Plan dispatch also refuses explicit `model_provider=openai` overrides or an
+Astra process count other than one. No loop tick creates another terminal.
+Provider health never hot-switches a running planner: `provider_restart_required`
+requires operator shutdown and relaunch. After an observed Plus rate limit,
+`spectre-codex-provider-health --plus-rate-limited` records the five-hour cooldown.
+
+Create the persistent Flash shell **in Orca**, using the registry's actual cwd:
+
+```bash
+orca-ide terminal create --worktree path:<minecraft-cwd> --title flash-packets --command bash
+spectre-pin-sync --flash-terminal <observed-term-handle> --apply
+```
+
+Binding checks that the handle is a live writable idle shell in that worktree.
+Do not invent a handle, create a bare tmux session, or start an invisible agent.
+Verify the wrapper is executable, DSH is installed, and the ClinePass key exists
+with mode 600. `spectre-slack-bridge --dispatch goal minecraft 'bounded check'
+--target flash --dry-run` checks readiness without typing or writing a packet.
+
+### On-box completion gate (not yet run)
+
+1. Run `bash verify.sh`, `sudo spectre-doctor`, state health/snapshots, pin-sync
+   inspection, loop dry-run, and reaper dry-run. Record actual output. Confirm
+   all new timers and the legacy supervisor/classifiers remain disabled.
+2. Confirm the real Orca planner/Flash/Efficient pins and provider health. In a
+   supervised bounded task, enable `SPECTRE_LOOP=1 ASTRA_ENABLED=1` for one-shot
+   ticks only. Observe COMPLETED → ASSIGNING, one planner prompt, stable result
+   file → one implementer packet → authoritative completion. No second prompt
+   for the same request, no `/goal` in Flash, no planner process replacement.
+3. Inspect failed/missing result handling, Slack escalation delivery, process
+   exit evidence, and GET latency under load. Check the next mechanical packet
+   runs only after the first completed. Do not use fabricated completion events
+   against a live worker to force this gate.
+4. Only after those gates should an operator enable `spectre-loop.timer` and
+   `codex-provider-health.timer` with matching service feature flags. Pin sync
+   and reaper units remain dry-run by default. No enablement is part of the
+   local implementation or targeted installer.
 
 ---
 

@@ -2,7 +2,7 @@
 // Unit tests for the Slack Socket Mode bridge policy and guards.
 import assert from "node:assert/strict";
 import { execFileSync, spawn, spawnSync } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { test } from "node:test";
@@ -926,8 +926,7 @@ test("dispatchLine: goal carries the clause on one line, resume is the bare comm
   assert.equal(dispatchLine("resume", "ignored", clause), "/goal resume");
   assert.equal(dispatchLine("goal", "no clause yet", ""), "/goal no clause yet");
   assert.equal(dispatchLine("goal", "x", "   "), "/goal x");
-  const capped = dispatchLine("goal", "y".repeat(5000), "clause");
-  assert.equal(capped.length, 4000);
+  assert.throws(() => dispatchLine("goal", "y".repeat(5000), "clause"), /goal line exceeds 4000/);
 });
 
 test("parseDispatchArgs: supervisor CLI shape", () => {
@@ -940,6 +939,7 @@ test("parseDispatchArgs: supervisor CLI shape", () => {
     operator: "supervisor",
     workersFile: null,
     target: "efficient",
+    requestId: null,
     error: null,
   });
 
@@ -988,7 +988,7 @@ test("writeFlashPacket: names the file after the claimed dispatch_id", () => {
     const written = writeFlashPacket("d-claimed1", "fix   the nether\nnext", env);
     assert.equal(written.ok, true);
     assert.equal(written.path, join(dir, "d-claimed1.txt"));
-    assert.equal(readFileSync(written.path, "utf8"), "fix the nether next\n");
+    assert.equal(readFileSync(written.path, "utf8"), "fix   the nether\nnext\n");
     assert.equal(statSync(written.path).mode & 0o777, 0o600);
     const made = finalizeFlashInjection({ claim: { dispatch_id: "d-claimed1" } }, "fix the nether", env);
     assert.equal(made.ok, true);
@@ -1074,7 +1074,19 @@ test("parseDispatchArgs: refusals never become a bare goal", () => {
 const BRIDGE_SCRIPT = join(dirname(fileURLToPath(import.meta.url)), "..", "scripts", "slack-bridge.mjs");
 const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 
+function fakeProcess(root, pid, argv, handle, cwd) {
+  const path = join(root, String(pid));
+  mkdirSync(path, { recursive: true });
+  writeFileSync(join(path, "cmdline"), argv.join("\0") + "\0");
+  writeFileSync(join(path, "environ"), `ORCA_TERMINAL_HANDLE=${handle}\0`);
+  writeFileSync(join(path, "stat"), `${pid} (test) S 1 0 0 0`);
+  symlinkSync(cwd, join(path, "cwd"));
+}
+
 function startStateServer(dir, ingestKind) {
+  const proc = join(dir, "identity-proc");
+  fakeProcess(proc, 991, ["qodercli", "-m", "Efficient"], "term_test", dir);
+  fakeProcess(proc, 992, ["qodercli", "-m", "Efficient"], "term_pin", dir);
   const sock = join(dir, "state.sock");
   const db = join(dir, "state.sqlite");
   const pyPath = join(dir, "seed.py");
@@ -1089,7 +1101,7 @@ function startStateServer(dir, ingestKind) {
       "now = 1800000000.0",
       ingestKind === "parked"
         ? "store.ingest({\"event_id\":\"park-1\",\"worker\":\"native\",\"kind\":\"goal.parked\",\"source\":\"session_jsonl\",\"turn_id\":\"t1\",\"source_timestamp\":\"2027-01-15T08:00:00+00:00\",\"payload\":{\"park_reason\":\"goal_budget\"}}, now)"
-        : "store.snapshot(\"idle\", now, rebuild=True)",
+        : "for worker in ('idle', 'minecraft', 'faux'): store.snapshot(worker, now, rebuild=True)",
       "store.close()",
     ].join("\n"),
   );
@@ -1110,7 +1122,7 @@ function startStateServer(dir, ingestKind) {
     Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50);
   }
   return {
-    env: { SPECTRE_WORKER_STATE_SOCK: sock },
+    env: { SPECTRE_WORKER_STATE_SOCK: sock, SPECTRE_PROC_ROOT: proc },
     db,
     stop() {
       child.kill("SIGTERM");
@@ -1119,19 +1131,15 @@ function startStateServer(dir, ingestKind) {
 }
 
 function seedParked(db, worker, eventId, turnId) {
-  const pyPath = join(dirname(db), `seed-${eventId}.py`);
-  writeFileSync(
-    pyPath,
-    [
-      "import sys",
-      `sys.path.insert(0, ${JSON.stringify(join(REPO_ROOT, "scripts"))})`,
-      "from worker_state.store import Store",
-      `store = Store(${JSON.stringify(db)})`,
-      `store.ingest({"event_id":${JSON.stringify(eventId)},"worker":${JSON.stringify(worker)},"kind":"goal.parked","source":"session_jsonl","turn_id":${JSON.stringify(turnId)},"source_timestamp":"2027-01-15T08:00:01+00:00","payload":{"park_reason":"goal_budget"}}, 1800000001.0)`,
-      "store.close()",
-    ].join("\n"),
-  );
-  execFileSync("python3", [pyPath]);
+  const script = [
+    "import sys",
+    `sys.path.insert(0, ${JSON.stringify(join(REPO_ROOT, "scripts"))})`,
+    "from worker_state.client import StateClient",
+    `client = StateClient(${JSON.stringify(join(dirname(db), "state.sock"))})`,
+    `status, payload = client.evidence({"event_id":${JSON.stringify(eventId)},"worker":${JSON.stringify(worker)},"kind":"goal.parked","source":"session_jsonl","turn_id":${JSON.stringify(turnId)},"source_timestamp":"2027-01-15T08:00:01+00:00","payload":{"park_reason":"goal_budget"}})`,
+    "assert status == 200, payload",
+  ].join("\n");
+  execFileSync("python3", ["-c", script]);
 }
 
 function runBridge(args, env) {
@@ -1149,6 +1157,7 @@ function writeFlashBits(dir) {
   const proc = join(dir, "proc");
   const packets = join(dir, "packets");
   mkdirSync(proc, { recursive: true });
+  fakeProcess(proc, 998, ["bash"], "term_flash", dir);
   mkdirSync(packets, { recursive: true });
   writeFileSync(wrapper, "#!/bin/sh\nexit 0\n");
   chmodSync(wrapper, 0o755);

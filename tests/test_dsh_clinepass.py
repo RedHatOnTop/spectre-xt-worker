@@ -14,6 +14,15 @@ WRAPPER = ROOT / "scripts" / "dsh-clinepass"
 
 
 class WrapperTest(unittest.TestCase):
+    def test_timeout_cleanup_kills_group_after_leader_exits(self):
+        import runpy
+        from unittest.mock import MagicMock, patch
+        wrapper = runpy.run_path(str(WRAPPER))
+        proc = MagicMock(pid=12345)
+        with patch('os.killpg') as kill:
+            wrapper['stop_group'](proc)
+        self.assertEqual([call.args[1] for call in kill.call_args_list], [15, 9])
+
     def test_unknown_flag_exits_2(self) -> None:
         proc = subprocess.run(
             [sys.executable, str(WRAPPER), "--file", "/nope", "--dispatch-id", "x"],
@@ -36,7 +45,7 @@ class WrapperTest(unittest.TestCase):
             fake_dsh.chmod(0o755)
             packet = Path(tmp) / "abc.txt"
             packet.write_text("do the work\n", encoding="utf-8")
-            env = os.environ.copy()
+            env = {**os.environ, "SPECTRE_PACKET_DIR": tmp}
             env["SPECTRE_DSH_KEY"] = str(key)
             env["SPECTRE_DSH_BIN"] = str(fake_dsh)
             env["SPECTRE_DSH_HOME"] = tmp
@@ -63,7 +72,7 @@ class WrapperTest(unittest.TestCase):
             fake_dsh.chmod(0o755)
             packet = Path(tmp) / "ok.txt"
             packet.write_text("done\n", encoding="utf-8")
-            env = os.environ.copy()
+            env = {**os.environ, "SPECTRE_PACKET_DIR": tmp}
             env["SPECTRE_DSH_KEY"] = str(key)
             env["SPECTRE_DSH_BIN"] = str(fake_dsh)
             env["SPECTRE_DSH_HOME"] = tmp
@@ -86,7 +95,7 @@ class WrapperTest(unittest.TestCase):
             key.chmod(0o644)
             packet = Path(tmp) / "p.txt"
             packet.write_text("x\n", encoding="utf-8")
-            env = os.environ.copy()
+            env = {**os.environ, "SPECTRE_PACKET_DIR": tmp}
             env["SPECTRE_DSH_KEY"] = str(key)
             env["SPECTRE_DSH_BIN"] = "/bin/true"
             proc = subprocess.run(
@@ -97,6 +106,34 @@ class WrapperTest(unittest.TestCase):
                 timeout=5,
             )
             self.assertEqual(proc.returncode, 2)
+
+    def test_packet_outside_spool_is_rejected_without_sidecar(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            packet = Path(tmp) / "outside.txt"
+            packet.write_text("do not execute")
+            proc = subprocess.run([sys.executable, str(WRAPPER), "--file", str(packet)],
+                env={**os.environ, "SPECTRE_PACKET_DIR": str(Path(tmp) / "spool")},
+                capture_output=True, text=True, timeout=5)
+            self.assertEqual(proc.returncode, 2)
+            self.assertFalse(packet.with_suffix(".exit").exists())
+
+    def test_output_stays_visible_and_sidecar_is_private(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            key = Path(tmp) / "key"
+            key.write_text("fixture-key")
+            key.chmod(0o600)
+            packet = Path(tmp) / "visible.txt"
+            packet.write_text("work")
+            binary = Path(tmp) / "dsh"
+            binary.write_text("#!" + sys.executable + "\nprint('visible progress')\n")
+            binary.chmod(0o755)
+            env = {**os.environ, "SPECTRE_PACKET_DIR": tmp, "SPECTRE_DSH_KEY": str(key),
+                   "SPECTRE_DSH_BIN": str(binary)}
+            proc = subprocess.run([sys.executable, str(WRAPPER), "--file", str(packet)],
+                                  env=env, capture_output=True, text=True, timeout=5)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn("visible progress", proc.stdout)
+            self.assertEqual(packet.with_suffix(".exit").stat().st_mode & 0o777, 0o600)
 
     def test_wrapper_is_executable_bit_in_tree(self) -> None:
         mode = stat.S_IMODE(WRAPPER.stat().st_mode)

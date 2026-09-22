@@ -38,6 +38,8 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { randomUUID } from "node:crypto";
+import { nativeProcessGuard, processRole, processes } from "./dispatch-process.mjs";
+import { planGuard, plannerPrompt, reservePlan } from "./planner-dispatch.mjs";
 import { actionResult, claimAction, getSnapshot } from "./worker-state-client.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -501,10 +503,9 @@ const SHELL_COMMANDS = ["bash", "zsh", "sh", "dash", "fish", "ksh", "tcsh"];
 export function paneRefusal(command, path, cwd, opts = {}) {
   const cmd = String(command || "").replace(/^-/, "").toLowerCase();
   if (SHELL_COMMANDS.includes(cmd)) {
-    if (opts.allowFlashShell && String(opts.line || "").startsWith(FLASH_FILE_PREFIX)) {
-      return null;
+    if (!(opts.allowFlashShell && String(opts.line || "").startsWith(FLASH_FILE_PREFIX))) {
+      return `pane runs a shell (${cmd}) — the text would execute as a shell command`;
     }
-    return `pane runs a shell (${cmd}) — the text would execute as a shell command`;
   }
   if (cwd && path) {
     let same = path === cwd;
@@ -571,11 +572,12 @@ export function oneLine(text) {
 export function dispatchLine(builtin, goalText, clauseText) {
   let line = builtin === "resume" ? "/goal resume" : `/goal ${oneLine(goalText)}`;
   if (builtin !== "resume" && oneLine(clauseText)) line += ` ${oneLine(clauseText)}`;
-  return line.length > GOAL_LINE_MAX ? line.slice(0, GOAL_LINE_MAX) : line;
+  if (line.length > GOAL_LINE_MAX) throw new RangeError(`goal line exceeds ${GOAL_LINE_MAX} characters`);
+  return line;
 }
 
 export const FLASH_FILE_PREFIX = "/usr/local/bin/dsh-clinepass --file ";
-export const FLASH_PACKET_DIR = "/home/person/.local/state/remote-agent/packets";
+export const FLASH_PACKET_DIR = join(homedir(), ".local/state/remote-agent/packets");
 export const FLASH_WRAPPER = "/usr/local/bin/dsh-clinepass";
 export const FLASH_KEY_DEFAULT = join(homedir(), ".config/fullmoon-agent-control/cline_api_key");
 export const FLASH_DSH_DEFAULT = join(homedir(), ".local/share/deepseek-harness-venv/bin/dsh");
@@ -607,7 +609,7 @@ export function writeFlashPacket(dispatchId, text, env = process.env) {
     mkdirSync(dir, { recursive: true });
     const dest = join(dir, `${id}.txt`);
     const tmp = join(dir, `${id}.txt.tmp`);
-    writeFileSync(tmp, `${oneLine(text)}\n`, { encoding: "utf8" });
+    writeFileSync(tmp, `${String(text).trim()}\n`, { encoding: "utf8", mode: 0o600, flag: "wx" });
     chmodSync(tmp, 0o600);
     renameSync(tmp, dest);
     return { ok: true, path: dest };
@@ -747,8 +749,8 @@ export function injectionLine({ builtin, target, goalText, clauseText, dispatchI
 
 export function astraPidVerdict(cmdlines) {
   const lines = (Array.isArray(cmdlines) ? cmdlines : []).map((c) => String(c));
-  const astra = lines.filter((c) => c.includes("gpt-6-astra"));
-  if (astra.some((c) => /model_provider\s*=\s*openai/.test(c))) {
+  const astra = lines.filter((c) => processRole(c.split(/\s+/)) === "astra");
+  if (astra.some((c) => /model_provider\s*=\s*["\']?openai/.test(c))) {
     return { ok: false, evt: "dispatch_astra_plus_burn" };
   }
   if (astra.length !== 1) {
@@ -766,24 +768,13 @@ export function astraCmdlinesFromEnv(env = process.env) {
 export function listAstraCmdlines(env = process.env, procRoot = "/proc") {
   const fromEnv = astraCmdlinesFromEnv(env);
   if (fromEnv) return fromEnv;
-  const out = [];
-  let ents = [];
   try {
-    ents = readdirSync(procRoot, { withFileTypes: true });
+    const rows = processes(env.SPECTRE_PROC_ROOT || procRoot).filter((row) => row.role === "astra");
+    const leaves = rows.filter((row) => !rows.some((other) => other.ppid === row.pid));
+    return leaves.map((row) => row.argv.join(" "));
   } catch {
-    return out;
+    return [];
   }
-  for (const ent of ents) {
-    if (!ent.isDirectory() || !/^\d+$/.test(ent.name)) continue;
-    try {
-      const raw = readFileSync(join(procRoot, ent.name, "cmdline"));
-      const cmd = String(raw).replace(/\0/g, " ");
-      if (cmd.includes("gpt-6-astra")) out.push(cmd);
-    } catch {
-      // unreadable pid
-    }
-  }
-  return out;
 }
 
 // CLI parsing for `--dispatch` (the goal supervisor's path; needs no Slack).
@@ -797,6 +788,7 @@ export function parseDispatchArgs(argv) {
     operator: "supervisor",
     workersFile: null,
     target: "efficient",
+    requestId: null,
     error: null,
   };
   const rest = [];
@@ -809,6 +801,9 @@ export function parseDispatchArgs(argv) {
       i += 1;
     } else if (arg === "--workers-file") {
       out.workersFile = String(argv[i + 1] || "").trim() || null;
+      i += 1;
+    } else if (arg === "--request-id") {
+      out.requestId = String(argv[i + 1] || "");
       i += 1;
     } else if (arg === "--target") {
       out.target = String(argv[i + 1] || "efficient").trim().toLowerCase() || "efficient";
@@ -829,6 +824,9 @@ export function parseDispatchArgs(argv) {
     out.error = `usage: --dispatch ${builtin} <worker>${builtin === "goal" ? " <goal text>" : ""}`;
   } else if (builtin === "goal" && !out.text) {
     out.error = "usage: --dispatch goal <worker> <goal text>";
+  }
+  if (!["flash", "efficient"].includes(out.target) || (builtin === "resume" && out.target !== "efficient")) {
+    out.error = "invalid target for dispatch";
   }
   return out;
 }
@@ -1478,7 +1476,9 @@ async function runLocalStatus() {
 }
 
 function loadWorkers(overridePath) {
-  const path = overridePath || (existsSync(BOX_WORKERS_FILE) ? BOX_WORKERS_FILE : REPO_WORKERS_FILE);
+  const local = join(homedir(), ".config/remote-agent/qoder-workers.json");
+  const path = overridePath || process.env.QODER_WORKERS_FILE || (existsSync(local) ? local
+    : existsSync(BOX_WORKERS_FILE) ? BOX_WORKERS_FILE : REPO_WORKERS_FILE);
   try {
     const payload = JSON.parse(readFileSync(path, "utf8"));
     const workers = payload && typeof payload.workers === "object" ? payload.workers : null;
@@ -1529,7 +1529,7 @@ async function finishClaim(claim, ok, error) {
   }
 }
 
-async function claimDispatch(worker, builtin, snapshot, target) {
+async function claimDispatch(worker, builtin, snapshot, target, terminal) {
   const action = dispatchAction(builtin);
   try {
     const { status, payload } = await claimAction({
@@ -1538,6 +1538,7 @@ async function claimDispatch(worker, builtin, snapshot, target) {
       expected_snapshot_version: snapshot.snapshot_version,
       idempotency_key: `${action}:${worker}:${snapshot.snapshot_version}:${randomUUID()}`,
       target: target || "efficient",
+      ...(terminal ? { terminal } : {}),
     });
     if (status !== 200 || !payload || !payload.action_id) {
       return {
@@ -1654,7 +1655,7 @@ async function dispatchCli(argv) {
 
   let injected;
   if (opts.builtin === "plan") {
-    injected = injectionLine({ builtin: "plan", goalText: opts.text });
+    injected = "";
   } else if (opts.builtin === "goal" && targetName === "flash") {
     // Placeholder for paneRefusal / dry-run. Live send overwrites after claim
     // writes packets/<dispatch_id>.txt named after the claimed id.
@@ -1670,12 +1671,16 @@ async function dispatchCli(argv) {
         code: 1,
       };
     }
-    injected = injectionLine({
-      builtin: "goal",
-      target: targetName,
-      goalText: opts.text,
-      clauseText: clause.text,
-    });
+    try {
+      injected = injectionLine({
+        builtin: "goal",
+        target: targetName,
+        goalText: opts.text,
+        clauseText: clause.text,
+      });
+    } catch (error) {
+      return { ok: false, evt: "dispatch_goal_too_long", detail: error.message, code: 1 };
+    }
   } else {
     injected = injectionLine({ builtin: "resume" });
   }
@@ -1690,7 +1695,9 @@ async function dispatchCli(argv) {
       code: 1,
     };
   }
-  const verdict = dispatchAllowed(probe.payload, dispatchAction(opts.builtin));
+  const verdict = opts.builtin === "plan"
+    ? planGuard(opts.worker, entry, probe.payload, opts.requestId)
+    : dispatchAllowed(probe.payload, dispatchAction(opts.builtin));
   if (!verdict.ok) {
     audit({ evt: "dispatch_refused", builtin: opts.builtin, worker: opts.worker, state: probe.payload.state, origin: opts.operator });
     return {
@@ -1703,17 +1710,34 @@ async function dispatchCli(argv) {
     };
   }
 
+  if (opts.builtin === "plan") {
+    try {
+      injected = oneLine(plannerPrompt(opts.requestId, probe.payload));
+    } catch (error) {
+      return { ok: false, evt: "dispatch_plan_prompt_failed", detail: error.message, code: 1 };
+    }
+  }
+
   if (!entry.tmux) {
     const listed = await listOrcaTerminals();
     if (!listed.ok) {
       audit({ evt: "dispatch_orca_failed", worker: opts.worker, origin: opts.operator, error: listed.error });
       return { ok: false, evt: "dispatch_orca_failed", detail: `cannot list orca terminals for ${opts.worker}: ${listed.error}`, code: 1 };
     }
-    const pin = targetName === "flash" ? flashPin(entry) : entry.terminal;
+    const pin = opts.builtin === "plan" ? entry.planner.terminal
+      : targetName === "flash" ? flashPin(entry) : (entry.targets?.efficient?.terminal || entry.terminal);
     const pick = pickNativeTerminal(listed.terminals, entry.cwd, pin);
     if (!pick.ok) {
       audit({ evt: "dispatch_orca_refused", worker: opts.worker, origin: opts.operator, detail: pick.detail });
       return { ok: false, evt: "dispatch_orca_refused", detail: pick.detail, code: 1 };
+    }
+    const role = opts.builtin === "plan" ? "astra" : targetName;
+    try {
+      if (!nativeProcessGuard(pick.terminal.handle, entry.cwd, role)) {
+        return { ok: false, evt: "dispatch_model_mismatch", detail: "pinned process argv/cwd does not match target", code: 1 };
+      }
+    } catch (error) {
+      return { ok: false, evt: "dispatch_model_mismatch", detail: error.message, code: 1 };
     }
     const base = {
       builtin: opts.builtin,
@@ -1728,9 +1752,15 @@ async function dispatchCli(argv) {
       audit({ evt: "dispatch_dry_run", ...base, line: injected });
       return { ok: true, evt: "dispatch_dry_run", ...base, line: injected };
     }
+    if (opts.builtin === "plan") {
+      const reserved = reservePlan(opts.requestId, packetDir());
+      if (!reserved.ok) {
+        return { ok: false, evt: "dispatch_plan_duplicate", detail: reserved.error, code: 1 };
+      }
+    }
     const claimed = opts.builtin === "plan"
       ? { ok: true, claim: { action_id: null } }
-      : await claimDispatch(opts.worker, opts.builtin, probe.payload, targetName);
+      : await claimDispatch(opts.worker, opts.builtin, probe.payload, targetName, pick.terminal.handle);
     if (!claimed.ok) {
       audit({ evt: "dispatch_claim_failed", worker: opts.worker, origin: opts.operator, error: claimed.error });
       return { ok: false, evt: "dispatch_claim_failed", detail: `claim refused for ${opts.worker}: ${claimed.error}`, code: 1 };
@@ -1845,7 +1875,12 @@ async function handleDispatch(msg, ctx, builtin, workerName, goalText) {
       await reply(`:warning: protocol clause unreadable (${clause.path}) — refusing to dispatch without it`);
       return;
     }
-    injected = dispatchLine("goal", goalText, clause.text);
+    try {
+      injected = dispatchLine("goal", goalText, clause.text);
+    } catch (error) {
+      await reply(`goal refused: ${error.message}`);
+      return;
+    }
   } else {
     injected = dispatchLine("resume", "", "");
   }
@@ -1879,7 +1914,16 @@ async function handleDispatch(msg, ctx, builtin, workerName, goalText) {
       await reply(`:no_entry: ${builtin} refused: ${pick.detail}`);
       return;
     }
-    const claimed = await claimDispatch(workerName, builtin, probe.payload);
+    try {
+      if (!nativeProcessGuard(pick.terminal.handle, entry.cwd, "efficient")) {
+        await reply("dispatch refused: pinned process argv/cwd does not match Efficient");
+        return;
+      }
+    } catch (error) {
+      await reply(`dispatch refused: ${error.message}`);
+      return;
+    }
+    const claimed = await claimDispatch(workerName, builtin, probe.payload, "efficient", pick.terminal.handle);
     if (!claimed.ok) {
       audit({ evt: "dispatch_claim_failed", worker: workerName, error: claimed.error });
       await reply(`:no_entry: ${builtin} refused: claim failed (${claimed.error})`);

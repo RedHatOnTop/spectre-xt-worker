@@ -31,7 +31,7 @@ else
 fi
 
 section "python compile"
-if python3 -m py_compile scripts/*.py scripts/worker_state/*.py; then
+if python3 -m py_compile scripts/*.py scripts/worker_state/*.py scripts/control_plane/*.py scripts/dsh-clinepass scripts/spectre-astra; then
   echo "ok    py_compile"
 else
   echo "FAIL  py_compile"
@@ -46,9 +46,13 @@ if command -v node >/dev/null 2>&1; then
     echo "FAIL  node --check slack-bridge.mjs"
     failed=1
   fi
-  bridge_out="$(node --test tests/slack_bridge.test.mjs 2>&1)"
+  bridge_out="$(node --test tests/*.test.mjs 2>&1)"
   rc=$?
-  echo "${bridge_out}" | tail -3
+  if [[ ${rc} -ne 0 ]]; then
+    echo "${bridge_out}"
+  else
+    echo "${bridge_out}" | tail -8
+  fi
   if [[ ${rc} -ne 0 ]]; then
     echo "FAIL  slack bridge tests"
     failed=1
@@ -63,7 +67,11 @@ section "node (devcodex, vendored)"
 if command -v node >/dev/null 2>&1; then
   dcx_out="$(node --test devcodex/test/*.test.js 2>&1)"
   rc=$?
-  echo "${dcx_out}" | tail -3
+  if [[ ${rc} -ne 0 ]]; then
+    echo "${dcx_out}"
+  else
+    echo "${dcx_out}" | tail -8
+  fi
   if [[ ${rc} -ne 0 ]]; then
     echo "FAIL  devcodex tests"
     failed=1

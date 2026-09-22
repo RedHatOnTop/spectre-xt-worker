@@ -1,288 +1,163 @@
-#!/usr/bin/env python3
+"""CLI integration: real UDS state daemon and bridge, fake Orca terminal I/O."""
 from __future__ import annotations
 
 import json
+import os
+from pathlib import Path
+import subprocess
 import sys
 import tempfile
+import time
 import unittest
-from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "scripts"))
-
-import importlib.util
-
-_spec = importlib.util.spec_from_file_location(
-    "spectre_loop", ROOT / "scripts" / "spectre-loop.py"
-)
-spectre_loop = importlib.util.module_from_spec(_spec)
-assert _spec.loader is not None
-_spec.loader.exec_module(spectre_loop)
-
-
-def snap(**over):
-    base = {
-        "goal": {"state": "COMPLETED", "goal_id": "g1"},
-        "policy": {
-            "grokbot_may_advance": True,
-            "continuity_recovery_allowed": False,
-            "idle_slo_violated": False,
-        },
-        "debug": {},
-    }
-    base.update(over)
-    return base
-
-
-class LoopEnableTest(unittest.TestCase):
-    def test_kill_switch_off_by_default(self) -> None:
-        self.assertFalse(spectre_loop.loop_enabled({}))
-        self.assertFalse(spectre_loop.astra_enabled({}))
-        self.assertTrue(spectre_loop.loop_enabled({"SPECTRE_LOOP": "1"}))
-
-
-class PlanTickTest(unittest.TestCase):
-    def test_disabled(self) -> None:
-        out = spectre_loop.plan_tick("qoder", {}, snap(), loop_on=False, astra_on=False, prev={})
-        self.assertEqual(out["action"], "disabled")
-
-    def test_planner_pin_skipped_when_astra_off(self) -> None:
-        entry = {"cwd": "/tmp/mc", "planner": {"terminal": "term_a"}}
-        out = spectre_loop.plan_tick("minecraft", entry, snap(), loop_on=True, astra_on=False, prev={})
-        self.assertEqual(out["action"], "skip")
-        self.assertEqual(out["reason"], "planner_pin")
-
-    def test_efficient_dispatches_next_goal_file(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            Path(tmp, "next_goal.json").write_text(
-                json.dumps({"goal": "fix the parser"}), encoding="utf-8"
-            )
-            entry = {"cwd": tmp}
-            out = spectre_loop.plan_tick("qoder", entry, snap(), loop_on=True, astra_on=False, prev={})
-            self.assertEqual(out["action"], "goal")
-            self.assertEqual(out["text"], "fix the parser")
-            self.assertEqual(out["target"], "efficient")
-
-    def test_missing_next_goal_escalates_once_then_sits(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            entry = {"cwd": tmp}
-            first = spectre_loop.plan_tick(
-                "qoder", entry, snap(), loop_on=True, astra_on=False, prev={}
-            )
-            self.assertEqual(first["action"], "escalate")
-            second = spectre_loop.plan_tick(
-                "qoder",
-                entry,
-                snap(),
-                loop_on=True,
-                astra_on=False,
-                prev={"escalated": {"g1": True}},
-            )
-            self.assertEqual(second["action"], "sit")
-
-    def test_blocked_next_goal_is_missing(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            Path(tmp, "next_goal.json").write_text(
-                json.dumps({"goal": "x", "blocked": True}), encoding="utf-8"
-            )
-            out = spectre_loop.plan_tick(
-                "qoder", {"cwd": tmp}, snap(), loop_on=True, astra_on=False, prev={}
-            )
-            self.assertEqual(out["action"], "escalate")
-
-    def test_continuity_skip(self) -> None:
-        s = snap(policy={"continuity_recovery_allowed": True, "grokbot_may_advance": False})
-        out = spectre_loop.plan_tick("qoder", {}, s, loop_on=True, astra_on=False, prev={})
-        self.assertEqual(out["action"], "skip")
-        self.assertEqual(out["reason"], "continuity")
-
-
-class LoopApplyTest(unittest.TestCase):
-    def test_dry_run_does_not_call_typer(self) -> None:
-        out = spectre_loop.apply_action(
-            {"worker": "qoder", "action": "goal", "text": "fix", "target": "efficient"},
-            dry=True,
-            environ={"SPECTRE_DISPATCH_BIN": "/nope/missing"},
-        )
-        self.assertFalse(out["applied"])
-        self.assertNotIn("io", out)
-
-    def test_live_goal_invokes_dispatch_bin(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            log = Path(tmp) / "dispatch.log"
-            bin_ = Path(tmp) / "dispatch"
-            bin_.write_text(
-                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$SPECTRE_DISPATCH_LOG\"\n"
-                "printf '%s\\n' '{\"ok\":true,\"evt\":\"dispatch_sent\"}'\n",
-                encoding="utf-8",
-            )
-            bin_.chmod(0o755)
-            env = {"SPECTRE_DISPATCH_BIN": str(bin_), "SPECTRE_DISPATCH_LOG": str(log)}
-            out = spectre_loop.apply_action(
-                {"worker": "qoder", "action": "goal", "text": "fix the parser", "target": "efficient"},
-                dry=False,
-                environ=env,
-            )
-            self.assertTrue(out["applied"])
-            logged = log.read_text(encoding="utf-8")
-            self.assertIn("--dispatch goal qoder fix the parser --target efficient", logged)
-
-    def test_escalate_marks_applied_even_if_notify_missing(self) -> None:
-        out = spectre_loop.apply_action(
-            {"worker": "qoder", "action": "escalate", "ident": "g1", "reason": "no_next_goal"},
-            dry=False,
-            environ={"SPECTRE_NOTIFY_BIN": "/nope/missing-notify"},
-        )
-        self.assertTrue(out["applied"])
-        persisted = spectre_loop.persist_from_actions({}, [out])
-        self.assertTrue(persisted["escalated"]["g1"])
+sys.path.insert(0, str(ROOT / 'scripts'))
+from control_plane import runtime
+from control_plane.io import read_json, write_json
+from worker_state.client import StateClient
 
 
 class LoopCliTest(unittest.TestCase):
-    def test_snapshot_file_skips_planner_when_astra_off(self) -> None:
-        import json
-        import os
-        import subprocess
-        import tempfile
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.bin = self.root / 'bin'
+        self.bin.mkdir()
+        self.packet_dir = self.root / 'packets'
+        self.packet_dir.mkdir()
+        self.proc = self.root / 'proc'
+        self.proc.mkdir()
+        self.workers = self.root / 'workers.json'
+        self.state = self.root / 'loop.json'
+        self.sent = self.root / 'sent.jsonl'
+        self.socket = self.root / 'state.sock'
+        self.client = StateClient(str(self.socket))
+        self.env = {**os.environ, 'HOME': str(self.root), 'SPECTRE_LOOP': '1', 'ASTRA_ENABLED': '1',
+            'SPECTRE_LOOP_STATE': str(self.state), 'SPECTRE_PACKET_DIR': str(self.packet_dir),
+            'SPECTRE_PROC_ROOT': str(self.proc), 'SPECTRE_WORKER_STATE_SOCK': str(self.socket),
+            'SPECTRE_DISPATCH_BIN': str(self.bin / 'bridge'), 'SPECTRE_NOTIFY_BIN': str(self.bin / 'notify'),
+            'SPECTRE_PROVIDER_STATE': str(self.root / 'provider.json'),
+            'SPECTRE_QODER_WORKERS': str(self.workers), 'QODER_WORKERS_FILE': str(self.workers),
+            'PATH': str(self.bin) + ':' + os.environ['PATH']}
+        self.fake_process(101, ['codex', '-m', 'gpt-6-astra'], 'term_astra')
+        self.fake_process(102, ['qodercli', '-m', 'Efficient'], 'term_eff')
+        self.fake_process(103, ['bash'], 'term_flash')
+        entry = {'cwd': str(self.root), 'terminal': 'term_eff', 'tmux': None,
+                 'planner': {'terminal': 'term_astra', 'provider': 'anyrouter'},
+                 'targets': {'flash': {'terminal': 'term_flash'}}}
+        write_json(self.workers, {'workers': {'minecraft': entry}})
+        write_json(self.root / 'provider.json', {'ok': True, 'id': 'anyrouter', 'checked_at': time.time()})
+        self.script('bridge', f'#!/bin/sh\nexec node {ROOT / "scripts/slack-bridge.mjs"} "$@" --workers-file {self.workers}\n')
+        self.script('notify', '#!/bin/sh\nexit 0\n')
+        terms = [{'handle': handle, 'worktreePath': str(self.root), 'connected': True, 'writable': True}
+                 for handle in ('term_astra', 'term_eff', 'term_flash')]
+        self.script('orca-ide', f'#!{sys.executable}\nimport json,sys\n'
+            f'if sys.argv[1:3] == ["terminal","list"]: print({json.dumps(json.dumps({"ok": True, "result": {"terminals": terms}}))})\n'
+            'else:\n'
+            f' with open({str(self.sent)!r}, "a") as out: out.write(json.dumps(sys.argv[1:]) + "\\n")\n'
+            ' print("{\\"ok\\":true}")\n')
+        self.daemon = subprocess.Popen([sys.executable, str(ROOT / 'scripts/spectre-state.py'),
+            '--socket', str(self.socket), '--db', str(self.root / 'worker.sqlite'),
+            'serve', '--poll-interval', '0', '--no-shadow'], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            env=self.env)
+        for _ in range(100):
+            if self.client.health()[0] == 200:
+                break
+            time.sleep(0.02)
+        health = self.client.health()
+        if health[0] != 200:
+            self.daemon.terminate()
+            stdout, stderr = self.daemon.communicate(timeout=5)
+            self.fail(f'daemon unavailable: {health} rc={self.daemon.returncode}: {stdout.decode()}{stderr.decode()}')
+        self.evidence('goal.completed', 'initial', goal_id='g1', attempt_id=1)
 
-        with tempfile.TemporaryDirectory() as tmp:
-            snaps = Path(tmp) / "snaps.json"
-            workers = Path(tmp) / "workers.json"
-            snaps.write_text(
-                json.dumps(
-                    {
-                        "minecraft": {
-                            "goal": {"state": "COMPLETED", "goal_id": "g1"},
-                            "policy": {"grokbot_may_advance": True},
-                            "debug": {},
-                        }
-                    }
-                ),
-                encoding="utf-8",
-            )
-            workers.write_text(
-                json.dumps(
-                    {
-                        "workers": {
-                            "minecraft": {
-                                "cwd": tmp,
-                                "planner": {"terminal": "term_a"},
-                            }
-                        }
-                    }
-                ),
-                encoding="utf-8",
-            )
-            env = os.environ.copy()
-            env["SPECTRE_LOOP"] = "1"
-            env.pop("ASTRA_ENABLED", None)
-            proc = subprocess.run(
-                [
-                    sys.executable,
-                    str(ROOT / "scripts" / "spectre-loop.py"),
-                    "--dry-run",
-                    "--snapshot-file",
-                    str(snaps),
-                    "--workers-file",
-                    str(workers),
-                ],
-                capture_output=True,
-                text=True,
-                env=env,
-                check=False,
-            )
-            self.assertEqual(proc.returncode, 0, proc.stderr)
-            payload = json.loads(proc.stdout)
-            self.assertEqual(payload["actions"][0]["action"], "skip")
-            self.assertEqual(payload["actions"][0]["reason"], "planner_pin")
+    def tearDown(self):
+        self.daemon.terminate()
+        self.daemon.communicate(timeout=5)
+        self.tmp.cleanup()
 
-    def test_main_live_dispatches_next_goal_and_persists_escalate_once(self) -> None:
-        import os
-        import subprocess
+    def script(self, name, text):
+        path = self.bin / name
+        path.write_text(text)
+        path.chmod(0o755)
 
-        with tempfile.TemporaryDirectory() as tmp:
-            work = Path(tmp) / "qoder"
-            work.mkdir()
-            (work / "next_goal.json").write_text(
-                json.dumps({"goal": "fix the parser"}), encoding="utf-8"
-            )
-            snaps = Path(tmp) / "snaps.json"
-            workers = Path(tmp) / "workers.json"
-            state = Path(tmp) / "loop-state.json"
-            log = Path(tmp) / "dispatch.log"
-            notify_log = Path(tmp) / "notify.log"
-            dispatch = Path(tmp) / "dispatch"
-            notify = Path(tmp) / "notify"
-            dispatch.write_text(
-                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$SPECTRE_DISPATCH_LOG\"\n"
-                "printf '%s\\n' '{\"ok\":true,\"evt\":\"dispatch_sent\"}'\n",
-                encoding="utf-8",
-            )
-            dispatch.chmod(0o755)
-            notify.write_text(
-                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$SPECTRE_NOTIFY_LOG\"\n"
-                "printf '%s\\n' ok\n",
-                encoding="utf-8",
-            )
-            notify.chmod(0o755)
-            snaps.write_text(
-                json.dumps(
-                    {
-                        "qoder": {
-                            "goal": {"state": "COMPLETED", "goal_id": "g1"},
-                            "policy": {"grokbot_may_advance": True},
-                            "debug": {},
-                        }
-                    }
-                ),
-                encoding="utf-8",
-            )
-            workers.write_text(
-                json.dumps({"workers": {"qoder": {"cwd": str(work)}}}),
-                encoding="utf-8",
-            )
-            env = os.environ.copy()
-            env["SPECTRE_LOOP"] = "1"
-            env.pop("ASTRA_ENABLED", None)
-            env["SPECTRE_LOOP_STATE"] = str(state)
-            env["SPECTRE_DISPATCH_BIN"] = str(dispatch)
-            env["SPECTRE_NOTIFY_BIN"] = str(notify)
-            env["SPECTRE_DISPATCH_LOG"] = str(log)
-            env["SPECTRE_NOTIFY_LOG"] = str(notify_log)
-            cmd = [
-                sys.executable,
-                str(ROOT / "scripts" / "spectre-loop.py"),
-                "--snapshot-file",
-                str(snaps),
-                "--workers-file",
-                str(workers),
-            ]
-            first = subprocess.run(cmd, capture_output=True, text=True, env=env, check=False)
-            self.assertEqual(first.returncode, 0, first.stderr)
-            payload = json.loads(first.stdout)
-            self.assertEqual(payload["actions"][0]["action"], "goal")
-            self.assertTrue(payload["actions"][0]["applied"])
-            self.assertIn("--dispatch goal qoder fix the parser --target efficient", log.read_text(encoding="utf-8"))
-            self.assertFalse(notify_log.exists())
+    def fake_process(self, pid, argv, handle):
+        path = self.proc / str(pid)
+        path.mkdir()
+        (path / 'cmdline').write_bytes(('\0'.join(argv) + '\0').encode())
+        (path / 'environ').write_bytes(f'ORCA_TERMINAL_HANDLE={handle}\0'.encode())
+        (path / 'stat').write_text(f'{pid} (test) S 1 0 0')
+        (path / 'cwd').symlink_to(self.root)
 
-            (work / "next_goal.json").unlink()
-            second = subprocess.run(cmd, capture_output=True, text=True, env=env, check=False)
-            self.assertEqual(second.returncode, 0, second.stderr)
-            escalate = json.loads(second.stdout)
-            self.assertEqual(escalate["actions"][0]["action"], "escalate")
-            self.assertTrue(escalate["actions"][0]["applied"])
-            saved = json.loads(state.read_text(encoding="utf-8"))
-            self.assertTrue(saved["escalated"]["g1"])
-            self.assertIn("lobby", notify_log.read_text(encoding="utf-8"))
+    def evidence(self, kind, ident, **identity):
+        code, value = self.client.evidence({'event_id': ident, 'kind': kind, 'worker': 'minecraft',
+            'source': 'qoder_jsonl', 'payload': {}, **identity})
+        self.assertEqual(code, 200, value)
+        return value
 
-            third = subprocess.run(cmd, capture_output=True, text=True, env=env, check=False)
-            self.assertEqual(third.returncode, 0, third.stderr)
-            sit = json.loads(third.stdout)
-            self.assertEqual(sit["actions"][0]["action"], "sit")
-            self.assertFalse(sit["actions"][0]["applied"])
-            notify_lines = notify_log.read_text(encoding="utf-8").strip().splitlines()
-            self.assertEqual(len(notify_lines), 1)
+    def tick(self, *args, env=None):
+        result = subprocess.run([sys.executable, str(ROOT / 'scripts/spectre-loop.py'),
+            '--workers-file', str(self.workers), *args], capture_output=True, text=True,
+            env={**self.env, **(env or {})}, timeout=15)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        return json.loads(result.stdout)
+
+    def lines(self):
+        return [json.loads(line) for line in self.sent.read_text().splitlines()] if self.sent.exists() else []
+
+    def test_disabled_and_dry_run_do_not_write_or_type(self):
+        self.assertTrue(self.tick(env={'SPECTRE_LOOP': '0'})['disabled'])
+        self.tick('--dry-run')
+        self.assertFalse(self.state.exists())
+        self.assertEqual(self.lines(), [])
+
+    def test_planner_off_skips_minecraft(self):
+        result = self.tick(env={'ASTRA_ENABLED': '0'})
+        self.assertEqual(result['actions'][0]['reason'], 'planner_pin')
+        self.assertEqual(self.lines(), [])
+
+    def test_real_flow_plan_once_result_then_efficient_packet(self):
+        first = self.tick()
+        self.assertEqual(first['actions'][0]['action'], 'plan')
+        self.assertEqual(self.client.snapshot('minecraft')['goal']['state'], 'ASSIGNING')
+        ident = read_json(self.state)['workers']['minecraft']['planning']['request_id']
+        self.assertEqual(self.lines()[0][self.lines()[0].index('--terminal') + 1], 'term_astra')
+        self.tick()
+        self.assertEqual(len(self.lines()), 1)
+        write_json(self.packet_dir / f'{ident}.json', {'request_id': ident, 'worker': 'minecraft',
+            'wake_reason': 'completed', 'packets': [{'id': 'p1', 'assignee': 'efficient', 'kind': 'mechanical',
+            'goal': 'Rename the fixture', 'acceptance': ['Fixture tests pass'], 'requires_astra_review': False}]})
+        self.tick()
+        self.tick()
+        self.assertEqual(len(self.lines()), 2)
+        sent = self.lines()[1]
+        self.assertEqual(sent[sent.index('--terminal') + 1], 'term_eff')
+        self.assertTrue(sent[sent.index('--text') + 1].startswith('/goal Rename the fixture'))
+        self.assertEqual(self.client.snapshot('minecraft')['goal']['state'], 'INJECTED')
+        self.tick()
+        self.assertEqual(len(self.lines()), 2)
+        repeat = subprocess.run([str(self.bin / 'bridge'), '--dispatch', 'plan', 'minecraft',
+            '--request-id', ident], env=self.env, capture_output=True, text=True)
+        self.assertNotEqual(repeat.returncode, 0)
+        self.assertEqual(len(self.lines()), 2)
+
+    def test_plus_burn_refuses_without_create(self):
+        (self.proc / '101/cmdline').write_bytes(b'codex\0-m\0gpt-6-astra\0-c\0model_provider=openai\0')
+        result = subprocess.run([str(self.bin / 'bridge'), '--dispatch', 'plan', 'minecraft',
+            '--request-id', 'r1'], capture_output=True, text=True, env=self.env)
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(json.loads(result.stdout)['evt'], 'dispatch_astra_plus_burn')
+        self.assertEqual(self.lines(), [])
+
+    def test_fixture_cannot_be_used_to_write_into_live_workers(self):
+        fixture = self.root / 'snapshots.json'
+        write_json(fixture, {'minecraft': self.client.snapshot('minecraft')})
+        result = subprocess.run([sys.executable, str(ROOT / 'scripts/spectre-loop.py'),
+            '--snapshot-file', str(fixture)], capture_output=True, text=True, env=self.env)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn('--snapshot-file requires --dry-run', result.stderr)
+        self.assertEqual(self.lines(), [])
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     unittest.main()

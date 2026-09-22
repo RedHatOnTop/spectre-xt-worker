@@ -276,13 +276,8 @@ install -m 0644 "${REPO_DIR}/scripts/worker_state/"*.py \
   /usr/local/lib/spectre-worker-state/worker_state/
 install -m 0755 "${REPO_DIR}/scripts/spectre-state.py" /usr/local/bin/spectre-state
 install -m 0755 "${REPO_DIR}/scripts/spectre-continuity.py" /usr/local/bin/spectre-continuity
-install -m 0755 "${REPO_DIR}/scripts/spectre-loop.py" /usr/local/bin/spectre-loop
-install -m 0755 "${REPO_DIR}/scripts/spectre-reaper.py" /usr/local/bin/spectre-reaper
-install -m 0755 "${REPO_DIR}/scripts/dsh-clinepass" /usr/local/bin/dsh-clinepass
-install -m 0755 "${REPO_DIR}/scripts/native-worker-pin-sync.py" /usr/local/bin/spectre-pin-sync
-install -m 0644 "${REPO_DIR}/systemd/spectre-loop.service" \
-  "${REPO_DIR}/systemd/spectre-loop.timer" \
-  "${PERSON_HOME}/.config/systemd/user/" 2>/dev/null || true
+PERSON_USER="${PERSON_USER}" PERSON_HOME="${PERSON_HOME}" \
+  bash "${REPO_DIR}/scripts/install-control-plane.sh"
 install -m 0644 "${REPO_DIR}/config/goal-supervisor-prompt.md" \
   /usr/local/share/remote-agent/goal-supervisor-prompt.md
 # The reviewer's isolated GROK_HOME profile: without it the grok CLI would scan

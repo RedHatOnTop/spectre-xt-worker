@@ -10,7 +10,7 @@ from pathlib import Path
 from time import time
 
 HERE = Path(__file__).resolve().parent
-for _parent in (HERE, Path("/usr/local/lib/spectre-worker-state")):
+for _parent in (HERE, HERE.parent / "lib/spectre-worker-state", Path("/usr/local/lib/spectre-worker-state")):
     if (_parent / "worker_state").is_dir() and str(_parent) not in sys.path:
         sys.path.insert(0, str(_parent))
         break
