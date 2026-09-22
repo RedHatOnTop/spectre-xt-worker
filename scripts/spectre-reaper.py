@@ -19,7 +19,7 @@ for parent in (Path(__file__).resolve().parent, Path(__file__).resolve().parent.
         sys.path.insert(0, str(parent))
         break
 
-from control_plane import inventory, runtime
+from control_plane import inventory, runtime, tidy
 from control_plane.io import locked, read_json, write_json, run
 from worker_state.client import StateClient
 from worker_state.process import pane_pid
@@ -203,10 +203,24 @@ def live(args):
                     continue
             actions = [*actions, summary(row)]
         write_json(args.state, state)
+    packet_dir = Path(os.environ.get('SPECTRE_PACKET_DIR',
+                                     str(Path.home() / '.local/state/remote-agent/packets')))
+    pinned = set()
+    for entry in workers.values():
+        pinned |= pin_set(workers, entry.get('cwd') or '')
+    tabs = tidy.select(terminals, pinned, packet_dir, time.time())
+    tab_actions = []
+    for row in tabs:
+        if args.apply:
+            result = tidy.close(row['handle'])
+            tab_actions = [*tab_actions, {**row, **result}]
+        else:
+            tab_actions = [*tab_actions, {**row, 'ok': True, 'dry_run': True}]
     killed = [row for row in actions if args.apply and row['action'] == 'term' and 'error' not in row]
     notice = runtime.notify(run, dict(os.environ), 'reaper', json.dumps(killed), channel='fleet') if killed else {'ok': True}
-    return {'ok': notice['ok'] and not any('error' in row for row in actions),
-            'dry_run': not args.apply, 'decisions': actions, 'notification': notice}
+    return {'ok': notice['ok'] and not any('error' in row for row in actions + tab_actions),
+            'dry_run': not args.apply, 'decisions': actions, 'orca_tabs': tab_actions,
+            'notification': notice}
 
 
 def main(argv=None):

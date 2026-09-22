@@ -2608,6 +2608,14 @@ output is on screen. `SPECTRE_PACKET_SURFACE=job` instead creates one tab per
 packet (`--title "flash <dispatch_id>"` `--command "…/dsh-clinepass --file …"`)
 so each job is its own visible session. Never a bare tmux session.
 
+**Auto-close unused tabs** (dry-run by default, same posture as the reaper):
+`spectre-reaper` also runs `control_plane/tidy.select`. It closes
+`orca-ide terminal close --tab` for (a) job tabs titled `flash <id>` /
+`mimo <id>` whose `packets/<id>.exit` is older than 300 s, and (b) orphan
+`flash-packets` / `mimo-packets` shells whose handle is **not** in the worker
+registry. Registry pins, Astra, Efficient, and any other title are never
+selected. Inspect `orca_tabs` in the reaper JSON before `--apply`.
+
 Create the persistent Flash shell **in Orca** by hand only if auto-provision is
 disabled, using the registry's actual cwd:
 
