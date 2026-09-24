@@ -2318,6 +2318,11 @@ What it is:
 - `spectre-state serve` — user unit `spectre-worker-state.service`. Unix
   socket `$XDG_RUNTIME_DIR/spectre-worker-state.sock`, SQLite WAL at
   `~/.local/state/remote-agent/worker-state.sqlite`.
+- `spectre-worker-state-watchdog.timer` probes that socket every minute. Two
+  consecutive failures trigger one service restart; at most three restarts
+  are attempted in a rolling hour. It reports recovery/failure in `#fleet`
+  and never dispatches to a worker. A process can be `active` with an
+  unreachable socket, so systemd `Restart=always` alone is insufficient.
 - JSON API: `GET /v1/workers/{worker}/snapshot`, `POST /v1/evidence`,
   `POST /v1/actions/claim`, `POST /v1/actions/{id}/result`,
   `POST /v1/reconcile`, `GET /v1/health`.
@@ -2420,6 +2425,81 @@ systemctl --user enable --now spectre-worker-state.service \
 `bootstrap.sh` installs these units and disables the retired classifiers
 above. It never enables `goal-supervisor.timer`.
 
+**Socket recovery migration (2026-09-23, verified on Spectre).** The running
+resolver was `active` but `spectre-state health` returned
+`{"detail": "[Errno 111] Connection refused", "error": "unavailable"}`.
+The old `UnixHTTPServer.server_bind` unlinked any existing socket pathname,
+including a live listener's, and `server_close` could unlink a replacement.
+The current source refuses a second live bind and removes only its own socket.
+The box still runs the low-overhead `spectre-state-fast.py` entrypoint against
+an older installed `worker_state` package. Installing only the current
+`server.py` failed with `ImportError: cannot import name 'dsh_jsonl' from
+'worker_state'`; it was rolled back immediately and health recovered. A
+socket-only backport against that exact installed package was then installed
+after stopping the old service. The live duplicate-bind probe was refused and
+`spectre-state health` still passed. The older package must be replaced as a
+whole when the control-plane migration reaches it; do not mix individual new
+modules with it.
+
+A shadow run of the unmodified 1.2.0 package against a consistent clone of
+the live journal returned `FAILED/unconfirmed_timeout` and
+`can_dispatch_goal=true` for Minecraft and qoder, but used 97.9% of one CPU
+over 20 seconds. The active low-overhead entrypoint avoids that poll cost,
+yet its cached-snapshot monkeypatch bypasses 1.2.0's read-time timeout
+effects. Do not combine the two unchanged. More importantly, an unconfirmed
+write is ambiguous delivery, not proof the worker did nothing: allowing a new
+goal after only 240 seconds could duplicate the first. Require authoritative
+acceptance or a verified terminal/process replacement before clearing it.
+
+The watchdog was separately installed and enabled after six staged on-box
+tests and a healthy socket probe. A controlled test stopped the resolver,
+observed the expected health failure, ran two watchdog checks, and verified a
+new resolver PID, `{"action": "recovered"}`, and a healthy API. Its own timer
+is active; the goal loop, provider-health timer, Go proxy service, and legacy
+Grokbot timer remain off. Check with:
+
+```bash
+systemctl --user is-active spectre-worker-state-watchdog.timer
+spectre-state health
+spectre-state get minecraft
+journalctl --user -u spectre-worker-state-watchdog.service -n 20 --no-pager
+```
+
+**Full resolver migration (2026-09-23, verified on Spectre).** Resolver 1.2.1
+retains `UNCONFIRMED` after a missing acceptance record, never converts an
+ambiguous terminal write into permission for a new goal, and raises
+`idle_slo_violated` for alerting. Passive poller evidence is inserted as one
+batch per worker. Process-tree discovery reads the kernel's per-thread
+`children` files instead of rescanning all of `/proc` at every tree node.
+Against a clone of the live journal, repeated full polls fell from
+3.6–4.2 seconds to 0.59–0.60 seconds; the first replay still took about
+12 seconds. On-box staged `bash verify.sh` passed bridge 64, Devcodex 77,
+and Python 427 tests; `shellcheck` was unavailable. The migration stopped
+the watchdog, park watcher, continuity timer, bridge, and old resolver;
+swapped the complete package and service entrypoint; verified a published
+1.2.1 snapshot; then restarted the consumers and watchdog. The previous
+package remains at
+`/usr/local/lib/spectre-worker-state/worker_state.pre-v121`, and the prior
+unit and binary backups are in `/tmp` for this session only. The live API
+returned healthy with seven workers. Minecraft and qoder were both
+`UNCONFIRMED`, `can_dispatch_goal=false`; bridge dry-run refused a Minecraft
+goal with `worker is UNCONFIRMED (policy.can_dispatch_goal=false)`.
+Watcher and continuity dry-runs completed without action. This migration
+restores reliable state authority, not autonomous goal progression.
+
+`sudo spectre-doctor` ran after cutover: 67 checks passed and one failed,
+`FAIL  codex third-party provider block present`. Its installed version does
+not yet include the new watchdog check; `systemctl --user is-active
+spectre-worker-state-watchdog.timer` was checked directly and returned
+`active`. The doctor failure is separate from the resolver API cutover but
+blocks a claim that the whole agent stack is ready.
+
+To roll back this migration, disable and stop the watchdog timer, restore the
+backed-up socket server from `/tmp/spectre-worker-state-server.pre-autonomy.py`
+only if it is still the intended baseline, and restart the resolver. The
+backup is temporary; compare checksums before restoring. Do not reset the
+SQLite journal or force an `UNCONFIRMED` worker to IDLE.
+
 Checks (run on Spectre 2026-09-19 21:40 KST; each is read-only):
 
 ```bash
@@ -2456,7 +2536,7 @@ dispatch, no resume, no continuity). That is the designed failure direction,
 but it means Slack `/goal` can be refused while the box is loaded. A cheaper
 read path (serve the cached row and apply `now`-dependent effects at read time,
 or drop the write from GET) was not implemented at that measurement. The local
-1.2.0 implementation below replaces this path; its on-box latency is unverified.
+1.2.1 implementation below replaces this path; its on-box latency is unverified.
 
 ---
 
@@ -2471,7 +2551,7 @@ bridge with fake Orca I/O, not a live planner or Slack connection.
 ### Runtime contract
 
 - `spectre-state` remains the only occupancy authority; `spectre-slack-bridge
-  --dispatch` remains the only terminal writer. Resolver 1.2.0 copies published
+  --dispatch` remains the only terminal writer. Resolver 1.2.1 copies published
   snapshots without the SQLite writer lock. Missing or older-resolver caches
   return UNKNOWN until the poller republishes them. SQLite schema stays v1.
 - `spectre-loop` persists private atomic intent before claiming or typing.
@@ -2577,7 +2657,111 @@ Seat ownership lives in `control_plane/seat.py` (`toplevel/<worker>/seat.json`
 + `brief.md`); warm handoff is capped at 2/day and is brief-based, never a
 cross-harness resume. Registry workers carry `class: toplevel|side`. Free-tier
 burn policy is `control_plane/quota.py` (free first for implement/mechanical
-only; review/blocker stay paid).
+only; review/blocker stay paid). With `SPECTRE_FREE_PACKETS_ENABLED=1`, an
+eligible Minecraft packet is sent to the Flash Orca pin with `--tier free`.
+The wrapper uses an isolated DSH profile through the loopback Go proxy; the
+proxy tries `cline-free/deepseek-v4.1-flash` and falls back on 429 to
+`cline-pass/deepseek-v4.1-flash`. The on-box configuration also falls back on
+free OAuth 401/403; Kimi has no paid fallback, so its probe cannot mistake a
+paid answer for a free seat. The bridge rejects a missing proxy/profile
+before claiming a packet, and the loop requeues a refused free packet on its
+original paid target without consuming the dispatch reservation. A 429 observed
+in `/omni/health` is copied to the private 24h packet tracker; subsequent
+packets use the paid target until that window expires. Kimi and packet quota
+trackers are separate because the published limit semantics are not known.
+
+`SPECTRE_KIMI_ENABLED` defaults off. Leave it off until Kimi Code and
+omni-proxy are installed and checked on Spectre; the usage tracker is not an
+omni-proxy or Kimi readiness probe by itself. When both relays fail, provider
+health makes a bounded one-token Kimi call through the Go proxy and requires
+the free provider response with no fallback. A 429 records the 24h Kimi limit
+and selects Plus. With it on, a selected `kimi_free`
+provider prepares a handoff brief and escalates `kimi_handoff_required`;
+the loop does not claim an assignment, launch Kimi, or change `seat.json`.
+The operator must fill the brief with the actual goal and open decisions;
+the generated brief contains only authoritative IDs and state. A committed
+Kimi seat blocks both
+the Astra launcher and planner dispatch. A recovered Astra relay cancels an
+uncommitted request. Malformed seat state fails closed rather than reverting
+to Codex ownership. If the loop or provider state path is overridden, set the
+same absolute `SPECTRE_SEAT_ROOT` for both processes.
+
+After the Go-only omni-proxy and real Cline credentials are installed and a
+real model call succeeds, the operator handoff is deliberately three steps:
+
+```bash
+spectre-kimi launch --dry-run
+spectre-kimi launch
+# Inspect the new kimi-standby terminal in Orca and verify the Kimi prompt.
+spectre-kimi send-prompt --terminal term_<handle>
+# Inspect the model's response in Orca before committing ownership.
+spectre-kimi confirm --terminal term_<handle> --observed-ready
+# When Astra is selected again, update the brief, stop Kimi, and inspect Orca.
+spectre-kimi release --observed-stopped
+spectre-astra --dry-run
+```
+
+`launch` requires a current loop handoff, fresh `kimi_free` selection, no
+other top-level process in the worktree, a uniquely identified Efficient pin,
+and a private Kimi Code config targeting the loopback omni-proxy `/v1`
+endpoint. It probes `cline-free/kimi-k3` through the Go proxy and rejects a
+fallback before creating an Orca terminal. `send-prompt` verifies that the
+terminal is live and owned by the Kimi process before typing. Only explicit
+`confirm` records the Kimi seat, with a compare-and-swap against the prior
+seat state. A timed-out terminal creation or send is not retried blindly;
+inspect Orca first. `release` requires a fresh Astra selection and no running
+top-level process before returning ownership to Codex; it does not start Astra.
+`spectre-kimi` is not yet installed on Spectre. A launch probe that receives
+429 invalidates the selection and records exhaustion so the next provider
+health tick can select Plus without creating a terminal.
+
+The Go core is the only proxy component for the box. Build it on Fedora with
+`CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o omni-proxy ./cmd/omni-proxy`
+in the separate `omni-proxy` repository, then install that single executable
+as `/usr/local/bin/omni-proxy` on Spectre. After an approved transfer of a
+current mode-600 Cline OAuth `providers.json` to
+`~/.config/omni-proxy/cline-providers.json`, run:
+
+```bash
+spectre-omni-configure --credentials-file "$HOME/.config/omni-proxy/cline-providers.json"
+systemctl --user daemon-reload
+systemctl --user start spectre-omni-proxy.service
+curl -fsS http://127.0.0.1:8790/omni/health
+spectre-codex-provider-health
+```
+
+`spectre-omni-configure` writes mode-600 Go, DSH-free, and Kimi Code configs;
+it never prints keys. The systemd service reads the client and ClinePass keys
+from mode-600 files and starts only the Go binary. A refresh can rotate the
+OAuth refresh token: keep the active credential file and the Fedora source in
+sync, and do not copy a stale snapshot over a refreshed one. Leave
+`SPECTRE_KIMI_ENABLED`, `SPECTRE_FREE_PACKETS_ENABLED`, the loop, and the
+omni-proxy service disabled until the real Kimi and free/paid calls succeed.
+
+On 2026-09-23, a temporary static Go omni-proxy binary on Spectre passed
+synthetic OpenAI routing/fallback/stream/quota/outage/recovery checks and a
+synthetic Cline adapter check. The 80-request direct and fallback batches had
+zero failures (p95 50.2 ms and 74.3 ms respectively); the Cline adapter
+preserved the 429 body and `Retry-After` header. This does not prove real
+Cline OAuth or real Kimi inference. An isolated Kimi Code CLI call through the
+Go proxy and fake Cline upstream exited 0 with an `OK` reply and the exact
+`cline-free/kimi-k3` upstream model after the provider-prefix fix. A second
+bounded run of the rebuilt binary completed 200 direct, fallback, stream, and
+Cline requests with zero failures. No permanent omni-proxy installation or
+service was made.
+
+A later 2026-09-23 Spectre run used the new Go attempt counters and generated
+free DSH profile against a synthetic Cline upstream: 20 direct Kimi requests,
+101 free DeepSeek 429s with 101 paid fallbacks (including one real DSH headless
+packet), and a DSH exit sidecar of 0. The Go process RSS was 16,180 KiB.
+`/omni/health` reported model-specific rate limits. The first fake SSE omitted
+`finish_reason` and DSH correctly refused it; the corrected SSE passed. This
+still does not verify real OAuth or model output. The temporary binary and
+upstream were removed, port 8790 was closed, and the service remained inactive.
+Another temporary Spectre run started with expired synthetic Cline OAuth
+credentials: 20 concurrent Kimi calls returned `OK`, exactly one refresh
+occurred, and the rotated access and refresh tokens were persisted in the
+private mode-600 fixture. This does not prove the real account can refresh.
 
 In `~/.codex/modes/providers.json`, both `anyrouter` and `agentrouter` require an
 HTTPS `base_url`, `wire_api` (`responses` or `chat`), and an explicitly configured
@@ -2635,7 +2819,16 @@ Verify the wrapper is executable, DSH is installed, and the ClinePass key exists
 with mode 600. `spectre-slack-bridge --dispatch goal minecraft 'bounded check'
 --target flash --dry-run` checks readiness without typing or writing a packet.
 
-### On-box completion gate (not yet run)
+### On-box completion gate (staged code gate passed; live gate not yet run)
+
+On 2026-09-23, a staged copy ran `SPECTRE_MOTD_DONE=1
+SLACK_AGENTS_FILE=<staged-tree>/config/slack-agents.json bash verify.sh` on
+Spectre: bridge 64 tests, Devcodex 77 tests, Python 404 tests, and
+`verify: all gates passed`. `shellcheck` was skipped because it is not
+installed. The two environment variables suppress the host login banner in
+nested shell tests and select this tree's agent registry instead of the older
+installed one. No service or feature flag was enabled. The live verification
+below remains open.
 
 1. Run `bash verify.sh`, `sudo spectre-doctor`, state health/snapshots, pin-sync
    inspection, loop dry-run, and reaper dry-run. Record actual output. Confirm

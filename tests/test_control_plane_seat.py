@@ -14,6 +14,28 @@ from control_plane.io import read_json, write_json
 
 
 class SeatTest(unittest.TestCase):
+    def test_missing_seat_defaults_to_requested_worker(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = seat.seat_path(Path(tmp), 'minecraft')
+            self.assertEqual(seat.load(path)['worker'], 'minecraft')
+
+    def test_corrupt_seat_cannot_reset_ownership_to_codex(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = seat.seat_path(Path(tmp))
+            path.parent.mkdir(parents=True)
+            for contents in ('{', '{}'):
+                path.write_text(contents)
+                with self.assertRaises(ValueError):
+                    seat.load(path)
+            path.unlink()
+            path.symlink_to('missing-seat.json')
+            with self.assertRaises(ValueError):
+                seat.load(path)
+            path.unlink()
+            write_json(path, {**seat.default_state(), 'history': 'not-a-list'})
+            with self.assertRaises(ValueError):
+                seat.load(path)
+
     def test_prepare_handoff_writes_brief_and_caps_daily(self):
         now = 1_800_000_000.0
         with tempfile.TemporaryDirectory() as tmp:
@@ -54,6 +76,59 @@ class SeatTest(unittest.TestCase):
             self.assertIn('standby seat', prompt)
 
 
+class SeatLadderTest(unittest.TestCase):
+    def test_shipped_ladder_is_valid_and_the_order_is_locked(self):
+        rows = seat.ladder()
+        seat.validate_ladder(rows)
+        self.assertEqual(
+            [(r['rank'], r['harness'], r['provider'], r['model'], r['wire_api'])
+             for r in rows],
+            [(1, 'claude', 'anyrouter', 'claude-opus-5-5', 'messages'),
+             (2, 'codex', 'agentrouter', 'gpt-6-astra', 'responses'),
+             (3, 'kimi', 'cline-free', 'cline-free/kimi-k3', 'chat'),
+             (4, 'codex', 'openai', 'gpt-6-astra', 'responses')])
+
+    def test_ladder_rejects_malformed_policies(self):
+        good = seat.ladder()
+        broken = [
+            [],                                                  # empty
+            'not-a-list',                                        # wrong type
+            [good[0], 'not-an-object'],                          # bad entry
+            [{**good[0], 'rank': 2}],                            # rank must be 1
+            [{**good[0], 'rank': True}],                         # bool is not a rank
+            [{**good[0], 'harness': 'nobody'}],                  # unknown harness
+            [{**good[0], 'wire_api': 'grpc'}],                   # unknown surface
+            [{**good[0], 'wire_api': None}],                     # missing surface
+            [{**good[0], 'model': ''}],                          # empty model
+            [{**good[0], 'provider': '  '}],                     # blank provider
+            [{**good[0], 'harness': 1}],                         # non-string harness
+        ]
+        for candidate in broken:
+            with self.assertRaises(ValueError):
+                seat.validate_ladder(candidate)
+
+    def test_owner_lookup_prefers_the_best_rank(self):
+        self.assertEqual(seat.owner_rank('claude'), 1)
+        self.assertEqual(seat.owner_rank('codex'), 2)
+        self.assertEqual(seat.owner_rank('kimi'), 3)
+        self.assertEqual([s['rank'] for s in seat.seats_for_owner('codex')], [2, 4])
+        self.assertEqual(seat.seats_for_owner('claude')[0]['model'], 'claude-opus-5-5')
+        self.assertEqual(seat.seat_for_rank(3)['provider'], 'cline-free')
+        with self.assertRaises(ValueError):
+            seat.owner_rank('nobody')
+        with self.assertRaises(ValueError):
+            seat.seat_for_rank(9)
+
+    def test_ladder_accessor_returns_copies(self):
+        row = seat.ladder()[0]
+        row['model'] = 'mutated'
+        self.assertEqual(seat.SEAT_LADDER[0]['model'], 'claude-opus-5-5')
+
+    def test_every_owner_has_a_seat(self):
+        for owner in seat.OWNERS:
+            self.assertTrue(seat.seats_for_owner(owner), owner)
+
+
 class QuotaTest(unittest.TestCase):
     def test_free_first_only_for_safe_kinds(self):
         free_ok = {'ok': True, 'exhausted': False}
@@ -67,6 +142,7 @@ class QuotaTest(unittest.TestCase):
         self.assertEqual(quota.pick_assignee(implement, free_out)['tier'], 'paid')
         self.assertEqual(quota.pick_assignee(review, free_ok)['tier'], 'paid')
         self.assertEqual(quota.pick_assignee(mechanical, free_ok)['tier'], 'free')
+        self.assertEqual(quota.pick_assignee(mechanical, free_ok)['assignee'], 'flash')
         self.assertEqual(quota.pick_assignee(gated, free_ok)['tier'], 'paid')
         routed = quota.route_queue([implement, review], free_ok)
         self.assertEqual(routed[0]['tier'], 'free')

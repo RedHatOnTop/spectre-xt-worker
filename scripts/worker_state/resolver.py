@@ -111,6 +111,7 @@ def resolve(
         execution,
         now,
         completion_open=completion_open and goal["state"] in {"COMPLETED", "FAILED"},
+        injected_at=goal.get("injected_at"),
     )
     policy = policy_for(
         goal_state=goal["state"],
@@ -455,10 +456,7 @@ def _apply_time_effects(goal: dict, execution: dict, now: float) -> None:
     injected_at = goal.get("injected_at")
     if goal["state"] in {"INJECTED", "UNCONFIRMED"} and injected_at is not None:
         age = now - float(injected_at)
-        if age >= UNCONFIRMED_SEC:
-            goal["state"] = "FAILED"
-            goal["park_reason"] = "unconfirmed_timeout"
-        elif goal["state"] == "INJECTED" and age >= 120:
+        if goal["state"] == "INJECTED" and age >= 120:
             goal["state"] = "UNCONFIRMED"
     execution["stalled"] = False
     execution["stall_reason"] = None
@@ -496,7 +494,11 @@ def _apply_time_effects(goal: dict, execution: dict, now: float) -> None:
         execution["stall_reason"] = f"no progress for {int(age)}s ({op or 'idle-run'})"
 
 
-def _idle_slo(goal_state: str, execution: dict, now: float, *, completion_open: bool) -> bool:
+def _idle_slo(goal_state: str, execution: dict, now: float, *,
+              completion_open: bool, injected_at: float | None = None) -> bool:
+    if (goal_state == "UNCONFIRMED" and injected_at is not None
+            and now - float(injected_at) >= UNCONFIRMED_SEC):
+        return True
     if goal_state == "RUNNING" and execution.get("stalled"):
         return True
     if completion_open and goal_state == "COMPLETED":
@@ -521,6 +523,7 @@ def apply_now_effects(snapshot: dict[str, Any], now: float) -> dict[str, Any]:
         now,
         completion_open=bool((out.get("policy") or {}).get("grokbot_may_advance"))
         and goal.get("state") in {"COMPLETED", "FAILED"},
+        injected_at=goal.get("injected_at"),
     )
     out["goal"] = goal
     out["execution"] = execution

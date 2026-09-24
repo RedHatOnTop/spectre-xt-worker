@@ -1,11 +1,12 @@
 """Launch an operator-requested planner only into a visible Orca terminal."""
 from __future__ import annotations
 
+import os
 from pathlib import Path
 import shlex
 import time
 
-from . import inventory, pins, providers, runtime
+from . import cline_free, inventory, pins, providers, runtime, seat
 from .io import locked, read_json, run as run_command, write_json, write_text
 
 
@@ -22,16 +23,26 @@ def launch(workers_file: Path, modes: Path, provider_state: Path, *, dry=False,
         entry = registry['workers'].get('minecraft')
         if not entry:
             raise ValueError('minecraft worker missing')
+        seat_root = Path(os.environ.get('SPECTRE_SEAT_ROOT', provider_state.parent))
+        if not seat_root.is_absolute():
+            raise ValueError('SPECTRE_SEAT_ROOT must be absolute')
+        owner = seat.load(seat.seat_path(seat_root))['owner']
+        if owner != seat.OWNER_ASTRA:
+            return {'ok': False, 'error': f'seat_owned_by_{owner}'}
         health = read_json(provider_state)
         if now - health.get('checked_at', 0) > 600 or not health.get('ok'):
             if dry:
                 return {'ok': False, 'error': 'provider_health_required', 'dry_run': True}
             health = providers.choose(read_json(modes / 'providers.json'), health, now,
-                                      lambda row: providers.probe(row, modes))
+                                      lambda row: providers.probe(row, modes),
+                                      kimi_fn=lambda: providers.kimi_candidate(os.environ,
+                                          lambda: cline_free.status(cline_free.load(), now)))
             write_json(provider_state, health)
         if not health.get('ok') or health.get('cooldown_until', 0) > now:
             return {'ok': False, 'error': 'provider_unavailable'}
         ident = health['id']
+        if ident == providers.KIMI_FREE:
+            return {'ok': False, 'error': 'kimi_handoff_required'}
         command = ['codex-mode', 'chatgpt'] if ident == 'openai' else ['codex-mode', 'api', ident, 'gpt-6-astra']
         if dry:
             return {'ok': True, 'dry_run': True, 'provider': ident, 'worktree': entry['cwd']}

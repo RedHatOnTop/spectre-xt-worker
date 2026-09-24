@@ -31,7 +31,7 @@ else
 fi
 
 section "python compile"
-if python3 -m py_compile scripts/*.py scripts/worker_state/*.py scripts/control_plane/*.py scripts/dsh-clinepass scripts/mimo-clinepass scripts/spectre-astra; then
+if python3 -m py_compile scripts/*.py scripts/worker_state/*.py scripts/control_plane/*.py scripts/dsh-clinepass scripts/mimo-clinepass scripts/spectre-astra scripts/spectre-kimi scripts/spectre-omni-proxy scripts/spectre-omni-configure; then
   echo "ok    py_compile"
 else
   echo "FAIL  py_compile"

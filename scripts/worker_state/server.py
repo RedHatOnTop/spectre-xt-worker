@@ -4,14 +4,17 @@ from __future__ import annotations
 import json
 import os
 import socket
+import stat
 from socketserver import TCPServer
 import threading
+from weakref import WeakKeyDictionary
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from time import time
 from typing import Any
 
 from . import dsh_jsonl, process, qoder_jsonl
+from .batch import ingest_batch
 from .http_api import MAX_BODY, handle
 from .shadow import compare, load_old_classifier
 from .store import Store
@@ -20,6 +23,8 @@ from .types import Event, iso_from
 _POLL_LOG = Path("/work/logs/worker-state.log")
 _PACKETS = Path.home() / ".local/state/remote-agent/packets"
 _TERMINAL = frozenset({"COMPLETED", "FAILED", "IDLE"})
+_RECONCILED: WeakKeyDictionary[Store, dict[str, float]] = WeakKeyDictionary()
+RECONCILE_INTERVAL_SEC = 60
 
 
 def _flash_died_at(events: list[Event], dispatch_id: str, now: float) -> float | None:
@@ -62,7 +67,7 @@ def _ingest_dsh_exit(
     *,
     packets_dir: Path | None = None,
 ) -> None:
-    snap = store.snapshot(name, now, rebuild=True)
+    snap = store.snapshot(name, now, rebuild=False)
     execution = snap.get("execution") or {}
     goal = snap.get("goal") or {}
     dispatch_id = str(goal.get("dispatch_id") or "")
@@ -102,12 +107,31 @@ class UnixHTTPServer(ThreadingHTTPServer):
     def server_bind(self) -> None:
         path = self.server_address
         Path(path).parent.mkdir(parents=True, exist_ok=True)
-        if os.path.exists(path):
-            os.unlink(path)
-        TCPServer.server_bind(self)
-        self.server_name = "localhost"
-        self.server_port = 0
-        os.chmod(path, 0o600)
+        try:
+            try:
+                existing = os.lstat(path)
+            except FileNotFoundError:
+                existing = None
+            if existing is not None:
+                if not stat.S_ISSOCK(existing.st_mode):
+                    raise OSError(f"refusing to replace non-socket path: {path}")
+                with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as probe:
+                    probe.settimeout(1)
+                    try:
+                        probe.connect(path)
+                    except ConnectionRefusedError:
+                        if os.lstat(path).st_ino == existing.st_ino:
+                            os.unlink(path)
+                    else:
+                        raise OSError(f"worker-state listener already active: {path}")
+            TCPServer.server_bind(self)
+            self.server_name = "localhost"
+            self.server_port = 0
+            os.chmod(path, 0o600)
+            self._bound_inode = os.lstat(path).st_ino
+        except BaseException:
+            self.socket.close()
+            raise
 
     def get_request(self):
         request, _client = self.socket.accept()
@@ -116,10 +140,12 @@ class UnixHTTPServer(ThreadingHTTPServer):
     def server_close(self) -> None:
         path = self.server_address
         super().server_close()
-        if isinstance(path, str) and os.path.exists(path):
+        if isinstance(path, str):
             try:
-                os.unlink(path)
-            except OSError:
+                current = os.lstat(path)
+                if stat.S_ISSOCK(current.st_mode) and current.st_ino == getattr(self, "_bound_inode", None):
+                    os.unlink(path)
+            except FileNotFoundError:
                 pass
 
 
@@ -179,33 +205,34 @@ def ingest_workers(
     packets = packets_dir or _PACKETS
     results: dict[str, Any] = {}
     for name, entry in workers.items():
-        prior = store.snapshot(name, now, rebuild=True)
+        prior = store.snapshot(name, now, rebuild=False)
+        if prior["goal"]["state"] == "UNKNOWN":
+            prior = store.reconcile(name, now)
         target = str((prior.get("execution") or {}).get("target") or "efficient")
         cwd = str(entry.get("cwd") or "")
-        for event in process.evidence_for_worker(
+        events = process.evidence_for_worker(
             name, entry, now, target=target, proc_root=proc
-        ):
-            store.ingest(event, now)
+        )
         if target == "flash":
             injected = (prior.get("goal") or {}).get("injected_at")
             inj_ts = None
             if isinstance(injected, (int, float)):
                 inj_ts = float(injected)
-            for event in dsh_jsonl.collect_dsh_evidence(
-                name, cwd, now, injected_at=inj_ts
-            ):
-                store.ingest(event, now)
-            _ingest_dsh_exit(store, name, now, packets_dir=packets)
+            events = [*events, *dsh_jsonl.collect_dsh_evidence(
+                name, cwd, now, injected_at=inj_ts)]
         else:
-            for event in qoder_jsonl.collect_worker_evidence(name, entry, sessions_root):
-                store.ingest(event, now)
-        try:
+            events = [*events, *qoder_jsonl.collect_worker_evidence(name, entry, sessions_root)]
+        added = ingest_batch(store, name, events, now)["added"]
+        if target == "flash":
+            _ingest_dsh_exit(store, name, now, packets_dir=packets)
+        reconciled = _RECONCILED.get(store, {})
+        due = now - reconciled.get(name, 0) >= RECONCILE_INTERVAL_SEC
+        if due:
             store.reconcile(name, now)
-        except Exception:
-            pass
-        snapshot = store.snapshot(name, now)
+            _RECONCILED[store] = {**reconciled, name: now}
+        snapshot = store.snapshot(name, now, rebuild=False)
         comparison = None
-        if old is not None:
+        if old is not None and (added or due):
             comparison = _shadow_one(store, old, name, entry, sessions_root, snapshot, now, shadow_log)
         results[name] = {"snapshot": snapshot, "shadow": comparison}
     return results

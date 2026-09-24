@@ -48,7 +48,7 @@ class StoreTest(unittest.TestCase):
         self.assertEqual(rebuilds, [])
         self.assertEqual(later["goal"]["state"], "IDLE")
 
-    def test_cached_get_applies_unconfirmed_timeout_without_ingest(self):
+    def test_cached_get_preserves_uncertain_delivery_without_ingest(self):
         self.store.ingest(
             {
                 "event_id": "inj",
@@ -64,8 +64,9 @@ class StoreTest(unittest.TestCase):
             NOW,
         )
         later = self.store.snapshot("pugc", NOW + 241, rebuild=False)
-        self.assertEqual(later["goal"]["state"], "FAILED")
-        self.assertTrue(later["policy"]["can_dispatch_goal"])
+        self.assertEqual(later["goal"]["state"], "UNCONFIRMED")
+        self.assertFalse(later["policy"]["can_dispatch_goal"])
+        self.assertTrue(later["policy"]["idle_slo_violated"])
 
     def test_flash_stalled_blocks_continuity_resume(self):
         self.store.ingest(

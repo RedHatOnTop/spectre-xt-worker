@@ -61,7 +61,8 @@ def provider_main(argv=None):
                       'cooldown_until': now + providers.PLUS_COOLDOWN}
         else:
             def kimi_status():
-                return cline_free.status(cline_free.load(), now)
+                return providers.kimi_candidate(os.environ,
+                    lambda: cline_free.status(cline_free.load(), now))
             output = providers.choose(read_json(args.modes / 'providers.json'), previous, now,
                                       lambda row: providers.probe(row, args.modes),
                                       kimi_fn=kimi_status)

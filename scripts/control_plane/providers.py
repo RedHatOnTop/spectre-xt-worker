@@ -125,6 +125,43 @@ def _kimi_unavailable() -> dict:
     return {'ok': False, 'configured': False, 'exhausted': True, 'status': None}
 
 
+def probe_kimi(env: dict) -> dict:
+    from . import cline_free, kimi, omni_setup
+    endpoint = str(env.get('SPECTRE_OMNI_ENDPOINT', omni_setup.ENDPOINT))
+    key_path = Path(env.get('SPECTRE_OMNI_CLIENT_KEY',
+                        Path.home() / '.config/omni-proxy/client_key'))
+    try:
+        parsed = urllib.parse.urlsplit(endpoint)
+        if (parsed.scheme != 'http' or parsed.hostname != '127.0.0.1'
+                or not parsed.port or parsed.path != '/v1' or parsed.query or parsed.fragment
+                or parsed.username or parsed.password):
+            raise ValueError('invalid proxy endpoint')
+        omni_setup.private_file(key_path)
+        key = key_path.read_text(encoding='utf-8').strip()
+    except (OSError, ValueError):
+        return {'ok': False, 'configured': True, 'exhausted': False,
+                'status': None, 'reason': 'proxy_config_missing'}
+    result = kimi.probe(endpoint, key, timeout=5)
+    if result.get('ok') or result.get('status') == 429:
+        cline_free.record(None, time.time(), 200 if result.get('ok') else 429)
+    return {'ok': bool(result.get('ok')), 'configured': True,
+            'exhausted': result.get('status') == 429,
+            'status': 200 if result.get('ok') else result.get('status'),
+            'reason': None if result.get('ok') else result.get('error')}
+
+
+def kimi_candidate(env: dict, usage_fn, probe_fn=None) -> dict:
+    enabled = str(env.get('SPECTRE_KIMI_ENABLED', '')).lower().strip() in {
+        '1', 'true', 'yes', 'on'}
+    if not enabled:
+        return {'ok': False, 'configured': True, 'exhausted': True,
+                'status': None, 'reason': 'disabled'}
+    usage = usage_fn()
+    if not usage.get('ok') or usage.get('exhausted'):
+        return usage
+    return (probe_fn or probe_kimi)(env)
+
+
 def selected(ident: str, previous: dict, now: float, probes: dict) -> dict:
     return {'ok': True, 'id': ident, 'checked_at': now, 'cooldown_until': 0,
             'plus_cooldown_until': max(previous.get('plus_cooldown_until', 0),

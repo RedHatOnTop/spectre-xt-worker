@@ -204,6 +204,17 @@ class EvidencePinTreeTest(unittest.TestCase):
         process._LAST.clear()
         process._LAST_EMIT.clear()
 
+    def test_proc_children_file_avoids_full_proc_scan(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            proc = Path(tmp) / "proc"
+            children = proc / "1000/task/1000/children"
+            children.parent.mkdir(parents=True)
+            children.write_text("1001 1002\n", encoding="utf-8")
+            other = proc / "1000/task/1003/children"
+            other.parent.mkdir(parents=True)
+            other.write_text("1004\n", encoding="utf-8")
+            self.assertEqual(process._children(1000, proc), [1001, 1002, 1004])
+
     def test_flash_missing_pid_emits_dead_sample(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             proc = Path(tmp) / "proc"

@@ -327,6 +327,7 @@ if command -v spectre-state >/dev/null 2>&1; then
   ws_enabled="$(RUN_AS_USER systemctl --user is-enabled spectre-worker-state.service 2>/dev/null || true)"
   if [[ "${ws_enabled}" == "enabled" ]]; then
     check_cmd "spectre-worker-state.service active (user unit)" "$(declare -f RUN_AS_USER); RUN_AS_USER systemctl --user is-active spectre-worker-state.service 2>/dev/null | grep -qx active"
+    check_cmd "spectre-worker-state-watchdog.timer active (user unit)" "$(declare -f RUN_AS_USER); RUN_AS_USER systemctl --user is-active spectre-worker-state-watchdog.timer 2>/dev/null | grep -qx active"
     # `spectre-state health` is a raw read; the socket can still refuse under
     # load. What matters for dispatch is `get`: an UNKNOWN snapshot is
     # fail-closed (every policy flag false), which refuses /goal and /resume.

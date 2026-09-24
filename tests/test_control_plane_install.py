@@ -30,6 +30,10 @@ class InstallTest(unittest.TestCase):
                                       capture_output=True, text=True)
             self.assertEqual(disabled.returncode, 0, disabled.stdout + disabled.stderr)
             self.assertTrue(json.loads(disabled.stdout)['disabled'])
+            watchdog = subprocess.run([str(binaries / 'spectre-worker-state-watchdog')],
+                                      env=env, cwd=tmp, capture_output=True, text=True)
+            self.assertEqual(watchdog.returncode, 0, watchdog.stdout + watchdog.stderr)
+            self.assertEqual(json.loads(watchdog.stdout)['action'], 'disabled')
             self.assertEqual((binaries / 'dsh-clinepass').stat().st_mode & 0o777, 0o755)
             self.assertFalse((root / 'home/operator/.config/systemd/user/timers.target.wants').exists())
             check = subprocess.run(['node', '--check', str(binaries / 'spectre-slack-bridge')],

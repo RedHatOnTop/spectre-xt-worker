@@ -22,7 +22,7 @@
 // Pure helpers are exported for tests/slack_bridge.test.mjs.
 
 import { execFile, spawn } from "node:child_process";
-import { appendFileSync, chmodSync, existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, statSync, writeFileSync } from "node:fs";
+import { appendFileSync, chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -496,6 +496,7 @@ export function paneRefusal(command, path, cwd, opts = {}) {
       return `pane runs a shell (${cmd}) — the text would execute as a shell command`;
     }
   }
+  if (cwd && !path) return "pane cwd is missing";
   if (cwd && path) {
     let same = path === cwd;
     if (!same) {
@@ -508,6 +509,15 @@ export function paneRefusal(command, path, cwd, opts = {}) {
     if (!same) return `pane cwd (${path}) is not the worker cwd (${cwd})`;
   }
   return null;
+}
+
+async function inspectPane(target) {
+  const [command, path] = await Promise.all([
+    runCommandCapture(TMUX_BIN, ["display-message", "-p", "-t", target, "#{pane_current_command}"], 10_000),
+    runCommandCapture(TMUX_BIN, ["display-message", "-p", "-t", target, "#{pane_current_path}"], 10_000),
+  ]);
+  if (!command.ok || !path.ok) return { ok: false, error: command.error || path.error };
+  return { ok: true, command: command.stdout.trim(), path: path.stdout.trim() };
 }
 
 // A bare registry name is ambiguous as a tmux target: tmux matches it as a
@@ -580,9 +590,9 @@ export function sanitizeDispatchId(dispatchId) {
   return String(dispatchId || "").replace(/[^A-Za-z0-9._-]/g, "");
 }
 
-export function flashSendLine(dispatchId, env = process.env) {
+export function flashSendLine(dispatchId, env = process.env, tier = "paid") {
   const id = sanitizeDispatchId(dispatchId) || "dry-run";
-  return `${FLASH_FILE_PREFIX}${packetDir(env)}/${id}.txt`;
+  return `${FLASH_FILE_PREFIX}${packetDir(env)}/${id}.txt${tier === "free" ? " --tier free" : ""}`;
 }
 
 export function flashPin(entry) {
@@ -825,47 +835,62 @@ export function pinTreeHasDsh(pin, procRoot = "/proc") {
   return false;
 }
 
-export function flashReady(entry, env = process.env) {
+export function flashReady(entry, env = process.env, tier = "paid") {
   const wrapper = String(env.SPECTRE_DSH_WRAPPER || FLASH_WRAPPER);
-  const key = String(env.SPECTRE_DSH_KEY || FLASH_KEY_DEFAULT);
+  const free = tier === "free";
+  const unavailable = free ? "dispatch_flash_free_unavailable" : "dispatch_flash_unavailable";
+  const key = String((free ? env.SPECTRE_DSH_FREE_KEY : env.SPECTRE_DSH_KEY)
+    || (free ? join(homedir(), ".config/omni-proxy/client_key") : FLASH_KEY_DEFAULT));
   const dsh = String(env.SPECTRE_DSH_BIN || FLASH_DSH_DEFAULT);
   const pin = flashPin(entry);
+  if (free && !["1", "true", "yes", "on"].includes(String(env.SPECTRE_FREE_PACKETS_ENABLED || "").toLowerCase())) {
+    return { ok: false, evt: unavailable, detail: "free packets are disabled" };
+  }
+  if (free) {
+    const home = String(env.SPECTRE_DSH_FREE_HOME || join(homedir(), ".local/share/fullmoon-dsh-free"));
+    try {
+      const config = lstatSync(join(home, "settings.yaml"));
+      if (!config.isFile() || (config.mode & 0o077) !== 0) throw new Error("mode");
+    } catch {
+      return { ok: false, evt: unavailable, detail: "private free DSH profile missing" };
+    }
+  }
   if (!pin && packetSurface(env) === "job") {
     // job surface creates its own terminal; a registry pin is optional
   } else if (!pin) {
-    return { ok: false, evt: "dispatch_flash_unavailable", detail: "flash pin missing (targets.flash.terminal) — run ensurePacketPin or spectre-pin-sync --flash-terminal" };
+    return { ok: false, evt: unavailable, detail: "flash pin missing (targets.flash.terminal) — run ensurePacketPin or spectre-pin-sync --flash-terminal" };
   }
   try {
     const st = statSync(wrapper);
     if ((st.mode & 0o777) !== 0o755) {
       return {
         ok: false,
-        evt: "dispatch_flash_unavailable",
+        evt: unavailable,
         detail: `wrapper mode ${(st.mode & 0o777).toString(8)} is not 755`,
       };
     }
   } catch {
-    return { ok: false, evt: "dispatch_flash_unavailable", detail: `wrapper missing (${wrapper})` };
+    return { ok: false, evt: unavailable, detail: `wrapper missing (${wrapper})` };
   }
   try {
-    const st = statSync(key);
-    if ((st.mode & 0o777) !== 0o600) {
+    const st = lstatSync(key);
+    if (!st.isFile() || (st.mode & 0o777) !== 0o600) {
       return {
         ok: false,
-        evt: "dispatch_flash_unavailable",
+        evt: unavailable,
         detail: `key mode ${(st.mode & 0o777).toString(8)} is not 600`,
       };
     }
   } catch {
-    return { ok: false, evt: "dispatch_flash_unavailable", detail: "cline key missing" };
+    return { ok: false, evt: unavailable, detail: "cline key missing" };
   }
   try {
     const st = statSync(dsh);
     if (!(st.mode & 0o111)) {
-      return { ok: false, evt: "dispatch_flash_unavailable", detail: `dsh not executable (${dsh})` };
+      return { ok: false, evt: unavailable, detail: `dsh not executable (${dsh})` };
     }
   } catch {
-    return { ok: false, evt: "dispatch_flash_unavailable", detail: `dsh missing (${dsh})` };
+    return { ok: false, evt: unavailable, detail: `dsh missing (${dsh})` };
   }
   const procRoot = String(env.SPECTRE_PROC_ROOT || "/proc");
   if (pinTreeHasDsh(pin, procRoot)) {
@@ -874,12 +899,38 @@ export function flashReady(entry, env = process.env) {
   return { ok: true, pin, wrapper, key, dsh };
 }
 
-export function finalizeFlashInjection(claimed, goalText, env = process.env) {
+export async function freeProxyReady(env = process.env) {
+  const raw = String(env.SPECTRE_OMNI_ENDPOINT || "http://127.0.0.1:8790/v1");
+  let endpoint;
+  try {
+    endpoint = new URL(raw);
+  } catch {
+    return { ok: false, evt: "dispatch_flash_free_unavailable", detail: "invalid proxy endpoint" };
+  }
+  if (endpoint.protocol !== "http:" || endpoint.hostname !== "127.0.0.1"
+      || !endpoint.port || endpoint.pathname !== "/v1" || endpoint.search || endpoint.hash
+      || endpoint.username || endpoint.password) {
+    return { ok: false, evt: "dispatch_flash_free_unavailable", detail: "proxy endpoint must be loopback /v1" };
+  }
+  try {
+    const response = await fetch(`${endpoint.origin}/omni/health`, { signal: AbortSignal.timeout(2000) });
+    const body = await response.json();
+    if (response.ok && body.ok === true && Array.isArray(body.providers)
+        && body.providers.includes("cline-free") && body.providers.includes("cline-paid")) {
+      return { ok: true };
+    }
+  } catch {
+    return { ok: false, evt: "dispatch_flash_free_unavailable", detail: "proxy unavailable" };
+  }
+  return { ok: false, evt: "dispatch_flash_free_unavailable", detail: "proxy providers unavailable" };
+}
+
+export function finalizeFlashInjection(claimed, goalText, env = process.env, tier = "paid") {
   const id = claimed && claimed.claim && claimed.claim.dispatch_id;
   if (!id) return { ok: false, error: "claim missing dispatch_id" };
   const written = writeFlashPacket(id, goalText, env);
   if (!written.ok) return written;
-  return { ok: true, line: flashSendLine(id, env), dispatch_id: id, packet: written.path };
+  return { ok: true, line: flashSendLine(id, env, tier), dispatch_id: id, packet: written.path };
 }
 
 export function injectionLine({ builtin, target, goalText, clauseText, dispatchId }) {
@@ -927,55 +978,59 @@ export function listAstraCmdlines(env = process.env, procRoot = "/proc") {
 // CLI parsing for `--dispatch` (the goal supervisor's path; needs no Slack).
 // Returns {builtin, worker, text, dryRun, operator, workersFile} or {error}.
 export function parseDispatchArgs(argv) {
-  const out = {
-    builtin: null,
-    worker: null,
-    text: "",
+  let options = {
     dryRun: false,
     operator: "supervisor",
     workersFile: null,
     target: "efficient",
+    tier: "paid",
     requestId: null,
-    error: null,
   };
-  const rest = [];
+  let rest = [];
   for (let i = 0; i < argv.length; i += 1) {
     const arg = String(argv[i]);
     if (arg === "--dry-run") {
-      out.dryRun = true;
+      options = { ...options, dryRun: true };
     } else if (arg === "--operator") {
-      out.operator = String(argv[i + 1] || "").trim() || "supervisor";
+      options = { ...options, operator: String(argv[i + 1] || "").trim() || "supervisor" };
       i += 1;
     } else if (arg === "--workers-file") {
-      out.workersFile = String(argv[i + 1] || "").trim() || null;
+      options = { ...options, workersFile: String(argv[i + 1] || "").trim() || null };
       i += 1;
     } else if (arg === "--request-id") {
-      out.requestId = String(argv[i + 1] || "");
+      options = { ...options, requestId: String(argv[i + 1] || "") };
       i += 1;
     } else if (arg === "--target") {
-      out.target = String(argv[i + 1] || "efficient").trim().toLowerCase() || "efficient";
+      options = { ...options, target: String(argv[i + 1] || "efficient").trim().toLowerCase() || "efficient" };
+      i += 1;
+    } else if (arg === "--tier") {
+      options = { ...options, tier: String(argv[i + 1] || "").trim().toLowerCase() };
       i += 1;
     } else {
-      rest.push(arg);
+      rest = [...rest, arg];
     }
   }
   const builtin = String(rest[0] || "").toLowerCase();
+  const worker = String(rest[1] || "").toLowerCase() || null;
+  const text = rest.slice(2).join(" ").trim();
+  const parsed = { ...options, builtin, worker, text, error: null };
   if (builtin !== "goal" && builtin !== "resume" && builtin !== "plan") {
-    out.error = "usage: --dispatch goal|resume|plan <worker> [goal text] [--target flash|efficient] [--dry-run]";
-    return out;
+    return { ...parsed, error: "usage: --dispatch goal|resume|plan <worker> [goal text] [--target flash|mimo|efficient] [--tier paid|free] [--dry-run]" };
   }
-  out.builtin = builtin;
-  out.worker = String(rest[1] || "").toLowerCase() || null;
-  out.text = rest.slice(2).join(" ").trim();
-  if (!out.worker) {
-    out.error = `usage: --dispatch ${builtin} <worker>${builtin === "goal" ? " <goal text>" : ""}`;
-  } else if (builtin === "goal" && !out.text) {
-    out.error = "usage: --dispatch goal <worker> <goal text>";
+  let error = null;
+  if (!worker) {
+    error = `usage: --dispatch ${builtin} <worker>${builtin === "goal" ? " <goal text>" : ""}`;
+  } else if (builtin === "goal" && !text) {
+    error = "usage: --dispatch goal <worker> <goal text>";
   }
-  if (!["flash", "mimo", "efficient"].includes(out.target) || (builtin === "resume" && out.target !== "efficient")) {
-    out.error = "invalid target for dispatch";
+  if (!["flash", "mimo", "efficient"].includes(options.target) || (builtin === "resume" && options.target !== "efficient")) {
+    error = "invalid target for dispatch";
   }
-  return out;
+  if (!["free", "paid"].includes(options.tier)) error = "invalid dispatch tier";
+  else if (options.tier === "free" && (builtin !== "goal" || options.target !== "flash")) {
+    error = "free tier requires a Flash goal";
+  }
+  return { ...parsed, error };
 }
 
 export function chunkText(text, limit = REPLY_CHUNK) {
@@ -1704,7 +1759,7 @@ async function bindFlashAfterClaim(opts, targetName, claimed, injected) {
   if (!(opts.builtin === "goal" && packetTarget)) {
     return { ok: true, injected, dispatch_id: null };
   }
-  const made = finalizeFlashInjection(claimed, opts.text);
+  const made = finalizeFlashInjection(claimed, opts.text, process.env, opts.tier);
   if (!made.ok) {
     await finishClaim(claimed.claim, false, made.error);
     return { ok: false, evt: `dispatch_${targetName}_packet_failed`, error: made.error };
@@ -1812,10 +1867,14 @@ async function dispatchCli(argv) {
     }
   }
   if (opts.builtin === "goal" && (targetName === "flash" || targetName === "mimo")) {
-    const ready = targetName === "mimo" ? mimoReady(entry, process.env) : flashReady(entry, process.env);
+    const ready = targetName === "mimo" ? mimoReady(entry, process.env) : flashReady(entry, process.env, opts.tier);
     if (!ready.ok) {
       audit({ evt: ready.evt, worker: opts.worker, origin: opts.operator, detail: ready.detail });
       return { ok: false, evt: ready.evt, detail: ready.detail, code: 1 };
+    }
+    if (opts.tier === "free") {
+      const proxy = await freeProxyReady(process.env);
+      if (!proxy.ok) return { ...proxy, code: 1 };
     }
   }
 
@@ -1825,7 +1884,7 @@ async function dispatchCli(argv) {
   } else if (opts.builtin === "goal" && (targetName === "flash" || targetName === "mimo")) {
     // Placeholder for paneRefusal / dry-run. Live send overwrites after claim
     // writes packets/<dispatch_id>.txt named after the claimed id.
-    injected = targetName === "mimo" ? mimoSendLine("dry-run") : flashSendLine("dry-run");
+    injected = targetName === "mimo" ? mimoSendLine("dry-run") : flashSendLine("dry-run", process.env, opts.tier);
   } else if (opts.builtin === "goal") {
     const clause = loadClause();
     if (!clause.text) {
@@ -1977,16 +2036,13 @@ async function dispatchCli(argv) {
   }
 
   const target = paneTarget(entry.tmux);
-  const pane = await runCommandCapture(
-    TMUX_BIN,
-    ["display-message", "-p", "-t", target, "#{pane_current_command}\t#{pane_current_path}"],
-    10_000,
-  );
+  const pane = await inspectPane(target);
   if (!pane.ok) {
     audit({ evt: "dispatch_pane_failed", worker: opts.worker, origin: opts.operator, error: pane.error });
     return { ok: false, evt: "dispatch_pane_failed", detail: `cannot read tmux pane ${entry.tmux}: ${pane.error}`, code: 1 };
   }
-  const [paneCommand, panePath] = pane.stdout.trim().split("\t");
+  const paneCommand = pane.command;
+  const panePath = pane.path;
   const refusal = paneRefusal(paneCommand, panePath, entry.cwd, {
     allowFlashShell: targetName === "flash",
     line: injected,
@@ -2144,17 +2200,14 @@ async function handleDispatch(msg, ctx, builtin, workerName, goalText) {
   }
 
   const target = paneTarget(entry.tmux);
-  const pane = await runCommandCapture(
-    TMUX_BIN,
-    ["display-message", "-p", "-t", target, "#{pane_current_command}\t#{pane_current_path}"],
-    10_000,
-  );
+  const pane = await inspectPane(target);
   if (!pane.ok) {
     audit({ evt: "dispatch_pane_failed", worker: workerName, error: pane.error });
     await reply(`:warning: cannot read tmux pane \`${entry.tmux}\`: ${pane.error}`);
     return;
   }
-  const [paneCommand, panePath] = pane.stdout.trim().split("\t");
+  const paneCommand = pane.command;
+  const panePath = pane.path;
   const refusal = paneRefusal(paneCommand, panePath, entry.cwd);
   if (refusal) {
     audit({ evt: "dispatch_pane_refused", builtin, worker: workerName, pane: paneCommand });

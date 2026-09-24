@@ -4,7 +4,7 @@ from __future__ import annotations
 from pathlib import Path
 import time
 
-from . import budget, packets, planning
+from . import budget, packets, planning, quota, seat
 from .io import locked, read_json, write_json, run as run_command
 
 TICK_SECONDS = 45
@@ -21,7 +21,8 @@ def worker_state(state: dict, worker: str, value: dict) -> dict:
 def validate_workers(workers: dict) -> None:
     allowed_class = {'toplevel', 'side'}
     for name, entry in workers.items():
-        if not isinstance(entry, dict) or not Path(entry.get('cwd', '')).is_absolute():
+        if (not isinstance(entry, dict) or not isinstance(entry.get('cwd'), str)
+                or not Path(entry['cwd']).is_absolute()):
             raise ValueError(f'{name}: absolute cwd required')
         worker_class = entry.get('class')
         if worker_class is None:
@@ -64,15 +65,52 @@ def dry_action(worker, entry, snapshot, env):
     return {'worker': worker, 'action': 'skip', 'reason': snapshot.get('goal', {}).get('state')}
 
 
+def planner_seat(worker, snapshot, state, path, env, provider, now, run):
+    ws = state.get('workers', {}).get(worker, {})
+    root = Path(env.get('SPECTRE_SEAT_ROOT', path.parent))
+    if not root.is_absolute():
+        raise ValueError('SPECTRE_SEAT_ROOT must be absolute')
+    current = seat.load(seat.seat_path(root, worker))
+    if current['owner'] != seat.OWNER_ASTRA:
+        updated, action = escalation(worker, ws, f"seat_owned_by_{current['owner']}", run, env)
+        return worker_state(state, worker, updated), action
+    if provider.get('id') == 'kimi_free':
+        pending = ws.get('handoff')
+        if not pending or pending.get('origin') != planning.identity(snapshot):
+            prepared = seat.prepare_handoff(current, root, now, goal=(
+                f"Goal ID: {snapshot['goal'].get('goal_id') or 'unknown'}"),
+                decisions=['Operator must confirm the visible Kimi seat before ownership changes.'],
+                outcomes=[f"Authoritative state: {snapshot['goal']['state']}"])
+            if not prepared['ok']:
+                updated, action = escalation(worker, ws, prepared['error'], run, env)
+                return worker_state(state, worker, updated), action
+            ws = {**ws, 'handoff': {'to': seat.OWNER_KIMI,
+                                   'origin': planning.identity(snapshot),
+                                   'brief': prepared['brief']['path'], 'requested_at': now}}
+            state = worker_state(state, worker, ws)
+            write_json(path, state)
+        updated, action = escalation(worker, ws, 'kimi_handoff_required', run, env)
+        return worker_state(state, worker, updated), action
+    if ws.get('handoff'):
+        state = worker_state(state, worker, {**ws, 'handoff': None, 'notified': None})
+    return state, None
+
+
 def start_plan(worker, entry, snapshot, state, path, client, env, now, run):
     ws = state.get('workers', {}).get(worker, {})
     provider_path = Path(env.get('SPECTRE_PROVIDER_STATE', Path.home() / '.local/state/remote-agent/codex-provider.json'))
     provider = read_json(provider_path)
     active_provider = entry.get('planner', {}).get('provider')
-    reason = ('provider_restart_required' if active_provider and active_provider != provider.get('id')
-              else budget.planner_refusal(state, provider, now, snapshot['goal']['state'] == 'FAILED'))
+    reason = budget.planner_refusal(state, provider, now, snapshot['goal']['state'] == 'FAILED')
     if reason:
         new_ws, action = escalation(worker, ws, reason, run, env)
+        return worker_state(state, worker, new_ws), action
+    state, seat_action = planner_seat(worker, snapshot, state, path, env, provider, now, run)
+    if seat_action:
+        return state, seat_action
+    ws = state.get('workers', {}).get(worker, {})
+    if active_provider and active_provider != provider.get('id'):
+        new_ws, action = escalation(worker, ws, 'provider_restart_required', run, env)
         return worker_state(state, worker, new_ws), action
     current = planning.request(snapshot, now)
     state = worker_state(state, worker, {**ws, 'planning': current})
@@ -141,6 +179,8 @@ def execute_packet(worker, item, snapshot, state, path, client, env, now, run):
             return state, {'worker': worker, 'action': 'skip', 'reason': reason}
         updated, action = escalation(worker, ws, reason, run, env)
         return worker_state(state, worker, updated), action
+    if worker == 'minecraft' and enabled(env, 'SPECTRE_FREE_PACKETS_ENABLED'):
+        item = quota.route_packet(item, quota.free_status_now(now, env=env))
     origin = planning.identity(snapshot)
     state = budget.reserve(state, worker, item['goal'], now)
     ws = state['workers'][worker]
@@ -160,7 +200,10 @@ def send_prepared(worker, snapshot, state, path, client, env, run):
         planning.advance(client, worker, snapshot, active['request_id'])
     state = worker_state(state, worker, {**ws, 'active': {**active, 'status': 'sending'}})
     write_json(path, state)
-    out = dispatch(run, env, ['goal', worker, packet_text(item), '--target', item['assignee']])
+    args = ['goal', worker, packet_text(item), '--target', item['assignee']]
+    if item.get('tier') == 'free':
+        args = [*args, '--tier', 'free']
+    out = dispatch(run, env, args)
     return record_dispatch(worker, item, state, out, env, run)
 
 
@@ -176,6 +219,22 @@ def record_dispatch(worker, item, state, out, env, run):
     queue = ws.get('queue') or []
     rest = [row for row in queue if row.get('id') != item.get('id')]
     if not out.get('ok') and not ambiguous:
+        if verdict.get('evt') in {'dispatch_flash_busy', 'dispatch_mimo_busy'}:
+            history = state.get('dispatches') or []
+            released = {**state, 'dispatches': history[:-1]} if history and history[-1]['worker'] == worker else state
+            updated = {**ws, 'active': None, 'last_fingerprint': None,
+                       'queue': [item, *rest]}
+            return worker_state(released, worker, updated), {
+                'worker': worker, 'action': 'refused', 'io': out}
+        if verdict.get('evt') == 'dispatch_flash_free_unavailable' and item.get('tier') == 'free':
+            paid = {**item, 'assignee': item.get('paid_assignee', item['assignee']),
+                    'tier': 'paid', 'reason': 'prior_free_refusal'}
+            updated = {**ws, 'active': None, 'last_fingerprint': None,
+                       'queue': [paid, *rest]}
+            history = state.get('dispatches') or []
+            released = {**state, 'dispatches': history[:-1]} if history and history[-1]['worker'] == worker else state
+            return worker_state(released, worker, updated), {
+                'worker': worker, 'action': 'refused', 'io': out}
         unavailable = verdict.get('evt') in {
             'dispatch_flash_unavailable', 'dispatch_mimo_unavailable'}
         if unavailable and item['kind'] == 'mechanical':

@@ -30,6 +30,8 @@ def model(argv: list[str]) -> str | None:
     selected = option(argv, '-m', '--model')
     if exe in {'codex', 'codex-cli'} and selected == 'gpt-6-astra':
         return 'astra'
+    if exe == 'kimi' and selected == 'cline/kimi-k3':
+        return 'kimi'
     if exe in {'qodercli', 'qoder', 'qoder-efficient'} and str(selected).lower() == 'efficient':
         return 'efficient'
     if exe in {'dsh-clinepass'} or (exe == 'dsh' and option(argv, '--profile') in {'headless', 'tui', 'minimal'}):

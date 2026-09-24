@@ -4,6 +4,7 @@ import assert from "node:assert/strict";
 import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
+import { createServer } from "node:http";
 import { dirname, join } from "node:path";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
@@ -28,6 +29,7 @@ import {
   dispatchLine,
   flashSendLine,
   flashReady,
+  freeProxyReady,
   flashPin,
   finalizeFlashInjection,
   injectionLine,
@@ -489,7 +491,7 @@ test("paneRefusal: shells and foreign cwds are refused", () => {
   assert.equal(paneRefusal("node", "/home/person/Projects/orca-rust", "/home/person/Projects/orca-rust"), null);
   assert.match(paneRefusal("node", "/home/person/Projects/other", "/home/person/Projects/orca-rust"), /pane cwd/);
   // Unknown pane path: the shell check still applies, the cwd check abstains.
-  assert.equal(paneRefusal("node", "", "/home/person/Projects/orca-rust"), null);
+  assert.match(paneRefusal("node", "", "/home/person/Projects/orca-rust"), /missing/);
   assert.equal(paneRefusal("node", undefined, undefined), null);
 });
 
@@ -945,6 +947,7 @@ test("parseDispatchArgs: supervisor CLI shape", () => {
     operator: "supervisor",
     workersFile: null,
     target: "efficient",
+    tier: "paid",
     requestId: null,
     error: null,
   });
@@ -967,6 +970,9 @@ test("parseDispatchArgs: supervisor CLI shape", () => {
   assert.equal(full.operator, "grok-supervisor");
   assert.equal(full.workersFile, "/tmp/workers.json");
   assert.equal(full.text, "text");
+  assert.equal(parseDispatchArgs(["goal", "q", "task", "--target", "flash", "--tier", "free"]).tier, "free");
+  assert.equal(parseDispatchArgs(["goal", "q", "task", "--tier", "free"]).error, "free tier requires a Flash goal");
+  assert.equal(parseDispatchArgs(["goal", "q", "task", "--target", "flash", "--tier", "unknown"]).error, "invalid dispatch tier");
 
   // A hyphenated or multi-word goal stays one literal; only flags are consumed.
   assert.equal(parseDispatchArgs(["goal", "q", "fix --dry-run bug"]).text, "fix --dry-run bug");
@@ -1059,6 +1065,9 @@ test("writeFlashPacket: names the file after the claimed dispatch_id", () => {
     assert.equal(made.ok, true);
     assert.equal(made.dispatch_id, "d-claimed1");
     assert.equal(made.line, flashSendLine("d-claimed1", env));
+    assert.equal(flashSendLine("d-claimed1", env, "free"), `${made.line} --tier free`);
+    assert.equal(finalizeFlashInjection({ claim: { dispatch_id: "d-claimed2" } }, "free work", env, "free").line,
+      flashSendLine("d-claimed2", env, "free"));
     assert.ok(!made.line.includes("fix the nether"));
     assert.equal(finalizeFlashInjection({ claim: {} }, "x", env).ok, false);
   } finally {
@@ -1101,6 +1110,52 @@ test("flashReady: fail-closes missing wrapper/key/dsh/pin and busy pin-tree dsh"
     assert.equal(flashReady(entry, env).evt, "dispatch_flash_busy");
   } finally {
     rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("flashReady: free tier requires flag, private profile and proxy client key", () => {
+  const dir = mkdtempSync(join(tmpdir(), "spectre-free-ready-"));
+  try {
+    const wrapper = join(dir, "dsh-clinepass");
+    const key = join(dir, "client_key");
+    const dsh = join(dir, "dsh");
+    const home = join(dir, "free-home");
+    mkdirSync(home);
+    writeFileSync(wrapper, "#!/bin/sh\n", { mode: 0o755 });
+    chmodSync(wrapper, 0o755);
+    writeFileSync(dsh, "#!/bin/sh\n", { mode: 0o755 });
+    chmodSync(dsh, 0o755);
+    writeFileSync(key, "client-key\n", { mode: 0o600 });
+    chmodSync(key, 0o600);
+    const entry = { targets: { flash: { terminal: "term_free" } } };
+    const env = { SPECTRE_DSH_WRAPPER: wrapper, SPECTRE_DSH_BIN: dsh,
+      SPECTRE_DSH_FREE_KEY: key, SPECTRE_DSH_FREE_HOME: home };
+    assert.equal(flashReady(entry, env, "free").evt, "dispatch_flash_free_unavailable");
+    env.SPECTRE_FREE_PACKETS_ENABLED = "1";
+    assert.equal(flashReady(entry, env, "free").evt, "dispatch_flash_free_unavailable");
+    writeFileSync(join(home, "settings.yaml"), "free profile\n", { mode: 0o600 });
+    chmodSync(join(home, "settings.yaml"), 0o600);
+    assert.equal(flashReady(entry, env, "free").ok, true);
+    rmSync(join(home, "settings.yaml"));
+    symlinkSync(key, join(home, "settings.yaml"));
+    assert.equal(flashReady(entry, env, "free").evt, "dispatch_flash_free_unavailable");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("freeProxyReady: only a live loopback proxy with both providers is accepted", async () => {
+  assert.equal((await freeProxyReady({ SPECTRE_OMNI_ENDPOINT: "http://example.com/v1" })).ok, false);
+  const server = createServer((_req, response) => {
+    response.setHeader("Content-Type", "application/json");
+    response.end(JSON.stringify({ ok: true, providers: ["cline-free", "cline-paid"] }));
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  try {
+    const endpoint = `http://127.0.0.1:${server.address().port}/v1`;
+    assert.equal((await freeProxyReady({ SPECTRE_OMNI_ENDPOINT: endpoint })).ok, true);
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
   }
 });
 

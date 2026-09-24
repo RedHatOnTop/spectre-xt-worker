@@ -50,6 +50,24 @@ def _stat_ticks(pid: int, proc_root: Path = Path("/proc")) -> int | None:
 
 
 def _children(pid: int, proc_root: Path = Path("/proc")) -> list[int]:
+    task_root = proc_root / str(pid) / "task"
+    try:
+        tasks = list(task_root.iterdir())
+    except OSError:
+        tasks = []
+    found: set[int] = set()
+    readable = False
+    for task in tasks:
+        if not task.name.isdigit():
+            continue
+        try:
+            listed = (task / "children").read_text(encoding="utf-8")
+        except OSError:
+            continue
+        readable = True
+        found.update(int(value) for value in listed.split() if value.isdigit())
+    if readable:
+        return sorted(found)
     out: list[int] = []
     try:
         for entry in proc_root.iterdir():

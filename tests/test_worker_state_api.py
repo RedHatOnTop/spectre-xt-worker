@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 import json
+import socket
 import sys
 import tempfile
 import threading
@@ -161,3 +162,42 @@ class UnixBindTest(unittest.TestCase):
             with patch('socket.getfqdn', side_effect=AssertionError('UDS bind performed DNS')):
                 server = UnixHTTPServer(str(Path(tmp) / 'state.sock'), Handler)
                 server.server_close()
+
+    def test_second_server_cannot_replace_live_listener(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = str(Path(tmp) / 'state.sock')
+            first = UnixHTTPServer(path, Handler)
+            try:
+                with self.assertRaises(OSError):
+                    UnixHTTPServer(path, Handler)
+                self.assertTrue(Path(path).exists())
+                with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+                    client.settimeout(1)
+                    client.connect(path)
+            finally:
+                first.server_close()
+
+    def test_stale_socket_is_replaced(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = str(Path(tmp) / 'state.sock')
+            stale = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            stale.bind(path)
+            stale.close()
+            server = UnixHTTPServer(path, Handler)
+            try:
+                self.assertTrue(Path(path).exists())
+            finally:
+                server.server_close()
+
+    def test_close_does_not_unlink_replacement(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'state.sock'
+            server = UnixHTTPServer(str(path), Handler)
+            path.unlink()
+            replacement = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            replacement.bind(str(path))
+            try:
+                server.server_close()
+                self.assertTrue(path.exists())
+            finally:
+                replacement.close()

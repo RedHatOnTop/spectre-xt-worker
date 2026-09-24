@@ -11,7 +11,7 @@ from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'scripts'))
-from control_plane import packets, runtime, providers, inventory
+from control_plane import packets, runtime, providers, inventory, quota
 from control_plane.io import read_json, write_json
 from worker_state.store import Store
 from worker_state.types import iso_from
@@ -213,6 +213,24 @@ class ProviderTest(unittest.TestCase):
         plus = providers.choose(registry, {}, NOW, dead, kimi_fn=kimi_out)
         self.assertEqual(plus['id'], providers.LAST_RESORT)
 
+    def test_kimi_probe_requires_private_proxy_key_and_records_429(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            key = Path(tmp) / 'client_key'
+            key.write_text('synthetic-key')
+            key.chmod(0o600)
+            env = {'SPECTRE_OMNI_CLIENT_KEY': str(key),
+                   'SPECTRE_OMNI_ENDPOINT': 'http://127.0.0.1:8790/v1'}
+            with (patch('control_plane.kimi.probe', return_value={
+                      'ok': False, 'error': 'kimi_probe_http', 'status': 429}) as probe,
+                  patch('control_plane.cline_free.record') as record):
+                result = providers.probe_kimi(env)
+            self.assertTrue(result['exhausted'])
+            self.assertFalse(result['ok'])
+            probe.assert_called_once_with(env['SPECTRE_OMNI_ENDPOINT'], 'synthetic-key', timeout=5)
+            self.assertEqual(record.call_args.args[2], 429)
+            key.chmod(0o644)
+            self.assertEqual(providers.probe_kimi(env)['reason'], 'proxy_config_missing')
+
     def test_plus_cooldown_is_retained(self):
         result = providers.choose({'providers': []}, {'cooldown_until': NOW + 60}, NOW,
                                   lambda row: {'ok': False})
@@ -383,6 +401,56 @@ class RecoveryTest(unittest.TestCase):
         self.assertEqual(flash_targets, ['flash', 'efficient'])
         self.assertIn('Rename a symbol', self.sent[-1][4])
         self.assertNotIn('Fix the parser', self.sent[-1][4])
+
+    def test_free_first_flash_packet_dispatches_with_tier(self):
+        completed(self.store)
+        self.env['SPECTRE_FREE_PACKETS_ENABLED'] = '1'
+        write_json(self.path, {'workers': {'minecraft': {'queue': [packet()]}}})
+        with patch.object(quota, 'free_status_now', return_value={
+                'ok': True, 'exhausted': False}):
+            self.tick()
+        command = self.sent[-1]
+        self.assertEqual(command[command.index('--target') + 1], 'flash')
+        self.assertEqual(command[command.index('--tier') + 1], 'free')
+        active = read_json(self.path)['workers']['minecraft']['active']['packet']
+        self.assertEqual(active['tier'], 'free')
+
+    def test_free_mechanical_packet_uses_flash_then_paid_efficient_on_refusal(self):
+        completed(self.store)
+        self.env['SPECTRE_FREE_PACKETS_ENABLED'] = '1'
+        mechanical = packet(assignee='efficient', kind='mechanical')
+        write_json(self.path, {'workers': {'minecraft': {'queue': [mechanical]}}})
+        def free_down(argv, **kwargs):
+            self.sent.append(argv)
+            if '--tier' in argv:
+                return {'ok': False, 'parsed': {'evt': 'dispatch_flash_free_unavailable'}}
+            return {'ok': True, 'parsed': {'ok': True, 'evt': 'dispatch_sent'}}
+        self.run_command = free_down
+        with patch.object(quota, 'free_status_now', return_value={
+                'ok': True, 'exhausted': False}):
+            self.tick()
+            queued = read_json(self.path)['workers']['minecraft']['queue'][0]
+            self.assertEqual(queued['assignee'], 'efficient')
+            self.assertEqual(queued['tier'], 'paid')
+            self.tick(now=NOW + 1)
+        command = self.sent[-1]
+        self.assertEqual(command[command.index('--target') + 1], 'efficient')
+        self.assertNotIn('--tier', command)
+        self.assertEqual(len(read_json(self.path)['dispatches']), 1)
+
+    def test_busy_flash_requeues_packet_without_burning_dispatch_budget(self):
+        completed(self.store)
+        write_json(self.path, {'workers': {'minecraft': {'queue': [packet()]}}})
+        def busy(argv, **kwargs):
+            self.sent.append(argv)
+            return {'ok': False, 'parsed': {'evt': 'dispatch_flash_busy'}}
+        self.run_command = busy
+        self.tick()
+        state = read_json(self.path)
+        self.assertIsNone(state['workers']['minecraft']['active'])
+        self.assertEqual(len(state['workers']['minecraft']['queue']), 1)
+        self.assertEqual(state['workers']['minecraft']['queue'][0]['id'], 'p1')
+        self.assertEqual(len(state['dispatches']), 0)
 
     def test_mimo_unavailable_keeps_packet_and_escalates(self):
         completed(self.store)
