@@ -249,3 +249,87 @@ worth keeping in mind for the next staged run:
   not be "fixed" by merely writing a block. The block must carry the base URL and
   wire API that D6 requires, or it will reproduce the double-`/v1` failure.
 - No deployment: the goal/provider/proxy timers remain disabled.
+
+## D1, D2, D3 and D5 landed — 2026-09-24
+
+`providers.choose()` no longer has a `probe_configuration` exit. A relay that
+cannot be probed returns `failure: 'configuration'` with a reason code, and every
+failure in `CONFIG_FAILURES` becomes a `<relay>:<reason>` alert while the chain
+moves on to `kimi_free` and then Plus. The reasons produced before any request
+is sent:
+
+| reason | cause |
+| --- | --- |
+| `relay_missing` | no registry row for the relay |
+| `relay_unknown` | the row id is not a known relay |
+| `key_unusable` | key file missing, a symlink, or not mode 600 |
+| `base_url_invalid` | not https (http only on `127.0.0.1`/`::1`), credentials in the URL, or unparsable |
+| `probe_model_missing` / `probe_model_astra` | no cheap probe model, or an Astra one |
+| `wire_api_unsupported` | `wire_api` is neither `responses` nor `chat` |
+
+D2 accepts the literal loopback addresses only. `localhost` is not accepted,
+because honouring it would mean trusting a name lookup, and the box registry
+already uses `127.0.0.1`.
+
+D3 reads at most 4 KiB of an error body, JSON-decodes it so escaped CJK text
+matches, and checks the measured shapes before the status: `Invalid URL (` is
+`bad_route`, `不支持所选模型` is `not_offered`, `1m 上下文` is `needs_beta`, and
+`已下线` is `retired` (the `claude-opus-4-6` deprecation body from the 404
+entitlement log). Only then does the status decide: 402 `upstream_quota`,
+401/403 `unauthorized`, 429 and 5xx `no_serving_channel`, anything else
+`rejected`. The body itself is never stored; only the class is. The
+`no_serving_channel` shape carries no model information (see D3 above), so it
+never alerts and never names the configured model.
+
+D5: selecting Plus always carries a `plus_fallback` alert. `cli.alerted()` posts
+`provider: <alerts>` to the lobby once per changed alert set; a failed post keeps
+the previous `alerts_sent`, so the next five-minute health run retries.
+`astra.launch()` also calls `choose()` but does not post; `alerts_sent` is carried
+through `selected()`, so the next health run announces whatever the launcher saw.
+Only `no_serving_channel`, `upstream_quota` and `unreachable` stay silent. Any
+other 4xx (`rejected`) and a 200 that is not a completion (`invalid_response`)
+alert too, because a retry cannot fix either, and a relay skipped in silence
+would leave the chain on a lower seat with nobody told. The one silent
+structural case left is the shim dying: that is `unreachable`, and it waits on
+D7.
+
+The responses probe now asks for 16 output tokens, not 1. It has never run
+against either relay, because the box registry has no `probe_model`, and the
+OpenAI Responses API rejects `max_output_tokens` below 16 with
+`400 Invalid 'max_output_tokens': integer below minimum value. Expected a value
+>= 16, but got 1 instead.` (quoted from pi issue #6265; Azure's Responses
+migration samples state the same minimum). A relay that forwards that check
+would have failed every probe, and the relays could never have been selected.
+16 is the smallest body the wire accepts, which is what the "responses-API
+equivalent" of a one-token ping in `2026-09-20-spectre-control-plane.md` has to
+mean. The chat probe keeps one token, and so does the Kimi probe; neither has
+been measured against a live upstream either.
+
+Two robustness gaps closed on the way. `http.client.HTTPException` (for example
+`IncompleteRead`) escaped `providers.probe()`, `error_body()` and `kimi.probe()`
+and would have crashed the health unit; it is now `unreachable` or
+`kimi_probe_unavailable`. A 200 whose body is not a response or chat completion
+used to fall into the same bucket as a dead socket; it is now its own class,
+`invalid_response`.
+
+Local gate:
+
+```
+$ env -u PYTHONHOME -u PYTHONPATH bash verify.sh
+ok    slack bridge tests    # 64 pass, 0 fail
+ok    devcodex tests        # 77 pass, 0 fail
+ok    Ran 436 tests
+verify: all gates passed
+```
+
+Python went 432 -> 436. The staged run on Spectre was skipped: ssh stopped at
+the Tailscale check-mode prompt.
+
+Effect once deployed, with the registry measured on the box: anyrouter's
+`http://127.0.0.1:9995/v1` now passes D2, but neither relay has a `probe_model`,
+so health reports `agentrouter:probe_model_missing` and
+`anyrouter:probe_model_missing`. The health unit does not set
+`SPECTRE_KIMI_ENABLED`, so the chain then selects Plus with `plus_fallback`,
+which is visible in the lobby rather than silent. The operator fix is a cheap
+non-Astra `probe_model` on both entries of `~/.codex/modes/providers.json`.
+Still not deployed.

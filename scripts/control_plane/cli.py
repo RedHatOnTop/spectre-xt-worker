@@ -8,7 +8,7 @@ from pathlib import Path
 import time
 
 from . import cline_free, providers, runtime
-from .io import read_json, write_json
+from .io import read_json, run, write_json
 from worker_state.client import StateClient
 from worker_state.qoder_jsonl import load_workers, workers_path
 
@@ -63,11 +63,22 @@ def provider_main(argv=None):
             def kimi_status():
                 return providers.kimi_candidate(os.environ,
                     lambda: cline_free.status(cline_free.load(), now))
-            output = providers.choose(read_json(args.modes / 'providers.json'), previous, now,
-                                      lambda row: providers.probe(row, args.modes),
-                                      kimi_fn=kimi_status)
+            output = alerted(providers.choose(read_json(args.modes / 'providers.json'), previous, now,
+                                              lambda row: providers.probe(row, args.modes),
+                                              kimi_fn=kimi_status),
+                             previous, os.environ)
         write_json(args.state, output)
     except (OSError, ValueError) as exc:
         output = {'ok': False, 'error': type(exc).__name__}
     print(json.dumps(output, sort_keys=True))
     return 0 if output['ok'] else 1
+
+
+def alerted(output: dict, previous: dict, env) -> dict:
+    """Announce a changed alert set once; a failed announcement retries next run."""
+    alerts = output.get('alerts') or []
+    sent = previous.get('alerts_sent') or []
+    if alerts and alerts != sent and not runtime.notify(
+            run, env, 'provider', ', '.join(alerts)).get('ok'):
+        return {**output, 'alerts_sent': sent}
+    return {**output, 'alerts_sent': alerts}

@@ -1,6 +1,7 @@
 """Operator-gated Kimi handoff through a visible Orca terminal."""
 from __future__ import annotations
 
+import http.client
 import json
 import os
 from pathlib import Path
@@ -69,7 +70,7 @@ def probe(endpoint: str, key: str, timeout: float = 15) -> dict:
     except urllib.error.HTTPError as exc:
         exc.close()
         return {'ok': False, 'error': 'kimi_probe_http', 'status': exc.code}
-    except (OSError, ValueError, urllib.error.URLError):
+    except (OSError, ValueError, urllib.error.URLError, http.client.HTTPException):
         return {'ok': False, 'error': 'kimi_probe_unavailable'}
 
 

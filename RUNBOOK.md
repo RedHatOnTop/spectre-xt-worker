@@ -2763,13 +2763,22 @@ credentials: 20 concurrent Kimi calls returned `OK`, exactly one refresh
 occurred, and the rotated access and refresh tokens were persisted in the
 private mode-600 fixture. This does not prove the real account can refresh.
 
-In `~/.codex/modes/providers.json`, both `anyrouter` and `agentrouter` require an
-HTTPS `base_url`, `wire_api` (`responses` or `chat`), and an explicitly configured
-cheap non-Astra `probe_model` supported by that relay. Keys remain in private
-mode-600 `~/.codex/modes/keys/<id>` files; never print or paste them. Health sends
-at most one output token per probe, without redirects, `/models`, or
-`codex-mode probe-payload`. Missing configuration fails closed; it does not
-spend Plus quota. Valid relay failures permit last-resort ChatGPT selection.
+In `~/.codex/modes/providers.json`, both `anyrouter` and `agentrouter` need a
+`base_url` (HTTPS, or plain http only on `127.0.0.1`/`::1` for the local SSE
+shim, never with credentials in the URL), `wire_api` (`responses` or `chat`),
+and an explicitly configured cheap non-Astra `probe_model` supported by that
+relay. Keys remain in private mode-600 `~/.codex/modes/keys/<id>` files; never
+print or paste them. Each probe asks for the smallest output the wire accepts
+(one token on `chat`, 16 on `responses`, whose API rejects anything lower),
+without redirects, `/models`, or `codex-mode probe-payload`. A relay that cannot
+be probed, or whose answer shows a fault no retry can fix (`bad_route`,
+`not_offered`, `needs_beta`, `retired`, `unauthorized`, any other 4xx as
+`rejected`, a 200 that is not a completion as `invalid_response`), raises an
+alert and the chain moves on to the next candidate; configuration never parks
+the chain. Only `no_serving_channel`, `upstream_quota` and `unreachable` stay
+silent. Selecting Plus always raises `plus_fallback`. Alerts go to the lobby as
+`provider: <alerts>` once per changed alert set; a failed post retries on the
+next run.
 
 ```bash
 spectre-codex-provider-health             # real, bounded relay requests

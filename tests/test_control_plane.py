@@ -242,15 +242,72 @@ class ProviderTest(unittest.TestCase):
         self.assertEqual(providers.upstream_retry_at(hit, NOW), NOW + providers.UPSTREAM_QUOTA_BACKOFF)
         self.assertEqual(providers.upstream_retry_at({'status': 500}, NOW), NOW)
 
-    def test_no_heavy_model_probe_and_one_token_body(self):
+    def test_no_heavy_model_probe_and_smallest_valid_body(self):
         with self.assertRaises(ValueError):
             providers.probe_request({'base_url': 'https://relay.example/v1',
                                      'wire_api': 'responses', 'probe_model': 'gpt-6-astra'})
         url, body = providers.probe_request({'base_url': 'https://relay.example/v1',
                                             'wire_api': 'responses', 'probe_model': 'cheap'})
         self.assertEqual(url, 'https://relay.example/v1/responses')
-        self.assertEqual(body['max_output_tokens'], 1)
+        self.assertEqual(body['max_output_tokens'], 16)
         self.assertFalse(body['store'])
+
+    def test_loopback_shim_may_use_http_but_remote_hosts_may_not(self):
+        row = {'wire_api': 'responses', 'probe_model': 'cheap'}
+        for base in ('http://127.0.0.1:9995/v1', 'http://[::1]:9995/v1'):
+            url, _ = providers.probe_request({**row, 'base_url': base})
+            self.assertEqual(url, base + '/responses')
+        for base in ('http://relay.example/v1', 'https://user:pw@relay.example/v1',
+                     'ftp://127.0.0.1/v1', 'http://[::1'):
+            with self.subTest(base=base), self.assertRaisesRegex(ValueError, '^base_url_invalid$'):
+                providers.probe_request({**row, 'base_url': base})
+        with self.assertRaisesRegex(ValueError, '^probe_model_missing$'):
+            providers.probe_request({'base_url': 'https://relay.example/v1', 'wire_api': 'responses'})
+
+    def test_error_bodies_are_classified_by_shape_before_status(self):
+        cases = (
+            (404, b'{"error":{"message":"Invalid URL (POST /v1/v1/responses)"}}', 'bad_route'),
+            (404, '{"error":{"message":"当前 API 不支持所选模型"}}'.encode(), 'not_offered'),
+            (400, b'{"error":{"message":"1m \\u4e0a\\u4e0b\\u6587\\u5df2\\u7ecf\\u5168\\u91cf"}}',
+             'needs_beta'),
+            (400, '{"error":{"message":"模型已下线"}}'.encode(), 'retired'),
+            (500, b'{"error":{"code":"get_channel_failed"}}', 'no_serving_channel'),
+            (429, b'{"error":{"message":"Service Unavailable"}}', 'no_serving_channel'),
+            (503, b'', 'no_serving_channel'),
+            (402, b'{"error":{"message":"quota"}}', 'upstream_quota'),
+            (401, b'', 'unauthorized'),
+            (400, b'\xff', 'rejected'),
+        )
+        for status, body, expected in cases:
+            with self.subTest(status=status, expected=expected):
+                self.assertEqual(providers.classify(status, body), expected)
+
+    def test_unprobeable_relays_alert_but_never_park_the_chain(self):
+        registry = {'providers': [{'id': 'agentrouter', 'base_url': 'https://relay.example/v1',
+                                   'wire_api': 'responses'}]}
+        real = lambda row: providers.probe(row, Path('/nonexistent'))
+        live = providers.choose(registry, {}, NOW, real,
+                                kimi_fn=lambda: {'ok': True, 'exhausted': False})
+        self.assertEqual(live['id'], providers.KIMI_FREE)
+        self.assertEqual(live['alerts'], ['agentrouter:probe_model_missing',
+                                          'anyrouter:relay_missing'])
+        plus = providers.choose(registry, {'alerts_sent': ['earlier']}, NOW, real,
+                                kimi_fn=lambda: {'ok': False, 'exhausted': True})
+        self.assertTrue(plus['ok'])
+        self.assertEqual(plus['id'], providers.LAST_RESORT)
+        self.assertEqual(plus['alerts'][-1], 'plus_fallback')
+        self.assertEqual(plus['alerts_sent'], ['earlier'])
+        relays = {'providers': [{'id': name} for name in providers.RELAYS]}
+        for failure, loud in (('no_serving_channel', False), ('upstream_quota', False),
+                              ('unreachable', False), ('rejected', True),
+                              ('invalid_response', True)):
+            with self.subTest(failure=failure):
+                result = providers.choose(relays, {}, NOW,
+                                          lambda row: {'ok': False, 'configured': True,
+                                                       'failure': failure},
+                                          kimi_fn=lambda: {'ok': True, 'exhausted': False})
+                expected = [f'{name}:{failure}' for name in providers.RELAYS] if loud else []
+                self.assertEqual(result['alerts'], expected)
 
 
 class InventoryTest(unittest.TestCase):

@@ -1,5 +1,6 @@
 """Bounded I/O, provider and validation failure paths."""
 from contextlib import redirect_stdout
+import http.client
 import io
 import json
 from pathlib import Path
@@ -64,7 +65,7 @@ class ProviderBoundaryTest(unittest.TestCase):
         return {'id': 'anyrouter', 'base_url': 'https://relay.example/v1',
                 'wire_api': 'responses', 'probe_model': 'cheap', **over}
 
-    def test_probe_uses_one_token_and_never_logs_secrets(self):
+    def test_probe_uses_smallest_valid_body_and_never_logs_secrets(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             (root / 'keys').mkdir()
@@ -82,17 +83,30 @@ class ProviderBoundaryTest(unittest.TestCase):
             self.assertTrue(result['ok'])
             request = opener.open.call_args.args[0]
             self.assertEqual(request.headers['Authorization'], 'Bearer fixture-secret')
-            self.assertEqual(json.loads(request.data)['max_output_tokens'], 1)
+            self.assertEqual(json.loads(request.data)['max_output_tokens'], 16)
             self.assertNotIn('fixture-secret', json.dumps(result))
+            response.read.return_value = b'<html>busy</html>'
+            with patch('urllib.request.build_opener', return_value=opener):
+                self.assertEqual(providers.probe(self.provider(), root)['failure'], 'invalid_response')
             opener.open.side_effect = urllib.error.HTTPError('https://relay.example', 429, 'busy', {}, None)
             with patch('urllib.request.build_opener', return_value=opener):
-                self.assertEqual(providers.probe(self.provider(), root)['status'], 429)
-            opener.open.side_effect = OSError('offline')
+                result = providers.probe(self.provider(), root)
+            self.assertEqual((result['status'], result['failure']), (429, 'no_serving_channel'))
+            opener.open.side_effect = urllib.error.HTTPError(
+                'https://relay.example', 404, 'nf', {},
+                io.BytesIO(b'{"error":{"message":"Invalid URL (POST /v1/v1/responses)"}}'))
             with patch('urllib.request.build_opener', return_value=opener):
-                self.assertFalse(providers.probe(self.provider(), root)['ok'])
+                result = providers.probe(self.provider(), root)
+            self.assertEqual(result['failure'], 'bad_route')
+            self.assertNotIn('Invalid URL', json.dumps(result))
+            for failure in (OSError('offline'), http.client.IncompleteRead(b'')):
+                opener.open.side_effect = failure
+                with patch('urllib.request.build_opener', return_value=opener):
+                    self.assertEqual(providers.probe(self.provider(), root)['failure'], 'unreachable')
             key.chmod(0o644)
-            self.assertFalse(providers.probe(self.provider(), root)['configured'])
-            self.assertFalse(providers.probe(self.provider(id='other'), root)['configured'])
+            self.assertEqual(providers.probe(self.provider(), root)['reason'], 'key_unusable')
+            self.assertEqual(providers.probe(self.provider(id='other'), root)['reason'],
+                             'relay_unknown')
 
     def test_chat_request_invalid_url_wire_and_cooldown(self):
         url, body = providers.probe_request(self.provider(wire_api='chat'))
@@ -150,10 +164,30 @@ class CliBoundaryTest(unittest.TestCase):
             state = root / 'provider.json'
             write_json(root / 'providers.json', {'providers': [{'id': 'agentrouter'}]})
             args = ['--modes', tmp, '--state', str(state)]
-            with patch('control_plane.cli.providers.probe', return_value={'ok': True, 'status': 200}):
+            with (patch('control_plane.cli.providers.probe', return_value={'ok': True, 'status': 200}),
+                  patch('control_plane.cli.runtime.notify', return_value={'ok': True}) as notify):
+                self.assertEqual(cli.provider_main(args), 0)
                 self.assertEqual(cli.provider_main(args), 0)
             self.assertEqual(read_json(state)['id'], 'agentrouter')
+            notify.assert_called_once()
+            self.assertIn('anyrouter:relay_missing', notify.call_args.args[3])
+            self.assertEqual(read_json(state)['alerts_sent'], ['anyrouter:relay_missing'])
             self.assertEqual(cli.provider_main([*args, '--plus-rate-limited']), 1)
             self.assertGreater(read_json(state)['cooldown_until'], read_json(state)['checked_at'])
             (root / 'providers.json').write_text('{')
             self.assertEqual(cli.provider_main(args), 1)
+
+    def test_provider_alert_retries_until_announced(self):
+        with tempfile.TemporaryDirectory() as tmp, redirect_stdout(io.StringIO()):
+            root = Path(tmp)
+            state = root / 'provider.json'
+            write_json(root / 'providers.json', {'providers': [{'id': 'agentrouter'}]})
+            args = ['--modes', tmp, '--state', str(state)]
+            with (patch('control_plane.cli.providers.probe', return_value={'ok': True, 'status': 200}),
+                  patch('control_plane.cli.runtime.notify',
+                        side_effect=[{'ok': False}, {'ok': True}]) as notify):
+                self.assertEqual(cli.provider_main(args), 0)
+                self.assertEqual(read_json(state)['alerts_sent'], [])
+                self.assertEqual(cli.provider_main(args), 0)
+            self.assertEqual(read_json(state)['alerts_sent'], ['anyrouter:relay_missing'])
+            self.assertEqual(notify.call_count, 2)

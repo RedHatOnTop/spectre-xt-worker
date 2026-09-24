@@ -140,12 +140,15 @@ class KimiProviderGateTest(unittest.TestCase):
             with (patch.dict(os.environ, {}, clear=True),
                   patch.object(providers, 'probe', return_value=dead),
                   patch('control_plane.cli.cline_free.load') as usage,
+                  patch('control_plane.cli.runtime.notify', return_value={'ok': True}) as notify,
                   redirect_stdout(io.StringIO()) as output):
                 code = cli.provider_main(['--modes', str(modes), '--state', str(root / 'provider.json')])
 
             self.assertEqual(code, 0)
             self.assertEqual(json.loads(output.getvalue())['id'], 'openai')
             usage.assert_not_called()
+            notify.assert_called_once()
+            self.assertIn('plus_fallback', notify.call_args.args[3])
 
     def test_explicit_kimi_enablement_allows_free_candidate(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -159,11 +162,13 @@ class KimiProviderGateTest(unittest.TestCase):
                   patch.object(providers, 'probe', return_value=dead),
                   patch.object(providers, 'probe_kimi', return_value=live_free),
                   patch('control_plane.cli.cline_free.status', return_value=live_free),
+                  patch('control_plane.cli.runtime.notify', return_value={'ok': True}) as notify,
                   redirect_stdout(io.StringIO()) as output):
                 code = cli.provider_main(['--modes', str(modes), '--state', str(root / 'provider.json')])
 
             self.assertEqual(code, 0)
             self.assertEqual(json.loads(output.getvalue())['id'], 'kimi_free')
+            notify.assert_not_called()
 
     def test_enabled_kimi_with_failed_real_probe_falls_to_plus(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -178,10 +183,12 @@ class KimiProviderGateTest(unittest.TestCase):
                       'ok': False, 'configured': True, 'exhausted': True, 'status': 429}),
                   patch('control_plane.cli.cline_free.status', return_value={
                       'ok': True, 'configured': True, 'exhausted': False}),
+                  patch('control_plane.cli.runtime.notify', return_value={'ok': True}) as notify,
                   redirect_stdout(io.StringIO()) as output):
                 code = cli.provider_main(['--modes', str(modes), '--state', str(root / 'provider.json')])
             self.assertEqual(code, 0)
             self.assertEqual(json.loads(output.getvalue())['id'], 'openai')
+            self.assertIn('plus_fallback', notify.call_args.args[3])
 
 
 if __name__ == '__main__':
