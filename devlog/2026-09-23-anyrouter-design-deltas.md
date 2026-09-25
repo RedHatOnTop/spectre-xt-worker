@@ -333,3 +333,107 @@ so health reports `agentrouter:probe_model_missing` and
 which is visible in the lobby rather than silent. The operator fix is a cheap
 non-Astra `probe_model` on both entries of `~/.codex/modes/providers.json`.
 Still not deployed.
+
+## P2 first slice — seat-aware planner dispatch — 2026-09-25
+
+D8. The planner registry entry now names its harness: `planner.harness` is
+`codex`, `claude` or `kimi`, and a missing field means `codex`, so every
+existing registry keeps its meaning. `seat.PLANNER_ROLES` maps the seat owner
+to the process role that must be running behind the pin (`codex` -> `astra`,
+`claude` -> `claude`, `kimi` -> `kimi`). The same mapping lives in
+`inventory.model()`, `dispatch-process.mjs` and the bridge's `PLANNER_ROLES`,
+and the four have to agree.
+
+`runtime.start_plan()` reads the seat before anything else. A codex seat runs
+the gates it always had (budget refusal, provider health, the Kimi handoff
+request, provider restart) and additionally refuses a pin whose harness is not
+codex (`planner_harness_mismatch`). Any other owner plans only through a pin of
+its own harness and skips the codex gates, because Plus caps and relay health
+say nothing about a Claude or Kimi seat; the ledger records the owner's best
+ladder provider (`anyrouter` for claude, `cline-free` for kimi). A pin of the
+wrong harness escalates `seat_owned_by_<owner>` without typing, and a pin with
+no terminal escalates `planner_terminal_missing`. The assignment timeout is now
+per owner and stored on the request: Claude gets 900 s, because one anyrouter
+edge window ends in a 524 at about 301 s and a planning turn can span several;
+everyone else keeps 300 s.
+
+Identity: `claude --model claude-opus-5-5` (also through `node`) is `claude`,
+`kimi -m cline/kimi-k3` is `kimi`, and option parsing stops at a bare `--`.
+That last rule keeps the Fedora `claude bg-pty-host` wrapper, whose argv
+carries its child's argv after `--`, from counting as a second Claude planner;
+the child itself still counts once. Pin sync picks the planner terminal by the
+pinned harness and refuses an unknown one without touching the pin.
+`kimi.confirm()` rewrites the planner pin to the Kimi terminal
+(`harness: kimi`, `provider: kimi_free`), `kimi.release()` rewrites it to
+`{terminal: null, harness: codex}` and returns `next: launch_astra`, and a
+registry write that fails after the seat commit is reported as
+`registry_update_failed` with `seat_committed: true`. The loop then fails
+closed on the mismatch instead of planning through the wrong harness. Kimi
+launch and release now refuse while any planner process, not only Astra, runs
+in the worktree.
+
+The bridge counts the pinned harness's planner: `plannerPidVerdict()` keeps the
+plus-burn refusal for Astra only and otherwise demands exactly one process
+(`dispatch_claude_busy`, `dispatch_kimi_busy`); an unknown harness is
+`dispatch_planner_unknown`. Both refuse before any terminal work. The native
+process guard treats a Claude or Kimi process in a packet pin as the wrong
+agent.
+
+Local gate (`d81121c` + `620be83`):
+
+```
+$ env -u PYTHONHOME -u PYTHONPATH bash verify.sh
+ok    slack bridge tests    # 70 pass, 0 fail
+ok    devcodex tests        # 77 pass, 0 fail
+ok    Ran 464 tests
+verify: all gates passed
+```
+
+The local count includes 18 tests from `tests/test_relay_probe.py`, which is
+another workstream's untracked file. Staged on Spectre from
+`git archive 620be83` into `/tmp` and removed afterwards:
+
+```
+VERIFY_EXIT=0 rev=620be83 host=spectre
+SKIP  shellcheck not installed (apt/dnf install shellcheck)
+ok    slack bridge tests    # 70 pass, 0 fail
+ok    devcodex tests        # 77 pass, 0 fail
+ok    Ran 446 tests
+verify: all gates passed
+```
+
+Python went 436 -> 446 and the bridge suite 64 -> 70.
+
+Still open after this slice:
+
+- Nothing moves the seat to Claude yet. There is no Claude launcher, and
+  `seat.transition(to='claude')` is reachable only by hand. A Claude planner
+  must carry `--model claude-opus-5-5` on argv (plain `claude` has no identity)
+  and needs write access to the packet directory. Unverified on Spectre:
+  Claude process identity, whether a daemon-hosted Claude inherits
+  `ORCA_TERMINAL_HANDLE`, and whether the Claude TUI submits on
+  `orca-ide terminal send --enter`.
+- The planner pid count is box-wide. A second
+  `claude --model claude-opus-5-5` anywhere on the box, an operator session
+  included, makes `plan` refuse with `dispatch_claude_busy`.
+- `ASTRA_ENABLED` still gates planning for every seat, and `dry_action()` still
+  reports `plan` without looking at the seat.
+- Seat transfer stays operator-confirmed. A non-codex seat has no relay
+  recovery: nothing hands it back to codex when the relays return. A Kimi seat
+  whose free quota is gone is not detected either; each plan times out after
+  300 s, is retried 300 s later, and every timeout posts its own
+  `assignment_timeout:<rid>` alert.
+- After `kimi.release()` the loop escalates `planner_terminal_missing` until
+  the Astra launcher or pin sync sets a terminal.
+- `cli.loop_main()` reads the registry before the tick takes the loop lock, so
+  a tick racing `kimi.confirm()` or `kimi.release()` can raise one spurious
+  `seat_owned_by_kimi` or `planner_harness_mismatch`. It fails closed, and the
+  next tick reads the new registry.
+- `astra.launch()` still looks only for a running Astra in the worktree.
+- `astra.create_terminal()` and `kimi.launch()` still create terminals with
+  `--worktree path:<dir>`, which binds an unregistered worktree record and
+  leaves the tab invisible in Orca. That is the next slice.
+- `config/astra-plan-prompt.md` is harness-generic except for the
+  `requires_astra_review` schema field.
+
+Still not deployed.
