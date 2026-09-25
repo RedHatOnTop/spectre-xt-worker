@@ -994,13 +994,14 @@ test("packetSurface: pin by default, job opt-in", () => {
   assert.equal(entry.targets.mimo.wrapper, "/usr/local/bin/mimo-clinepass");
 });
 
-function fakeCreatingOrca(dir, { registered = dir, boundTo = `wt-1::${dir}` } = {}) {
+function fakeCreatingOrca(dir, { registered = dir, boundTo = `wt-1::${dir}`, title = "flash-packets", preexisting = [] } = {}) {
   const bin = join(dir, "bin");
   mkdirSync(bin);
   const log = join(dir, "orca.log");
   const createdIn = join(dir, "create.cwd");
   const created = join(dir, "created");
   const rows = [{ worktreeId: `wt-1::${registered}`, path: registered, isArchived: false }];
+  const fresh = { handle: "term_new", worktreePath: dir, connected: true, writable: true, title };
   const script = [
     "#!/bin/sh",
     'printf "%s\\n" "$*" >> ' + JSON.stringify(log),
@@ -1008,9 +1009,9 @@ function fakeCreatingOrca(dir, { registered = dir, boundTo = `wt-1::${dir}` } = 
     "  printf '%s' " + JSON.stringify(JSON.stringify({ ok: true, result: { worktrees: rows, truncated: false } })),
     'elif [ "$1" = "terminal" ] && [ "$2" = "list" ]; then',
     '  if [ -f ' + JSON.stringify(created) + ' ]; then',
-    "    printf '%s' " + JSON.stringify(JSON.stringify({ ok: true, result: { terminals: [{ handle: "term_new", worktreePath: dir, connected: true, writable: true, title: "flash-packets" }] } })),
+    "    printf '%s' " + JSON.stringify(JSON.stringify({ ok: true, result: { terminals: [...preexisting, fresh] } })),
     "  else",
-    "    printf '%s' " + JSON.stringify(JSON.stringify({ ok: true, result: { terminals: [] } })),
+    "    printf '%s' " + JSON.stringify(JSON.stringify({ ok: true, result: { terminals: preexisting } })),
     "  fi",
     'elif [ "$1" = "terminal" ] && [ "$2" = "create" ]; then',
     '  pwd > ' + JSON.stringify(createdIn),
@@ -1024,21 +1025,32 @@ function fakeCreatingOrca(dir, { registered = dir, boundTo = `wt-1::${dir}` } = 
   return { bin, log, createdIn };
 }
 
-async function withOrcaOnPath(bin, fn) {
-  const prev = process.env.PATH;
-  process.env.PATH = `${bin}:${prev}`;
+async function withFakeOrca(bin, fn) {
+  const prev = { PATH: process.env.PATH, SPECTRE_PACKET_DIR: process.env.SPECTRE_PACKET_DIR };
+  process.env.PATH = `${bin}:${prev.PATH}`;
+  process.env.SPECTRE_PACKET_DIR = join(dirname(bin), "packets");
   try {
     return await fn();
   } finally {
-    process.env.PATH = prev;
+    for (const [key, value] of Object.entries(prev)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
   }
+}
+
+function writeRecord(dir, handle, fields = {}) {
+  const tabs = join(dir, "packets", "tabs");
+  mkdirSync(tabs, { recursive: true });
+  const record = { handle, role: "flash", kind: "shell", dispatch_id: null, cwd: dir, worktree_id: `wt-1::${dir}`, created_at: 1, ...fields };
+  writeFileSync(join(tabs, `${handle}.json`), JSON.stringify(record));
 }
 
 test("ensurePacketPin: reuses a live pin and creates flash-packets when missing", async () => {
   const dir = mkdtempSync(join(tmpdir(), "spectre-pin-ensure-"));
   try {
     const orca = fakeCreatingOrca(dir);
-    await withOrcaOnPath(orca.bin, async () => {
+    await withFakeOrca(orca.bin, async () => {
       const first = await ensurePacketPin({}, "flash", dir);
       assert.equal(first.ok, true, JSON.stringify(first));
       assert.equal(first.created, true);
@@ -1062,7 +1074,7 @@ test("ensurePacketPin: an unregistered worktree gets no terminal", async () => {
   const dir = mkdtempSync(join(tmpdir(), "spectre-pin-unregistered-"));
   try {
     const orca = fakeCreatingOrca(dir, { registered: join(dir, "elsewhere") });
-    const out = await withOrcaOnPath(orca.bin, () => ensurePacketPin({}, "flash", dir));
+    const out = await withFakeOrca(orca.bin, () => ensurePacketPin({}, "flash", dir));
     assert.equal(out.ok, false);
     assert.equal(out.evt, "dispatch_orca_failed");
     assert.match(out.detail, /^orca_worktree_unregistered: /);
@@ -1076,11 +1088,108 @@ test("ensurePacketPin: a tab bound to another worktree is closed, not pinned", a
   const dir = mkdtempSync(join(tmpdir(), "spectre-pin-ghost-"));
   try {
     const orca = fakeCreatingOrca(dir, { boundTo: `repo-9::${dir}` });
-    const out = await withOrcaOnPath(orca.bin, () => ensurePacketPin({}, "flash", dir));
+    const out = await withFakeOrca(orca.bin, () => ensurePacketPin({}, "flash", dir));
     assert.equal(out.ok, false);
     assert.match(out.detail, /^orca_terminal_invisible: term_new bound to repo-9::/);
     assert.match(out.detail, /closed=true$/);
     assert.match(readFileSync(orca.log, "utf8"), /^terminal close --terminal term_new --tab --json$/m);
+    assert.equal(existsSync(join(dir, "packets", "tabs", "term_new.json")), false);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("ensurePacketPin: a recorded shell is reused after the shell retitles it", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "spectre-pin-record-"));
+  try {
+    const orca = fakeCreatingOrca(dir, { title: "person@spectre: ~/x" });
+    await withFakeOrca(orca.bin, async () => {
+      const first = await ensurePacketPin({}, "flash", dir);
+      assert.equal(first.created, true, JSON.stringify(first));
+      const second = await ensurePacketPin({}, "flash", dir);
+      assert.deepEqual(second, { ok: true, handle: "term_new", created: false });
+    });
+    const path = join(dir, "packets", "tabs", "term_new.json");
+    assert.equal(statSync(path).mode & 0o777, 0o600);
+    assert.equal(statSync(dirname(path)).mode & 0o777, 0o700);
+    const record = JSON.parse(readFileSync(path, "utf8"));
+    assert.equal(typeof record.created_at, "number");
+    assert.deepEqual({ ...record, created_at: 0 }, {
+      handle: "term_new", role: "flash", kind: "shell", dispatch_id: null, cwd: dir,
+      worktree_id: `wt-1::${dir}`, created_at: 0,
+    });
+    const creates = readFileSync(orca.log, "utf8").split("\n").filter((line) => line.startsWith("terminal create "));
+    assert.equal(creates.length, 1);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("ensurePacketPin: titles, other roles, jobs and dead tabs are never reused", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "spectre-pin-foreign-"));
+  try {
+    const live = (handle, title, extra = {}) => ({ handle, worktreePath: dir, connected: true, writable: true, title, ...extra });
+    const orca = fakeCreatingOrca(dir, {
+      preexisting: [
+        live("term_titled", "flash-packets"),
+        live("term_mimo", "mimo-packets"),
+        live("term_job", "flash d-1"),
+        live("term_other_cwd", "flash-packets"),
+        live("term_dead", "flash-packets", { connected: false }),
+      ],
+    });
+    writeRecord(dir, "term_mimo", { role: "mimo" });
+    writeRecord(dir, "term_job", { kind: "job", dispatch_id: "d-1" });
+    writeRecord(dir, "term_other_cwd", { cwd: join(dir, "other") });
+    writeRecord(dir, "term_dead");
+    writeFileSync(join(dir, "packets", "tabs", "term_alias.json"), JSON.stringify({ handle: "term_titled", role: "flash", kind: "shell", cwd: dir }));
+    const out = await withFakeOrca(orca.bin, () => ensurePacketPin({}, "flash", dir));
+    assert.deepEqual(out, { ok: true, handle: "term_new", created: true, title: "flash-packets" });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("ensurePacketPin: an unwritable record directory creates nothing", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "spectre-pin-unwritable-"));
+  try {
+    const orca = fakeCreatingOrca(dir);
+    mkdirSync(join(dir, "packets"));
+    writeFileSync(join(dir, "packets", "tabs"), "");
+    const out = await withFakeOrca(orca.bin, () => ensurePacketPin({}, "flash", dir));
+    assert.equal(out.evt, "dispatch_orca_failed");
+    assert.match(out.detail, /^orca_record_unwritable: /);
+    const calls = readFileSync(orca.log, "utf8");
+    assert.equal(calls.includes("worktree ps"), false);
+    assert.equal(calls.includes("terminal create"), false);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("ensurePacketPin: a tab whose record cannot be saved is closed", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "spectre-pin-unsaved-"));
+  try {
+    const orca = fakeCreatingOrca(dir);
+    mkdirSync(join(dir, "packets", "tabs", "term_new.json"), { recursive: true });
+    const out = await withFakeOrca(orca.bin, () => ensurePacketPin({}, "flash", dir));
+    assert.equal(out.detail, "orca_record_failed: term_new: EISDIR; closed=true");
+    assert.match(readFileSync(orca.log, "utf8"), /^terminal close --terminal term_new --tab --json$/m);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("startPacketJob: records the job tab under its dispatch id", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "spectre-job-record-"));
+  try {
+    const orca = fakeCreatingOrca(dir);
+    const line = "/usr/local/bin/mimo-clinepass --file x";
+    const out = await withFakeOrca(orca.bin, () => startPacketJob({ role: "mimo", cwd: dir, line, dispatchId: "d-7" }));
+    assert.deepEqual(out, { ok: true, handle: "term_new", title: "mimo d-7", created: true });
+    const record = JSON.parse(readFileSync(join(dir, "packets", "tabs", "term_new.json"), "utf8"));
+    assert.deepEqual([record.role, record.kind, record.dispatch_id], ["mimo", "job", "d-7"]);
+    assert.match(readFileSync(orca.log, "utf8"), /^terminal create --worktree active --title mimo d-7 --command \/usr\/local\/bin\/mimo-clinepass --file x --focus --json$/m);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

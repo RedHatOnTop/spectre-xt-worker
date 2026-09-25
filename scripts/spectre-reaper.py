@@ -189,7 +189,8 @@ def live(args):
     listed = run(['orca-ide', 'terminal', 'list', '--json'], timeout=8)
     if not listed['ok']:
         raise ValueError('Orca inventory unavailable; refusing reap')
-    terminals = listed['parsed'].get('result', {}).get('terminals', [])
+    listing = listed['parsed'].get('result', {})
+    terminals = listing.get('terminals', [])
     with locked(args.state.with_suffix('.lock')):
         rows, state = observe(workers, inventory.scan(), inventory.listeners(proc.stdout),
                               read_json(args.state), StateClient(timeout=2), time.time(), terminals)
@@ -208,19 +209,13 @@ def live(args):
     pinned = set()
     for entry in workers.values():
         pinned |= pin_set(workers, entry.get('cwd') or '')
-    tabs = tidy.select(terminals, pinned, packet_dir, time.time())
-    tab_actions = []
-    for row in tabs:
-        if args.apply:
-            result = tidy.close(row['handle'])
-            tab_actions = [*tab_actions, {**row, **result}]
-        else:
-            tab_actions = [*tab_actions, {**row, 'ok': True, 'dry_run': True}]
+    tab_actions, records = tidy.sweep(terminals, pinned, packet_dir, time.time(), apply=args.apply,
+                                      truncated=bool(listing.get('truncated')))
     killed = [row for row in actions if args.apply and row['action'] == 'term' and 'error' not in row]
     notice = runtime.notify(run, dict(os.environ), 'reaper', json.dumps(killed), channel='fleet') if killed else {'ok': True}
-    return {'ok': notice['ok'] and not any('error' in row for row in actions + tab_actions),
+    return {'ok': notice['ok'] and not any('error' in row for row in actions + tab_actions + records),
             'dry_run': not args.apply, 'decisions': actions, 'orca_tabs': tab_actions,
-            'notification': notice}
+            'tab_records': records, 'notification': notice}
 
 
 def main(argv=None):

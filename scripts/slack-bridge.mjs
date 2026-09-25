@@ -22,7 +22,7 @@
 // Pure helpers are exported for tests/slack_bridge.test.mjs.
 
 import { execFile, spawn } from "node:child_process";
-import { appendFileSync, chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, statSync, writeFileSync } from "node:fs";
+import { accessSync, appendFileSync, chmodSync, constants as fsConstants, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -657,6 +657,58 @@ export function packetJobTitle(role, dispatchId) {
   return `${String(role || "packet")} ${id}`;
 }
 
+// The shell's OSC title replaces --title within seconds and agents set their
+// own, so a tab the bridge created is known only by the record written here.
+const TAB_HANDLE = /^term_[A-Za-z0-9_-]{1,96}$/;
+
+function tabRecordDir(env = process.env) {
+  return join(packetDir(env), "tabs");
+}
+
+function tabRecordsWritable(env = process.env) {
+  const dir = tabRecordDir(env);
+  try {
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    accessSync(dir, fsConstants.W_OK);
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, error: `orca_record_unwritable: ${dir}: ${(err && err.code) || err}` };
+  }
+}
+
+function writeTabRecord(record, env = process.env) {
+  if (!TAB_HANDLE.test(record.handle)) return { ok: false, error: "bad handle" };
+  const dir = tabRecordDir(env);
+  try {
+    const tmp = join(dir, `${record.handle}.json.tmp`);
+    writeFileSync(tmp, `${JSON.stringify(record)}\n`, { encoding: "utf8", mode: 0o600, flag: "wx" });
+    renameSync(tmp, join(dir, `${record.handle}.json`));
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, error: String((err && err.code) || err) };
+  }
+}
+
+function readTabRecords(env = process.env) {
+  const dir = tabRecordDir(env);
+  let names = [];
+  try {
+    names = readdirSync(dir);
+  } catch {
+    return [];
+  }
+  return names.flatMap((name) => {
+    const handle = name.endsWith(".json") ? name.slice(0, -".json".length) : "";
+    if (!TAB_HANDLE.test(handle)) return [];
+    try {
+      const record = JSON.parse(readFileSync(join(dir, name), "utf8"));
+      return record && typeof record === "object" && record.handle === handle ? [record] : [];
+    } catch {
+      return [];
+    }
+  });
+}
+
 async function orcaWorktreeId(cwd) {
   const listed = await runCommandCapture(ORCA_BIN, ["worktree", "ps", "--json"], 20_000);
   if (!listed.ok) return { ok: false, error: `orca_ps_failed: ${listed.error}` };
@@ -676,10 +728,17 @@ async function orcaWorktreeId(cwd) {
   return { ok: false, error: `orca_worktree_unregistered: ${cwd} (${ids.length} rows)` };
 }
 
+function closeOrcaTab(handle) {
+  return runCommandCapture(ORCA_BIN, ["terminal", "close", "--terminal", handle, "--tab", "--json"], 15_000);
+}
+
 // Only a registered worktree renders, and only the active selector run from
 // inside it binds to that registration; `path:<dir>` synthesizes an id the UI
-// never shows.
-async function createOrcaTerminal({ cwd, title, command, focus = true }) {
+// never shows. The record directory is checked before create; otherwise every
+// loop tick would create a tab only to close it again.
+async function createOrcaTerminal({ cwd, title, command, focus = true, record }) {
+  const writable = tabRecordsWritable();
+  if (!writable.ok) return writable;
   const registered = await orcaWorktreeId(cwd);
   if (!registered.ok) return registered;
   const args = ["terminal", "create", "--worktree", "active", "--title", String(title || ""), "--command", String(command || ""), "--json"];
@@ -699,11 +758,24 @@ async function createOrcaTerminal({ cwd, title, command, focus = true }) {
     return { ok: false, error: "orca_handle_missing; inspect terminal list before retry" };
   }
   if (terminal.worktreeId !== registered.worktreeId) {
-    const closed = await runCommandCapture(ORCA_BIN, ["terminal", "close", "--terminal", handle, "--tab", "--json"], 15_000);
+    const closed = await closeOrcaTab(handle);
     return {
       ok: false,
       error: `orca_terminal_invisible: ${handle} bound to ${terminal.worktreeId}, expected ${registered.worktreeId}; closed=${closed.ok}`,
     };
+  }
+  const saved = writeTabRecord({
+    handle,
+    role: record.role,
+    kind: record.kind,
+    dispatch_id: record.dispatch_id || null,
+    cwd,
+    worktree_id: registered.worktreeId,
+    created_at: nowSec(),
+  });
+  if (!saved.ok) {
+    const closed = await closeOrcaTab(handle);
+    return { ok: false, error: `orca_record_failed: ${handle}: ${saved.error}; closed=${closed.ok}` };
   }
   return { ok: true, handle, payload };
 }
@@ -725,13 +797,21 @@ export async function ensurePacketPin(entry, role, cwd) {
   );
   const byPin = wanted ? live.find((term) => term.handle === wanted) : null;
   if (byPin) return { ok: true, handle: byPin.handle, created: false };
-  const byTitle = live.find((term) => String(term.title || "") === title);
-  if (byTitle) return { ok: true, handle: byTitle.handle, created: false };
+  const owned = new Map(
+    readTabRecords()
+      .filter((record) => record.kind === "shell" && record.role === role && record.cwd === cwd)
+      .map((record) => [record.handle, record]),
+  );
+  const byRecord = live
+    .filter((term) => owned.has(term.handle))
+    .sort((a, b) => Number(owned.get(b.handle).created_at) - Number(owned.get(a.handle).created_at))[0];
+  if (byRecord) return { ok: true, handle: byRecord.handle, created: false };
   const created = await createOrcaTerminal({
     cwd,
     title,
     command: "bash",
     focus: true,
+    record: { role, kind: "shell" },
   });
   if (!created.ok) {
     return { ok: false, evt: "dispatch_orca_failed", detail: created.error };
@@ -742,7 +822,13 @@ export async function ensurePacketPin(entry, role, cwd) {
 /** Per-packet visible job tab running the wrapper itself. */
 export async function startPacketJob({ role, cwd, line, dispatchId }) {
   const title = packetJobTitle(role, dispatchId);
-  const created = await createOrcaTerminal({ cwd, title, command: line, focus: true });
+  const created = await createOrcaTerminal({
+    cwd,
+    title,
+    command: line,
+    focus: true,
+    record: { role, kind: "job", dispatch_id: sanitizeDispatchId(dispatchId) },
+  });
   if (!created.ok) {
     return { ok: false, evt: "dispatch_orca_failed", detail: created.error };
   }
@@ -1915,7 +2001,10 @@ async function dispatchCli(argv) {
       }
       ensuredPin = ensured.handle;
       entry = applyPacketPin(entry, targetName, ensured.handle);
-      persistWorkersPin(opts.workersFile || workersFile, opts.worker, entry);
+      const persisted = persistWorkersPin(opts.workersFile || workersFile, opts.worker, entry);
+      if (!persisted.ok) {
+        audit({ evt: "dispatch_pin_persist_failed", worker: opts.worker, origin: opts.operator, terminal: ensured.handle, error: persisted.error });
+      }
     }
   }
   if (opts.builtin === "goal" && (targetName === "flash" || targetName === "mimo")) {
