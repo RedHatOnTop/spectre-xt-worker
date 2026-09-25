@@ -123,9 +123,10 @@ def tree_listeners(processes, listen):
 def hygiene_fields(proc, entry, snapshot, terminals, now):
     terminal = next((row for row in terminals if row.get('handle') == proc['handle']
                      and row.get('worktreePath') == entry.get('cwd')), {})
-    title = terminal.get('title', '')
-    untitled = bool(terminal) and (title in {'', 'bash', 'person@spectre'}
-                                  or title.startswith('(person@spectre shell, untitled)'))
+    # Orca lists most tabs with `title: null`; a title it did not report is no evidence.
+    title = terminal.get('title')
+    untitled = isinstance(title, str) and (title in {'', 'bash', 'person@spectre'}
+                                           or title.startswith('(person@spectre shell, untitled)'))
     age = time.clock_gettime(time.CLOCK_BOOTTIME) - proc['start'] / os.sysconf('SC_CLK_TCK')
     return {'age': age, 'duplicate': bool(entry) and proc['comm'] in {
         'qodercli', 'qoder', 'qoder-efficient', 'codex', 'codex-cli', 'codex.js'},

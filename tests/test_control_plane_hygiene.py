@@ -30,6 +30,19 @@ class ReaperTest(unittest.TestCase):
         self.assertEqual(reaper.decide({'cmd': 'dsh --profile headless task',
                                        'unpinned_flash_done_age': 301}, **args), 'term')
 
+    def test_only_a_reported_default_title_marks_a_shell_untitled(self):
+        proc = {'handle': 'term_a', 'start': 0, 'comm': 'bash'}
+
+        def untitled(**fields):
+            terminals = [{'handle': 'term_a', 'worktreePath': '/work/mc', **fields}]
+            return reaper.hygiene_fields(proc, {'cwd': '/work/mc'}, {}, terminals, 0)['untitled']
+
+        self.assertTrue(untitled(title='bash'))
+        self.assertTrue(untitled(title='(person@spectre shell, untitled) 3'))
+        self.assertFalse(untitled(title='flash-packets'))
+        self.assertFalse(untitled(title=None))
+        self.assertFalse(untitled())
+
     def test_descendant_listener_protects_parent_tree(self):
         rows = [{'pid': 20, 'ppid': 1}, {'pid': 21, 'ppid': 20}]
         self.assertEqual(reaper.tree_listeners(rows, {21: {6768}})[20], {6768})
