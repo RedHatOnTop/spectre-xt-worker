@@ -1,4 +1,5 @@
 """Process-backed hygiene and launcher regression tests."""
+import argparse
 import json
 import os
 from pathlib import Path
@@ -63,6 +64,64 @@ class ReaperTest(unittest.TestCase):
     def test_listener_parser(self):
         text = 'LISTEN 0 128 127.0.0.1:6768 0.0.0.0:* users:(("orca",pid=42,fd=7))\n'
         self.assertEqual(inventory.listeners(text), {42: {6768}})
+
+    def test_only_this_uids_unattributed_listeners_count(self):
+        text = ('LISTEN 0 128 0.0.0.0:22 0.0.0.0:* ino:1 sk:1 cgroup:/system.slice/ssh.service <->\n'
+                'LISTEN 0 511 0.0.0.0:6768 0.0.0.0:* users:(("orca",pid=42,fd=7)) uid:1000 ino:2 sk:2 <->\n'
+                'LISTEN 0 128 127.0.0.1:8080 0.0.0.0:* uid:1000 ino:3 sk:3 <->\n'
+                'LISTEN 0 128 127.0.0.1:9000 0.0.0.0:* uid:1001 ino:4 sk:4 <->\n'
+                'garbled\n\n')
+        self.assertEqual(inventory.unattributed(text, 1000), ['127.0.0.1:8080', 'garbled'])
+        self.assertEqual(inventory.unattributed(text, 0), ['0.0.0.0:22', 'garbled'])
+        self.assertEqual(inventory.listeners(text), {42: {6768}})
+
+
+class LiveTest(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        self.packet_dir = root / 'packets'
+        (self.packet_dir / 'tabs').mkdir(parents=True)
+        self.record = self.packet_dir / 'tabs' / 'term_gone.json'
+        self.record.write_text(json.dumps({'handle': 'term_gone', 'role': 'flash', 'kind': 'shell',
+                                           'dispatch_id': None, 'created_at': 0}) + '\n')
+        write_json(root / 'workers.json', {'workers': {'minecraft': {'cwd': '/work/mc'}}})
+        self.args = argparse.Namespace(apply=False, workers_file=root / 'workers.json',
+                                       state=root / 'reaper.json')
+
+    def live(self, listener_uid, observe):
+        row = f'LISTEN 0 128 127.0.0.1:8080 0.0.0.0:* uid:{listener_uid} ino:3 sk:3 <->\n'
+
+        def fake_ss(argv, **kwargs):
+            self.assertEqual(argv, ['ss', '-ltnpeH'])
+            return subprocess.CompletedProcess(argv, 0, row, '')
+
+        listing = {'ok': True, 'parsed': {'result': {'terminals': [], 'truncated': False}}}
+        with patch.dict(os.environ, {'SPECTRE_PACKET_DIR': str(self.packet_dir)}), \
+                patch.object(reaper.subprocess, 'run', side_effect=fake_ss), \
+                patch.object(reaper, 'run', return_value=listing), \
+                patch.object(reaper, 'observe', side_effect=observe):
+            return reaper.live(self.args)
+
+    def test_another_uids_unattributed_listener_does_not_block(self):
+        out = self.live(os.getuid() + 1, lambda *args: ([], {}))
+        self.assertTrue(out['ok'])
+        self.assertNotIn('error', out)
+        self.assertEqual([row['reason'] for row in out['tab_records']], ['tab_gone'])
+
+    def test_own_unattributed_listener_refuses_processes_but_sweeps_tabs(self):
+        def refuse_observe(*args):
+            raise AssertionError('observe ran despite an unattributed listener')
+
+        out = self.live(os.getuid(), refuse_observe)
+        self.assertFalse(out['ok'])
+        self.assertEqual(out['error'],
+                         'listener ownership incomplete: 127.0.0.1:8080; refusing process reap')
+        self.assertEqual(out['decisions'], [])
+        self.assertEqual([(row['handle'], row['reason'], row['dry_run']) for row in out['tab_records']],
+                         [('term_gone', 'tab_gone', True)])
+        self.assertTrue(self.record.exists())
 
 
 class PinTest(unittest.TestCase):

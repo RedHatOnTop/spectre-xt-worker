@@ -177,22 +177,9 @@ def summary(row):
             for key in ('pid', 'comm', 'handle', 'rss_mib', 'listen', 'action') if key in row}
 
 
-def live(args):
-    workers = load_workers(args.workers_file)
-    runtime.validate_workers(workers)
-    if not workers:
-        raise ValueError('worker registry missing or empty')
-    proc = subprocess.run(['ss', '-ltnpH'], capture_output=True, text=True, timeout=5, check=True)
-    # Missing process ownership makes the entire listen table unsafe to act on.
-    if any(line.strip() and 'pid=' not in line for line in proc.stdout.splitlines()):
-        raise ValueError('listener ownership incomplete; refusing reap')
-    listed = run(['orca-ide', 'terminal', 'list', '--json'], timeout=8)
-    if not listed['ok']:
-        raise ValueError('Orca inventory unavailable; refusing reap')
-    listing = listed['parsed'].get('result', {})
-    terminals = listing.get('terminals', [])
+def reap_processes(args, workers, terminals, listen_text):
     with locked(args.state.with_suffix('.lock')):
-        rows, state = observe(workers, inventory.scan(), inventory.listeners(proc.stdout),
+        rows, state = observe(workers, inventory.scan(), inventory.listeners(listen_text),
                               read_json(args.state), StateClient(timeout=2), time.time(), terminals)
         actions = []
         for row in rows:
@@ -204,6 +191,25 @@ def live(args):
                     continue
             actions = [*actions, summary(row)]
         write_json(args.state, state)
+    return actions
+
+
+def live(args):
+    workers = load_workers(args.workers_file)
+    runtime.validate_workers(workers)
+    if not workers:
+        raise ValueError('worker registry missing or empty')
+    proc = subprocess.run(['ss', '-ltnpeH'], capture_output=True, text=True, timeout=5, check=True)
+    # An unattributed listener of this uid means /proc hides some of its processes,
+    # so their ports are unknown. Another uid's never belongs to a process scan()
+    # returns: ss reads the same fd tables and would name it.
+    unowned = inventory.unattributed(proc.stdout, os.getuid())
+    listed = run(['orca-ide', 'terminal', 'list', '--json'], timeout=8)
+    if not listed['ok']:
+        raise ValueError('Orca inventory unavailable; refusing reap')
+    listing = listed['parsed'].get('result', {})
+    terminals = listing.get('terminals', [])
+    actions = [] if unowned else reap_processes(args, workers, terminals, proc.stdout)
     packet_dir = Path(os.environ.get('SPECTRE_PACKET_DIR',
                                      str(Path.home() / '.local/state/remote-agent/packets')))
     pinned = set()
@@ -213,8 +219,10 @@ def live(args):
                                       truncated=bool(listing.get('truncated')))
     killed = [row for row in actions if args.apply and row['action'] == 'term' and 'error' not in row]
     notice = runtime.notify(run, dict(os.environ), 'reaper', json.dumps(killed), channel='fleet') if killed else {'ok': True}
-    return {'ok': notice['ok'] and not any('error' in row for row in actions + tab_actions + records),
-            'dry_run': not args.apply, 'decisions': actions, 'orca_tabs': tab_actions,
+    refusal = ({'error': f'listener ownership incomplete: {", ".join(unowned)}; refusing process reap'}
+               if unowned else {})
+    return {'ok': not unowned and notice['ok'] and not any('error' in row for row in actions + tab_actions + records),
+            **refusal, 'dry_run': not args.apply, 'decisions': actions, 'orca_tabs': tab_actions,
             'tab_records': records, 'notification': notice}
 
 

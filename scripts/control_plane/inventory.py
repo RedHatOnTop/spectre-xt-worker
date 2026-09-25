@@ -100,3 +100,19 @@ def listeners(text: str) -> dict[int, set[int]]:
             pid = int(value)
             result = {**result, pid: result.get(pid, set()) | {port}}
     return result
+
+
+def unattributed(text: str, uid: int) -> list[str]:
+    """`ss -ltnpeH` listeners of `uid` that no visible process holds.
+
+    ss prints no `uid:` for root's sockets. A row that does not parse counts.
+    """
+    out = []
+    for line in text.splitlines():
+        parts = line.split()
+        if not parts or 'pid=' in line:
+            continue
+        owner = re.search(r'(?:^|\s)uid:(\d+)', line)
+        if len(parts) < 5 or parts[0] != 'LISTEN' or int(owner.group(1) if owner else 0) == uid:
+            out = [*out, parts[3] if len(parts) >= 5 else line.strip()]
+    return out
