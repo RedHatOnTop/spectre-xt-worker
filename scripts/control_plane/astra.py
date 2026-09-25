@@ -77,6 +77,7 @@ def create_terminal(workers_file, entry, processes, ident, modes, run):
         targets = current.get('targets') or {}
         updated = {**current, 'terminal': efficient['handle'],
                    'targets': {**targets, 'efficient': {**targets.get('efficient', {}), 'terminal': efficient['handle']}},
-                   'planner': {'terminal': handle, 'model': 'gpt-6-astra', 'provider': ident}}
+                   'planner': {'terminal': handle, 'harness': seat.OWNER_ASTRA,
+                               'model': 'gpt-6-astra', 'provider': ident}}
         write_json(workers_file, {**registry, 'workers': {**registry['workers'], 'minecraft': updated}})
     return {'ok': True, 'terminal': handle, 'provider': ident, 'worktree': entry['cwd']}

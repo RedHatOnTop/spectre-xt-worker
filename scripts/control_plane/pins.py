@@ -1,6 +1,8 @@
 """Reconcile native terminal pins from process identity, preserving ambiguous pins."""
 from __future__ import annotations
 
+from . import seat
+
 
 def pick(terminals: list[dict], processes: list[dict], cwd: str, role: str) -> dict:
     live = [row for row in terminals if row.get('worktreePath') == cwd
@@ -25,10 +27,13 @@ def sync(workers: dict, terminals: list[dict], processes: list[dict]) -> tuple[d
                 **entry['targets']['efficient'], 'terminal': efficient['handle']}}}
         changes = [*changes, {'worker': name, 'role': 'efficient', **efficient}]
         if name == 'minecraft' and entry.get('planner'):
-            astra = pick(terminals, processes, entry['cwd'], 'astra')
-            if astra['ok']:
-                updated = {**updated, 'planner': {**entry['planner'], 'terminal': astra['handle']}}
-            changes = [*changes, {'worker': name, 'role': 'astra', **astra}]
+            harness = entry['planner'].get('harness') or seat.OWNER_ASTRA
+            role = seat.planner_role(harness)
+            planner = (pick(terminals, processes, entry['cwd'], role) if role else
+                       {'ok': False, 'error': f'unknown planner harness {harness!r}'})
+            if planner['ok']:
+                updated = {**updated, 'planner': {**entry['planner'], 'terminal': planner['handle']}}
+            changes = [*changes, {'worker': name, 'role': role or 'planner', **planner}]
         result = {**result, name: updated}
     return result, changes
 

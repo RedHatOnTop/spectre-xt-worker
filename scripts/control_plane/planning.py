@@ -33,9 +33,9 @@ def event(client, worker: str, kind: str, planning: dict, now: float) -> dict:
             'request_id': planning['request_id'], 'action_id': planning['action_id']}}))
 
 
-def request(snapshot: dict, now: float) -> dict:
+def request(snapshot: dict, now: float, timeout: int = ASSIGNMENT_TIMEOUT) -> dict:
     goal = snapshot['goal']
-    return {'request_id': f'r-{uuid4().hex}', 'woke_at': now,
+    return {'request_id': f'r-{uuid4().hex}', 'woke_at': now, 'timeout': timeout,
             'goal_id': goal.get('goal_id'), 'attempt_id': goal.get('attempt_id'),
             'origin': identity(snapshot), 'status': 'prepared'}
 
@@ -44,6 +44,6 @@ def result(directory: Path, current: dict, now: float) -> dict:
     polled = packets.poll(directory, current)
     if 'packets' in polled:
         return {'action': 'ready', **polled}
-    if now - current['woke_at'] >= ASSIGNMENT_TIMEOUT:
+    if now - current['woke_at'] >= current.get('timeout', ASSIGNMENT_TIMEOUT):
         return {'action': 'timeout', 'reason': polled.get('error', 'assignment_timeout')}
     return {'action': 'waiting', **polled}

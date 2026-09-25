@@ -945,16 +945,27 @@ export function injectionLine({ builtin, target, goalText, clauseText, dispatchI
   return dispatchLine("goal", goalText, clauseText);
 }
 
-export function astraPidVerdict(cmdlines) {
+// Must match PLANNER_ROLES in scripts/control_plane/seat.py.
+const PLANNER_ROLES = new Map([["codex", "astra"], ["claude", "claude"], ["kimi", "kimi"]]);
+
+export function plannerRole(entry) {
+  return PLANNER_ROLES.get(entry?.planner?.harness || "codex") ?? null;
+}
+
+export function plannerPidVerdict(cmdlines, role) {
   const lines = (Array.isArray(cmdlines) ? cmdlines : []).map((c) => String(c));
-  const astra = lines.filter((c) => processRole(c.split(/\s+/)) === "astra");
-  if (astra.some((c) => /model_provider\s*=\s*["\']?openai/.test(c))) {
+  const matched = lines.filter((c) => processRole(c.split(/\s+/)) === role);
+  if (role === "astra" && matched.some((c) => /model_provider\s*=\s*["\']?openai/.test(c))) {
     return { ok: false, evt: "dispatch_astra_plus_burn" };
   }
-  if (astra.length !== 1) {
-    return { ok: false, evt: "dispatch_astra_busy", count: astra.length };
+  if (matched.length !== 1) {
+    return { ok: false, evt: `dispatch_${role}_busy`, count: matched.length };
   }
   return { ok: true };
+}
+
+export function astraPidVerdict(cmdlines) {
+  return plannerPidVerdict(cmdlines, "astra");
 }
 
 export function astraCmdlinesFromEnv(env = process.env) {
@@ -963,11 +974,11 @@ export function astraCmdlinesFromEnv(env = process.env) {
   return String(raw).split("\n").filter(Boolean);
 }
 
-export function listAstraCmdlines(env = process.env, procRoot = "/proc") {
+export function listPlannerCmdlines(role, env = process.env, procRoot = "/proc") {
   const fromEnv = astraCmdlinesFromEnv(env);
   if (fromEnv) return fromEnv;
   try {
-    const rows = processes(env.SPECTRE_PROC_ROOT || procRoot).filter((row) => row.role === "astra");
+    const rows = processes(env.SPECTRE_PROC_ROOT || procRoot).filter((row) => row.role === role);
     const leaves = rows.filter((row) => !rows.some((other) => other.ppid === row.pid));
     return leaves.map((row) => row.argv.join(" "));
   } catch {
@@ -1833,16 +1844,25 @@ async function dispatchCli(argv) {
   }
 
   if (opts.builtin === "plan") {
-    const cmdlines = listAstraCmdlines();
-    const astra = astraPidVerdict(cmdlines);
-    if (!astra.ok) {
-      audit({ evt: astra.evt, worker: opts.worker, origin: opts.operator, count: astra.count });
+    const role = plannerRole(entry);
+    if (!role) {
+      audit({ evt: "dispatch_planner_unknown", worker: opts.worker, origin: opts.operator });
       return {
         ok: false,
-        evt: astra.evt,
-        detail: astra.evt === "dispatch_astra_plus_burn"
+        evt: "dispatch_planner_unknown",
+        detail: "planner harness is unknown — refusing plan, not creating a terminal",
+        code: 1,
+      };
+    }
+    const pids = plannerPidVerdict(listPlannerCmdlines(role), role);
+    if (!pids.ok) {
+      audit({ evt: pids.evt, worker: opts.worker, origin: opts.operator, count: pids.count });
+      return {
+        ok: false,
+        evt: pids.evt,
+        detail: pids.evt === "dispatch_astra_plus_burn"
           ? "plus-burn gpt-6-astra pid present — refusing plan, not creating a terminal"
-          : "astra pid count is not 1 — refusing plan, not creating a terminal",
+          : `${role} pid count is not 1 — refusing plan, not creating a terminal`,
         code: 1,
       };
     }
@@ -1958,7 +1978,7 @@ async function dispatchCli(argv) {
       audit({ evt: "dispatch_orca_refused", worker: opts.worker, origin: opts.operator, detail: pick.detail });
       return { ok: false, evt: "dispatch_orca_refused", detail: pick.detail, code: 1 };
     }
-    const role = opts.builtin === "plan" ? "astra" : targetName;
+    const role = opts.builtin === "plan" ? plannerRole(entry) : targetName;
     try {
       if (!nativeProcessGuard(pick.terminal.handle, entry.cwd, role)) {
         return { ok: false, evt: "dispatch_model_mismatch", detail: "pinned process argv/cwd does not match target", code: 1 };

@@ -19,6 +19,7 @@ from .io import locked, read_json, run as run_command, write_json
 MODEL_ALIAS = 'cline/kimi-k3'
 UPSTREAM_MODEL = 'cline-free/kimi-k3'
 HANDLE_PATTERN = re.compile(r'^term_[a-zA-Z0-9-]+$')
+PLANNER_MODELS = frozenset(seat.PLANNER_ROLES.values())
 
 
 def config_endpoint(path: Path, endpoint: str) -> str:
@@ -117,6 +118,14 @@ def context(workers_file: Path, provider_state: Path, loop_state: Path,
             'brief': brief}
 
 
+def set_planner(workers_file: Path, planner: dict) -> None:
+    with locked(workers_file.with_suffix('.lock')):
+        registry = read_json(workers_file)
+        current = registry['workers']['minecraft']
+        write_json(workers_file, {**registry, 'workers': {
+            **registry['workers'], 'minecraft': {**current, 'planner': planner}}})
+
+
 def orca_terminals(run) -> list[dict]:
     result = run(['orca-ide', 'terminal', 'list', '--json'], timeout=15)
     if not result.get('ok'):
@@ -146,7 +155,7 @@ def launch(workers_file: Path, provider_state: Path, loop_state: Path, seat_root
             return {'ok': False, 'error': 'kimi_terminal_already_created',
                     'terminal': info['pending']['terminal']}
         processes = scan()
-        if any(row.get('model') in {'astra', 'kimi'} and row.get('cwd') == info['entry']['cwd']
+        if any(row.get('model') in PLANNER_MODELS and row.get('cwd') == info['entry']['cwd']
                for row in processes):
             return {'ok': False, 'error': 'top_level_agent_already_running'}
         terminals = orca_terminals(run)
@@ -248,6 +257,12 @@ def confirm(workers_file: Path, provider_state: Path, loop_state: Path,
                                            {**updated['seat'], 'terminal': handle})
         if not committed['ok']:
             return committed
+        try:
+            set_planner(workers_file, {'terminal': handle, 'harness': seat.OWNER_KIMI,
+                                       'model': UPSTREAM_MODEL, 'provider': providers.KIMI_FREE})
+        except (OSError, ValueError, KeyError):
+            return {'ok': False, 'error': 'registry_update_failed',
+                    'seat_committed': True, 'terminal': handle}
         ws = info['state']['workers']['minecraft']
         try:
             write_json(loop_state, runtime.worker_state(info['state'], 'minecraft',
@@ -284,7 +299,7 @@ def release(workers_file: Path, provider_state: Path, loop_state: Path,
         current = seat.load(seat.seat_path(seat_root))
         if current['owner'] != seat.OWNER_KIMI:
             raise ValueError(f"seat_owned_by_{current['owner']}")
-        if any(row.get('model') in {'astra', 'kimi'} and row.get('cwd') == entry['cwd']
+        if any(row.get('model') in PLANNER_MODELS and row.get('cwd') == entry['cwd']
                for row in scan()):
             return {'ok': False, 'error': 'top_level_agent_still_running'}
         brief = seat.brief_path(seat_root)
@@ -297,4 +312,9 @@ def release(workers_file: Path, provider_state: Path, loop_state: Path,
                                            updated['seat'])
         if not committed['ok']:
             return committed
+        try:
+            set_planner(workers_file, {'terminal': None, 'harness': seat.OWNER_ASTRA,
+                                       'model': 'gpt-6-astra'})
+        except (OSError, ValueError, KeyError):
+            return {'ok': False, 'error': 'registry_update_failed', 'seat_committed': True}
         return {'ok': True, 'owner': seat.OWNER_ASTRA, 'next': 'launch_astra'}

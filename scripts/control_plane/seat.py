@@ -47,6 +47,17 @@ SEAT_LADDER = (
      'model': 'gpt-6-astra', 'wire_api': 'responses'},
 )
 
+# Process role of each owner's planner, as inventory.model() and
+# scripts/dispatch-process.mjs name it. The three tables must agree.
+PLANNER_ROLES = {OWNER_ASTRA: 'astra', OWNER_CLAUDE: 'claude', OWNER_KIMI: 'kimi'}
+# anyrouter's edge answers 524 at ~301 s per request and prefill costs ~1 s per
+# 1k tokens, so a Claude plan needs more than one edge window.
+PLAN_TIMEOUTS = {OWNER_CLAUDE: 900}
+
+
+def planner_role(owner: str) -> str | None:
+    return PLANNER_ROLES.get(owner)
+
 
 def ladder() -> list[dict]:
     """The routing policy as copies, best seat first."""
@@ -126,7 +137,7 @@ def load(path: Path) -> dict:
         raise ValueError(f'{path.name}: symlink seat state is not allowed')
     row = read_json(path)
     if (row.get('worker') != path.parent.name or
-            row.get('owner') not in {OWNER_ASTRA, OWNER_KIMI} or
+            row.get('owner') not in OWNERS or
             type(row.get('handoff_count')) is not int or row['handoff_count'] < 0 or
             not isinstance(row.get('history'), list) or
             not all(isinstance(item, dict) for item in row['history']) or
@@ -177,7 +188,7 @@ def prepare_handoff(state: dict, root: Path, now: float, *, to: str = OWNER_KIMI
     ok, reason = can_handoff(state, now, cap)
     if not ok:
         return {'ok': False, 'error': reason}
-    if to not in {OWNER_KIMI, OWNER_ASTRA}:
+    if to not in OWNERS:
         return {'ok': False, 'error': 'unknown_owner'}
     if to == state.get('owner'):
         return {'ok': False, 'error': 'already_owner'}
@@ -191,7 +202,7 @@ def transition(state: dict, now: float, *, to: str, brief: str,
     ok, reason = can_handoff(state, now, cap)
     if not ok:
         return {'ok': False, 'error': reason}
-    if to not in {OWNER_KIMI, OWNER_ASTRA}:
+    if to not in OWNERS:
         return {'ok': False, 'error': 'unknown_owner'}
     if to == state.get('owner'):
         return {'ok': False, 'error': 'already_owner'}
@@ -199,12 +210,12 @@ def transition(state: dict, now: float, *, to: str, brief: str,
     count = int(state.get('handoff_count') or 0) + 1 if state.get('handoff_day') == day else 1
     history = [*state.get('history', []), {
         'at': now, 'from': state.get('owner'), 'to': to, 'brief': brief}][-20:]
-    model = 'cline-free/kimi-k3' if to == OWNER_KIMI else 'gpt-6-astra'
-    chain = ['cline-free'] if to == OWNER_KIMI else ['agentrouter', 'anyrouter']
+    best = seats_for_owner(to)[0]
+    chain = ['agentrouter', 'anyrouter'] if to == OWNER_ASTRA else [best['provider']]
     updated = {
         **state,
         'owner': to,
-        'model': model,
+        'model': best['model'],
         'provider_chain': chain,
         'session_id': None,
         'terminal': None,

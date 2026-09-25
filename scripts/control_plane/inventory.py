@@ -8,6 +8,10 @@ import re
 
 def option(argv: list[str], *names: str) -> str | None:
     for index, arg in enumerate(argv):
+        # A wrapper such as `claude bg-pty-host ... -- /usr/bin/claude --model X`
+        # carries its child's argv; counting it would double the planner.
+        if arg == '--':
+            return None
         if arg in names and index + 1 < len(argv):
             return argv[index + 1]
         for name in names:
@@ -32,6 +36,8 @@ def model(argv: list[str]) -> str | None:
         return 'astra'
     if exe == 'kimi' and selected == 'cline/kimi-k3':
         return 'kimi'
+    if exe == 'claude' and selected == 'claude-opus-5-5':
+        return 'claude'
     if exe in {'qodercli', 'qoder', 'qoder-efficient'} and str(selected).lower() == 'efficient':
         return 'efficient'
     if exe in {'dsh-clinepass'} or (exe == 'dsh' and option(argv, '--profile') in {'headless', 'tui', 'minimal'}):

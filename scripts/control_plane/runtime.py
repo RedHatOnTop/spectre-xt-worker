@@ -65,11 +65,16 @@ def dry_action(worker, entry, snapshot, env):
     return {'worker': worker, 'action': 'skip', 'reason': snapshot.get('goal', {}).get('state')}
 
 
-def planner_seat(worker, snapshot, state, path, env, provider, now, run):
-    ws = state.get('workers', {}).get(worker, {})
+def seat_root(path, env):
     root = Path(env.get('SPECTRE_SEAT_ROOT', path.parent))
     if not root.is_absolute():
         raise ValueError('SPECTRE_SEAT_ROOT must be absolute')
+    return root
+
+
+def planner_seat(worker, snapshot, state, path, env, provider, now, run):
+    ws = state.get('workers', {}).get(worker, {})
+    root = seat_root(path, env)
     current = seat.load(seat.seat_path(root, worker))
     if current['owner'] != seat.OWNER_ASTRA:
         updated, action = escalation(worker, ws, f"seat_owned_by_{current['owner']}", run, env)
@@ -96,23 +101,47 @@ def planner_seat(worker, snapshot, state, path, env, provider, now, run):
     return state, None
 
 
-def start_plan(worker, entry, snapshot, state, path, client, env, now, run):
+def codex_gate(worker, entry, snapshot, state, path, env, now, run):
     ws = state.get('workers', {}).get(worker, {})
+    planner = entry.get('planner', {})
+    if (planner.get('harness') or seat.OWNER_ASTRA) != seat.OWNER_ASTRA:
+        new_ws, action = escalation(worker, ws, 'planner_harness_mismatch', run, env)
+        return worker_state(state, worker, new_ws), action, None
     provider_path = Path(env.get('SPECTRE_PROVIDER_STATE', Path.home() / '.local/state/remote-agent/codex-provider.json'))
     provider = read_json(provider_path)
-    active_provider = entry.get('planner', {}).get('provider')
     reason = budget.planner_refusal(state, provider, now, snapshot['goal']['state'] == 'FAILED')
     if reason:
         new_ws, action = escalation(worker, ws, reason, run, env)
-        return worker_state(state, worker, new_ws), action
+        return worker_state(state, worker, new_ws), action, None
     state, seat_action = planner_seat(worker, snapshot, state, path, env, provider, now, run)
     if seat_action:
-        return state, seat_action
+        return state, seat_action, None
     ws = state.get('workers', {}).get(worker, {})
-    if active_provider and active_provider != provider.get('id'):
+    if planner.get('provider') and planner['provider'] != provider.get('id'):
         new_ws, action = escalation(worker, ws, 'provider_restart_required', run, env)
+        return worker_state(state, worker, new_ws), action, None
+    return state, None, provider.get('id')
+
+
+def start_plan(worker, entry, snapshot, state, path, client, env, now, run):
+    planner = entry.get('planner', {})
+    owner = seat.load(seat.seat_path(seat_root(path, env), worker))['owner']
+    if owner == seat.OWNER_ASTRA:
+        state, action, ledger = codex_gate(worker, entry, snapshot, state, path, env, now, run)
+        if action:
+            return state, action
+    elif planner.get('harness') == owner:
+        # Codex budgets and provider health do not describe another harness.
+        ledger = seat.seats_for_owner(owner)[0]['provider']
+    else:
+        ws = state.get('workers', {}).get(worker, {})
+        new_ws, action = escalation(worker, ws, f'seat_owned_by_{owner}', run, env)
         return worker_state(state, worker, new_ws), action
-    current = planning.request(snapshot, now)
+    ws = state.get('workers', {}).get(worker, {})
+    if not planner.get('terminal'):
+        new_ws, action = escalation(worker, ws, 'planner_terminal_missing', run, env)
+        return worker_state(state, worker, new_ws), action
+    current = planning.request(snapshot, now, seat.PLAN_TIMEOUTS.get(owner, planning.ASSIGNMENT_TIMEOUT))
     state = worker_state(state, worker, {**ws, 'planning': current})
     write_json(path, state)
     claim = planning.advance(client, worker, snapshot, current['request_id'])
@@ -121,7 +150,7 @@ def start_plan(worker, entry, snapshot, state, path, client, env, now, run):
     write_json(path, state)
     planning.event(client, worker, 'assignment.started', current, now)
     plans = [row for row in state.get('plans', []) if row['at'] > now - budget.PLUS_WINDOW]
-    state = {**state, 'plans': [*plans, {'at': now, 'provider': provider.get('id'),
+    state = {**state, 'plans': [*plans, {'at': now, 'provider': ledger,
                                        'critical': snapshot['goal']['state'] == 'FAILED'}]}
     write_json(path, state)
     out = dispatch(run, env, ['plan', worker, '--request-id', current['request_id']])

@@ -3,6 +3,9 @@ import { basename, join } from "node:path";
 
 function option(argv, names) {
   for (let i = 0; i < argv.length; i += 1) {
+    // A wrapper such as `claude bg-pty-host ... -- /usr/bin/claude --model X`
+    // carries its child's argv; counting it would double the planner.
+    if (argv[i] === "--") return null;
     if (names.includes(argv[i])) return argv[i + 1];
     for (const name of names) if (argv[i].startsWith(`${name}=`)) return argv[i].slice(name.length + 1);
   }
@@ -14,6 +17,8 @@ export function processRole(argv) {
   if (/^(node|python)/.test(exe)) exe = basename(argv[1] || "");
   const model = option(argv, ["-m", "--model"]);
   if (["codex", "codex-cli", "codex.js"].includes(exe) && model === "gpt-6-astra") return "astra";
+  if (exe === "claude" && model === "claude-opus-5-5") return "claude";
+  if (exe === "kimi" && model === "cline/kimi-k3") return "kimi";
   if (["qodercli", "qoder", "qoder-efficient"].includes(exe) && String(model).toLowerCase() === "efficient") return "efficient";
   if (exe === "dsh-clinepass" || (exe === "dsh" && ["headless", "tui", "minimal"].includes(option(argv, ["--profile"])))) return "flash";
   if (["mimo-clinepass", "mimo", "mimocode"].includes(exe)) return "mimo";
@@ -49,6 +54,6 @@ export function nativeProcessGuard(pin, cwd, target, rows = processes()) {
   const packetTargets = ["flash", "mimo"];
   const wanted = packetTargets.includes(target) ? "shell" : target;
   const matched = tree.some((row) => row.role === wanted && row.cwd === cwd);
-  const wrongAgent = tree.some((row) => ["astra", "efficient", "flash", "mimo"].includes(row.role) && row.role !== wanted);
+  const wrongAgent = tree.some((row) => ["astra", "claude", "kimi", "efficient", "flash", "mimo"].includes(row.role) && row.role !== wanted);
   return matched && !wrongAgent;
 }
