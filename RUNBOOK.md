@@ -2858,6 +2858,157 @@ below remains open.
 
 ---
 
+## 7.19 Claude Code session handoff (since 2026-09-26)
+
+§7.15 moves a **Codex** session between the two machines. Claude Code has no
+equivalent helper, but a Claude session is three plain artifacts, so the same
+move is a file copy plus one Orca terminal. This was first done for the
+11-hour `/goal control plane` session (fedora → spectre) on 2026-09-26; the
+procedure below is that run, not a proposal.
+
+### What actually has to move
+
+A Claude Code session is **not** the transcript alone. Four things travel, and
+the transcript is keyed to the working directory it was recorded in:
+
+| artifact | path | why |
+| --- | --- | --- |
+| transcript | `~/.claude/projects/<slug>/<uuid>.jsonl` | the conversation; `<slug>` is the cwd with `/` → `-` (leading `/` included), so the **same** session lands under `<box-slug>` on the other side |
+| file-history | `~/.claude/file-history/<uuid>/` | the per-session backup blobs (`<hash>@vN`) that `Edit`/`Write` diff against |
+| task output | `/tmp/claude-1000/<slug>/<uuid>/` | background-task stdout the transcript references by path |
+| workspace trust | `~/.claude.json` → `projects["<cwd>"].hasTrustDialogAccepted` | without it the box opens the "Do you trust this folder?" dialog and the resume **stalls there** (see below) |
+
+The transcript's own `cwd` field stays at the old path — that is the address,
+not a claim about the machine. Everything a session does *after* the resume
+uses the box's real cwd.
+
+### The trust dialog is the one real trap
+
+The box had no `projects` entry for the new path, so `claude --resume <uuid>`
+stopped at:
+
+```
+Quick safety check: Is this a project you created or one you trust?
+ ❯ No, exit
+```
+
+`--permission-mode bypassPermissions` does **not** skip it — it is a
+workspace-trust gate, not a permission gate, and nothing in the terminal
+advances it. There is no non-interactive flag for it either, so seed the entry
+before the terminal is created (same shape as an existing trusted project):
+
+```bash
+env -u PYTHONHOME -u PYTHONPATH python3 - <<'PY'
+import json, os, tempfile
+p = os.path.expanduser('~/.claude.json')
+d = json.load(open(p))
+d.setdefault('projects', {})['/home/person/Projects/remote-agent'] = {
+    'allowedTools': [], 'mcpContextUris': [], 'mcpServers': {},
+    'enabledMcpjsonServers': [], 'disabledMcpjsonServers': [],
+    'hasTrustDialogAccepted': True,
+    'hasClaudeMdExternalIncludesApproved': False,
+    'hasClaudeMdExternalIncludesWarningShown': False,
+}
+fd, tmp = tempfile.mkstemp(dir=os.path.dirname(p))
+with os.fdopen(fd, 'w') as f: json.dump(d, f)
+os.chmod(tmp, 0o600); os.replace(tmp, p)
+PY
+```
+
+`~/.claude.json` is mode 600 and holds relay keys, so a merge that preserves
+the other projects is mandatory — never rewrite the file from scratch.
+
+### Procedure (fedora → spectre)
+
+```bash
+SID=<session-uuid>
+FED_SLUG=-home-person-Projects-distribution-project-remote-agent
+BOX_SLUG=-home-person-Projects-remote-agent
+SSH='ssh spectre'
+
+# 0. the receiving side must have the repo at its own path, on the same commit,
+#    and the same working tree — the session resumes mid-edit otherwise.
+#    /home/person/Projects/distribution-project exists on the box but the repo
+#    lives at /home/person/Projects/remote-agent (2026-09-26 deploy).
+git -C ~/Projects/distribution-project/remote-agent rev-parse HEAD
+$SSH 'git -C /home/person/Projects/remote-agent rev-parse HEAD'   # must match
+rsync -a --exclude '/.git/' --exclude '/zcode-remote-app/' --exclude '/.mimocode/' \
+  --exclude node_modules/ --exclude __pycache__/ --exclude '*.pyc' \
+  --exclude references/ \
+  ~/Projects/distribution-project/remote-agent/ \
+  spectre:/home/person/Projects/remote-agent/
+
+# 1. stop the sender first: a live sender keeps appending to the transcript
+#    while it is copied, and the two copies then diverge from the copy point.
+#    SIGTERM is enough and the TUI exits at once.
+kill <fedora-claude-pid>          # pid is in ~/.claude/sessions/<pid>.json
+
+# 2. the three artifacts, then the trust seed (above)
+$SSH "mkdir -p ~/.claude/projects/$BOX_SLUG"
+rsync -a ~/.claude/projects/$FED_SLUG/$SID.jsonl   spectre:~/.claude/projects/$BOX_SLUG/$SID.jsonl
+rsync -a ~/.claude/file-history/$SID/              spectre:~/.claude/file-history/$SID/
+rsync -a /tmp/claude-1000/$FED_SLUG/$SID/          spectre:/tmp/claude-1000/$FED_SLUG/$SID/
+rsync -a /tmp/claude-1000/$FED_SLUG/$SID/          spectre:/tmp/claude-1000/$BOX_SLUG/$SID/
+
+# 3. Orca must know the repo, or the terminal is not renderable (AGENTS.md rule)
+$SSH 'orca-ide repo add --path /home/person/Projects/remote-agent --json'
+$SSH 'cd /home/person/Projects/remote-agent && orca-ide worktree current --json'   # check the full id
+
+# 4. bring it up as an Orca terminal, from inside the worktree with the active selector
+$SSH 'cd /home/person/Projects/remote-agent && orca-ide terminal create --worktree active \
+  --title "Claude Code (control plane handoff)" \
+  --command "claude --permission-mode bypassPermissions --resume '"$SID"'" --json'
+```
+
+Then wait for the TUI, and tell the resumed session **where it now is** — the
+transcript's last line is still the old cwd, and a session that starts writing
+paths from it writes them on the wrong machine:
+
+```bash
+$SSH 'orca-ide terminal wait --terminal <handle> --for tui-idle --timeout-ms 90000 --json'
+$SSH 'orca-ide terminal send --terminal <handle> --text "스펙터로 이관 완료. ... cwd가 ... 에서 /home/person/Projects/remote-agent 로 바뀌었다." --enter --json'
+```
+
+### What survives and what does not
+
+- The `/goal` Stop hook **re-arms from the transcript itself**: the resumed
+  terminal's statusline reads `◎ /goal active` again, with no re-issue of
+  `/goal`. The condition is re-derived from the recorded command, not from
+  local state.
+- `--permission-mode bypassPermissions` must be passed explicitly. The
+  box's `settings.json` sets `permissions.defaultMode: bypassPermissions`
+  (§7.2), but the CLI does not apply it to a resume that passes the flag
+  differently; passing it makes terminal and settings agree.
+- The session's own `sessionId` is preserved, so the box's transcript is
+  `<uuid>.jsonl` with the identical content (verify by `sha256sum`).
+- **The sender's terminal stays open as a dead tab.** Killing the CLI leaves
+  the Orca tab at a shell prompt; close it (`orca-ide terminal close
+  --terminal <handle>`) so the worktree does not look like it still holds a
+  live worker — and so nothing else pins to it (§7.10).
+- A session that resumes from a **copied** transcript is a fork point from
+  that instant. Do not let both copies run: the sender is stopped as part of
+  the handoff, not left "just in case".
+
+### Verify
+
+```bash
+# sender is gone, receiver has the identical transcript
+sha256sum ~/.claude/projects/-home-person-Projects-distribution-project-remote-agent/<uuid>.jsonl
+ssh spectre 'sha256sum ~/.claude/projects/-home-person-Projects-remote-agent/<uuid>.jsonl'
+#   identical
+
+# the receiver is a real, verified worktree (not a path: binding)
+ssh spectre 'orca-ide worktree ps' | grep -A1 remote-agent      # live:1, pty:yes, registered path
+
+# the resumed session is up, in the right cwd, with the goal re-armed
+ssh spectre 'orca-ide terminal read --terminal <handle> --limit 60 --json'
+#   banner: ~/Projects/remote-agent · ⎇ feat/spectre-control-plane-pr1 · ◎ /goal active
+ssh spectre 'ls ~/.claude/projects/-home-person-Projects-remote-agent/<uuid>.jsonl'
+jq -r '.projects["/home/person/Projects/remote-agent"].hasTrustDialogAccepted' ~/.claude.json  # (box) true
+```
+
+---
+
 ## 8. Monitoring
 
 
@@ -3085,6 +3236,15 @@ spectre-slack-bridge --dispatch resume qoder --dry-run   # dispatch_dry_run, not
 cat /work/logs/goal-supervisor.log | tail -5       # scan lines + any grok failure detail
 systemctl --user is-enabled goal-supervisor.timer  # not enabled (installed off)
 grep -c '^Environment=SPECTRE_GOAL_SUPERVISOR=1' ~/.config/systemd/user/goal-supervisor.service
+
+# Claude Code session handoff (RUNBOOK 7.19)
+orca-ide repo list | grep remote-agent                # repo registered, else the tab is unrenderable
+orca-ide worktree current --json | jq -r .result.worktree.id   # run from the worktree dir
+orca-ide worktree ps | grep -A1 remote-agent          # live:1 pty:yes at the registered path
+orca-ide terminal read --terminal <handle> --limit 60 --json   # banner cwd + branch + ◎ /goal active
+jq -r '.projects["/home/person/Projects/remote-agent"].hasTrustDialogAccepted' ~/.claude.json
+#   true, or the resume stalls on the trust dialog (bypassPermissions does not skip it)
+ls ~/.claude/file-history/<uuid>/ | head             # backup blobs travelled with the transcript
 ```
 
 Until those commands have been run on the Spectre, this box is a plan,
