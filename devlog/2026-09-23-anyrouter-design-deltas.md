@@ -437,3 +437,106 @@ Still open after this slice:
   `requires_astra_review` schema field.
 
 Still not deployed.
+
+## Orca terminals bind to a registered worktree — 2026-09-25
+
+This closes the `path:` item left open by the P2 first slice. Every terminal
+the control plane creates now goes through one rule: `orca.create()` for
+`astra.create_terminal()` and `kimi.launch()`, and `createOrcaTerminal()` for
+the bridge's `ensurePacketPin()` and `startPacketJob()`. Each first reads
+`orca-ide worktree ps --json` and needs exactly one unarchived row whose `path`
+is the target cwd. It then runs `orca-ide terminal create --worktree active`
+with that cwd as the process working directory, so the active selector resolves
+to the registered record, and compares the `worktreeId` that comes back with
+the registered one. `--worktree path:<dir>` is gone. It returned a connected,
+writable terminal bound to a worktree record the ADE does not render.
+
+Nothing is created when the listing fails (`orca_ps_failed`), has an unknown
+shape (`orca_ps_invalid`), is truncated without the row (`orca_ps_truncated`),
+or holds zero or several matching rows (`orca_worktree_unregistered`, with the
+row count); a truncated listing is not proof of absence. The bridge reports the
+same cases with the cwd in the message. A terminal that comes back bound
+anywhere else is closed with `terminal close --tab` and reported as
+`orca_terminal_invisible` with both ids and whether the close worked. A create
+that timed out or returned no `term_` handle is not retried: the tab may exist,
+so the error says to inspect `terminal list` first. Astra and Kimi record
+nothing after a failed create, so neither the planner pin nor the pending Kimi
+handoff can point at an invisible tab. `io.run()` gained a `cwd` argument for
+this.
+
+Smoke on Spectre from the staged tree, against the live Orca: `orca.create()`
+on the minecraft worktree with the title `cp-smoke` returned `ok`, a `term_`
+handle, the registered id
+(`bbc15fac-9ef1-426c-a4ba-81a9e6346afd::/home/person/Projects/minecraft-server-project`)
+and `surface: background`. `terminal list` showed the tab bound to that id,
+connected and writable; `tidy.close()` closed it, and the next listing no
+longer had it. `surface` reads `background` for a correctly bound tab, so it
+says nothing about visibility. The ADE client itself was not looked at; the
+evidence is the id match.
+
+The same smoke showed that a title is not an identity. Within 3 s the shell's
+OSC title had replaced `cp-smoke` with
+`person@spectre: ~/Projects/minecraft-server-project`, and agents set their own
+(qodercli shows "◇ Gemini CLI", codex shows its task). Of the 47 terminals
+listed on Spectre, 35 carry the `person@spectre: <cwd>` form and none carries a
+control-plane title. Everything keyed on titles is therefore inert live:
+
+- `tidy.select()` picks `flash <id>`, `mimo <id>`, `flash-packets` and
+  `mimo-packets` tabs by title, so the reaper's tab tidy has selected nothing.
+- `ensurePacketPin()` reuse by title never matches; while no pin is recorded,
+  each dispatch creates another shell.
+- `packetJobTitle()` job tabs cannot be recognized after creation.
+- The reaper's `untitled` rule matches `''`, `bash`, `person@spectre` and
+  `(person@spectre shell, untitled)…`, never `person@spectre: <cwd>`, so it
+  terminates nothing. That is the safe failure and it stays: widening the rule
+  would terminate idle operator shells.
+
+Live state on 2026-09-25: the minecraft worktree holds 24 idle `bash` shells
+started by Orca, with no agent identity and no pin. All are bound to the
+registered id, so the operator sees them. They were started between 2026-09-18
+16:07 and 2026-09-19 00:53 UTC, a median 16 minutes apart, and all last printed
+between 2026-09-20 01:11 and 01:16 UTC. No journal entry records who created
+them. A bridge that creates a packet shell per dispatch and cannot record the
+pin would produce this pattern, and the live registry is `root:root 0644`, not
+writable by the bridge user, holding only the three top-level pins (zzbrush,
+minecraft, korea-metro-twin). That is unverified, so the shells were left
+open: the operator sees them, their origin is unknown, and a close cannot be
+undone.
+
+Local gate (`f155dd9`):
+
+```
+$ env -u PYTHONHOME -u PYTHONPATH bash verify.sh
+ok    slack bridge tests    # 72 pass, 0 fail
+ok    devcodex tests        # 77 pass, 0 fail
+ok    Ran 473 tests
+verify: all gates passed
+```
+
+The local count again includes the 18 tests of `tests/test_relay_probe.py`.
+Staged on Spectre from `git archive f155dd9` into `/tmp/rv-stage-f155dd9`;
+this time the tree and its log were left in `/tmp`:
+
+```
+VERIFY_EXIT=0 rev=f155dd9 host=spectre
+SKIP  shellcheck not installed (apt/dnf install shellcheck)
+ok    slack bridge tests    # 72 pass, 0 fail
+ok    devcodex tests        # 77 pass, 0 fail
+ok    Ran 455 tests
+verify: all gates passed
+```
+
+Python went 446 -> 455 (eight `orca` tests, one Kimi test) and the bridge
+suite 70 -> 72.
+
+Still open after this slice:
+
+- Titles carry no identity, so tab tidy, title reuse and job-tab recognition
+  are inert. Next slice: the creators write an ownership record per handle at
+  creation, and tidy closes only recorded tabs.
+- The 24 idle minecraft shells stay open until the operator decides.
+- A truncated `worktree ps` listing without the row refuses creation; nothing
+  pages through it.
+- The other open items of the P2 first slice stand.
+
+Still not deployed.
