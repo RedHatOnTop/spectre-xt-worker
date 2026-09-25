@@ -91,6 +91,60 @@ class HandoffRuntimeTest(unittest.TestCase):
         self.assertFalse(any('--dispatch' in command for command in self.sent))
         self.assertEqual(self.client.snapshot('minecraft')['goal']['state'], 'COMPLETED')
 
+    def test_kimi_seat_plans_through_its_own_pin_without_codex_gates(self):
+        fixtures.completed(self.store)
+        write_json(seat.seat_path(self.root), {**seat.default_state(), 'owner': 'kimi'})
+        write_json(self.root / 'provider.json', {'ok': False, 'id': 'openai', 'checked_at': 0})
+        write_json(self.path, {'plans': [
+            {'at': fixtures.NOW - 60 * n, 'provider': 'openai', 'critical': False}
+            for n in (1, 2, 3)]})
+        self.entry = {**self.entry, 'planner': {'terminal': 'term_kimi', 'harness': 'kimi'}}
+
+        result = self.tick()
+
+        self.assertEqual(result['actions'][0]['action'], 'plan')
+        state = read_json(self.path)
+        self.assertEqual(state['plans'][-1]['provider'], 'cline-free')
+        self.assertEqual(state['workers']['minecraft']['planning']['timeout'], 300)
+        self.assertEqual(self.client.snapshot('minecraft')['goal']['state'], 'ASSIGNING')
+        self.assertEqual(len([c for c in self.sent if '--dispatch' in c]), 1)
+
+    def test_claude_seat_outlasts_one_anyrouter_edge_window(self):
+        fixtures.completed(self.store)
+        write_json(seat.seat_path(self.root), {**seat.default_state(), 'owner': 'claude'})
+        self.entry = {**self.entry, 'planner': {'terminal': 'term_claude', 'harness': 'claude'}}
+
+        self.assertEqual(self.tick()['actions'][0]['action'], 'plan')
+        state = read_json(self.path)
+        self.assertEqual(state['plans'][-1]['provider'], 'anyrouter')
+        self.assertEqual(state['workers']['minecraft']['planning']['timeout'], 900)
+        self.assertEqual(self.tick(now=fixtures.NOW + 301)['actions'][0]['action'], 'waiting')
+        self.assertEqual(self.client.snapshot('minecraft')['goal']['state'], 'ASSIGNING')
+        timed_out = self.tick(now=fixtures.NOW + 901)['actions'][0]
+        self.assertTrue(timed_out['reason'].startswith('assignment_timeout:'))
+        self.assertEqual(len([c for c in self.sent if '--dispatch' in c]), 1)
+
+    def test_planner_pin_must_match_the_seat_owner(self):
+        fixtures.completed(self.store)
+        cases = (
+            ('claude', {'terminal': 'term_kimi', 'harness': 'kimi'}, 'seat_owned_by_claude'),
+            ('codex', {'terminal': 'term_kimi', 'harness': 'kimi'}, 'planner_harness_mismatch'),
+            ('codex', {'terminal': 'term_x', 'harness': 'gemini'}, 'planner_harness_mismatch'),
+            ('kimi', {'terminal': 'term_astra'}, 'seat_owned_by_kimi'),
+            ('codex', {'terminal': None, 'harness': 'codex'}, 'planner_terminal_missing'),
+            ('kimi', {'terminal': None, 'harness': 'kimi'}, 'planner_terminal_missing'),
+        )
+        for owner, planner, reason in cases:
+            with self.subTest(owner=owner, planner=planner):
+                write_json(seat.seat_path(self.root), {**seat.default_state(), 'owner': owner})
+                self.entry = {**self.entry, 'planner': planner}
+
+                result = self.tick()
+
+                self.assertEqual(result['actions'][0]['reason'], reason)
+                self.assertFalse(any('--dispatch' in command for command in self.sent))
+                self.assertEqual(self.client.snapshot('minecraft')['goal']['state'], 'COMPLETED')
+
 
 class AstraKimiGuardTest(unittest.TestCase):
     def test_committed_kimi_seat_blocks_astra_launcher(self):

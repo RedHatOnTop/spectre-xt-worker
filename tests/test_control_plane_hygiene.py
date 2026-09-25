@@ -130,6 +130,7 @@ class LaunchFlowTest(unittest.TestCase):
             self.assertEqual((root / 'active-provider').read_text(), 'anyrouter\n')
             updated = json.loads((root / 'workers').read_text())['workers']['minecraft']
             self.assertEqual(updated['planner']['terminal'], 'term_astra')
+            self.assertEqual(updated['planner']['harness'], 'codex')
             self.assertEqual(updated['targets']['efficient']['terminal'], 'term_eff')
             self.assertEqual(updated['targets']['flash']['terminal'], 'term_flash')
             self.assertNotIn('model_provider=openai', ' '.join(calls[-1]))
@@ -145,6 +146,24 @@ class LaunchFlowTest(unittest.TestCase):
         self.assertEqual(updated['minecraft']['targets']['efficient']['terminal'], 'new_e')
         self.assertEqual(updated['minecraft']['planner']['terminal'], 'new_a')
         self.assertEqual(workers['minecraft']['terminal'], 'old')
+
+    def test_pin_sync_follows_the_planner_harness(self):
+        terminals = [{'handle': h, 'worktreePath': '/work/mc', 'connected': True, 'writable': True}
+                     for h in ('new_e', 'new_a', 'new_c')]
+        procs = [{'handle': 'new_e', 'cwd': '/work/mc', 'model': 'efficient'},
+                 {'handle': 'new_a', 'cwd': '/work/mc', 'model': 'astra'},
+                 {'handle': 'new_c', 'cwd': '/work/mc', 'model': 'claude'}]
+        workers = {'minecraft': {'cwd': '/work/mc',
+                                 'planner': {'terminal': 'old', 'harness': 'claude'}}}
+        updated, changes = pins.sync(workers, terminals, procs)
+        self.assertEqual(updated['minecraft']['planner'], {'terminal': 'new_c', 'harness': 'claude'})
+        self.assertEqual(changes[-1]['role'], 'claude')
+        unknown = {'minecraft': {'cwd': '/work/mc',
+                                 'planner': {'terminal': 'old', 'harness': 'gemini'}}}
+        updated, changes = pins.sync(unknown, terminals, procs)
+        self.assertEqual(updated['minecraft']['planner']['terminal'], 'old')
+        self.assertFalse(changes[-1]['ok'])
+        self.assertIn('unknown planner harness', changes[-1]['error'])
 
 class FlashPinTest(unittest.TestCase):
     def test_flash_binding_requires_an_idle_shell_in_minecraft(self):

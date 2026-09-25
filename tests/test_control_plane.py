@@ -321,6 +321,19 @@ class InventoryTest(unittest.TestCase):
         self.assertEqual(inventory.model(['mimo', 'run', 'task']), 'mimo')
         self.assertEqual(inventory.model(['mimo-clinepass', '--file', 'x.txt']), 'mimo')
 
+    def test_claude_and_kimi_planners_need_their_model_on_argv(self):
+        wrapped = ['--bg-pty-host', '/tmp/x.sock', '148', '55', '--',
+                   '/usr/bin/claude', '--model', 'claude-opus-5-5']
+        self.assertEqual(inventory.model(
+            ['claude', '--dangerously-skip-permissions', '--model', 'claude-opus-5-5']), 'claude')
+        self.assertEqual(inventory.model(
+            ['node', '/usr/local/bin/claude', '--model=claude-opus-5-5']), 'claude')
+        self.assertEqual(inventory.model(['kimi', '-m', 'cline/kimi-k3']), 'kimi')
+        self.assertIsNone(inventory.model(['claude']))
+        self.assertIsNone(inventory.model(['claude', '--model', 'claude-sonnet-5']))
+        self.assertIsNone(inventory.model(['claude', 'bg-pty-host', *wrapped]))
+        self.assertIsNone(inventory.model(['claude bg-pty-host', *wrapped]))
+
 
 if __name__ == '__main__':
     unittest.main()

@@ -283,6 +283,63 @@ class KimiHandoffTest(unittest.TestCase):
         self.assertEqual(seat.load(seat.seat_path(self.root))['handoff_count'], 2)
         self.assertIsNone(seat.load(seat.seat_path(self.root))['terminal'])
 
+    def test_confirm_and_release_move_the_planner_pin_with_the_seat(self):
+        self.prompted()
+        confirmed = kimi.confirm(self.workers, self.provider, self.loop, self.root,
+                                 self.client, 'term_kimi', observed_ready=True,
+                                 now=fixtures.NOW + 2, env={'SPECTRE_KIMI_ENABLED': '1'},
+                                 run=self.fake_run, scan=lambda: self.processes)
+        self.assertTrue(confirmed['ok'])
+        entry = read_json(self.workers)['workers']['minecraft']
+        self.assertEqual(entry['planner'], {'terminal': 'term_kimi', 'harness': 'kimi',
+                                            'model': 'cline-free/kimi-k3',
+                                            'provider': 'kimi_free'})
+        self.assertEqual((entry['cwd'], entry['class']), (str(self.cwd), 'toplevel'))
+        write_json(self.provider, {'ok': True, 'id': 'anyrouter',
+                                   'checked_at': fixtures.NOW + 3})
+        self.processes = [row for row in self.processes if row['model'] != 'kimi']
+        released = kimi.release(self.workers, self.provider, self.loop, self.root,
+                                observed_stopped=True, now=fixtures.NOW + 3,
+                                scan=lambda: self.processes)
+        self.assertEqual(released['next'], 'launch_astra')
+        self.assertEqual(read_json(self.workers)['workers']['minecraft']['planner'],
+                         {'terminal': None, 'harness': 'codex', 'model': 'gpt-6-astra'})
+
+    def test_registry_failure_after_seat_commit_is_reported(self):
+        self.prompted()
+        with patch('control_plane.kimi.set_planner', side_effect=OSError):
+            result = kimi.confirm(self.workers, self.provider, self.loop, self.root,
+                                  self.client, 'term_kimi', observed_ready=True,
+                                  now=fixtures.NOW + 2, env={'SPECTRE_KIMI_ENABLED': '1'},
+                                  run=self.fake_run, scan=lambda: self.processes)
+        self.assertEqual(result, {'ok': False, 'error': 'registry_update_failed',
+                                  'seat_committed': True, 'terminal': 'term_kimi'})
+        self.assertEqual(seat.load(seat.seat_path(self.root))['owner'], 'kimi')
+        self.assertEqual(read_json(self.workers)['workers']['minecraft']['planner'],
+                         {'terminal': 'term_astra'})
+        write_json(self.provider, {'ok': True, 'id': 'anyrouter',
+                                   'checked_at': fixtures.NOW + 3})
+        with patch('control_plane.kimi.set_planner', side_effect=OSError):
+            released = kimi.release(self.workers, self.provider, self.loop, self.root,
+                                    observed_stopped=True, now=fixtures.NOW + 3,
+                                    scan=lambda: [])
+        self.assertEqual(released, {'ok': False, 'error': 'registry_update_failed',
+                                    'seat_committed': True})
+        self.assertEqual(seat.load(seat.seat_path(self.root))['owner'], 'codex')
+
+    def test_running_claude_planner_blocks_kimi_launch_and_release(self):
+        claude = {'model': 'claude', 'cwd': str(self.cwd), 'handle': 'term_claude'}
+        self.processes = [*self.processes, claude]
+        self.assertEqual(self.launch()['error'], 'top_level_agent_already_running')
+        self.assertFalse(any(command[2] == 'create' for command in self.calls))
+        write_json(seat.seat_path(self.root), {**seat.default_state(), 'owner': 'kimi'})
+        write_json(self.provider, {'ok': True, 'id': 'anyrouter', 'checked_at': fixtures.NOW})
+        result = kimi.release(self.workers, self.provider, self.loop, self.root,
+                              observed_stopped=True, now=fixtures.NOW,
+                              scan=lambda: [claude])
+        self.assertEqual(result['error'], 'top_level_agent_still_running')
+        self.assertEqual(seat.load(seat.seat_path(self.root))['owner'], 'kimi')
+
     def test_release_refuses_stale_provider_and_wrong_owner(self):
         with self.assertRaisesRegex(ValueError, 'fresh Astra provider'):
             kimi.release(self.workers, self.provider, self.loop, self.root,

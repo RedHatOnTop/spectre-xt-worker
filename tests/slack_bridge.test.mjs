@@ -24,6 +24,9 @@ import {
   debateMerged,
   debateMergeRecord,
   astraPidVerdict,
+  listPlannerCmdlines,
+  plannerPidVerdict,
+  plannerRole,
   dispatchAction,
   dispatchAllowed,
   dispatchLine,
@@ -60,6 +63,7 @@ import {
   speakerReady,
   validateConfig,
 } from "../scripts/slack-bridge.mjs";
+import { nativeProcessGuard, processRole } from "../scripts/dispatch-process.mjs";
 
 const NOW = 1_800_000_000; // 2027-01-15T08:00:00Z
 
@@ -1168,6 +1172,69 @@ test("astraPidVerdict: plus-burn and busy", () => {
   assert.equal(astraPidVerdict(["codex -m gpt-6-astra"]).ok, true);
 });
 
+test("plannerRole: the pinned harness names the planner process", () => {
+  assert.equal(plannerRole({}), "astra");
+  assert.equal(plannerRole({ planner: { terminal: "term_a" } }), "astra");
+  assert.equal(plannerRole({ planner: { harness: "codex" } }), "astra");
+  assert.equal(plannerRole({ planner: { harness: "claude" } }), "claude");
+  assert.equal(plannerRole({ planner: { harness: "kimi" } }), "kimi");
+  assert.equal(plannerRole({ planner: { harness: "gemini" } }), null);
+});
+
+test("plannerPidVerdict: only the astra role knows plus-burn", () => {
+  assert.equal(plannerPidVerdict(["/usr/bin/claude --model claude-opus-5-5"], "claude").ok, true);
+  assert.deepEqual(plannerPidVerdict([], "claude"), { ok: false, evt: "dispatch_claude_busy", count: 0 });
+  assert.deepEqual(
+    plannerPidVerdict(["codex -m gpt-6-astra -c model_provider=openai"], "kimi"),
+    { ok: false, evt: "dispatch_kimi_busy", count: 0 },
+  );
+  assert.equal(plannerPidVerdict(["kimi -m cline/kimi-k3"], "kimi").ok, true);
+});
+
+test("processRole: planners need their model on argv and wrappers do not count", () => {
+  assert.equal(processRole(["claude", "--dangerously-skip-permissions", "--model", "claude-opus-5-5"]), "claude");
+  assert.equal(processRole(["node", "/usr/local/bin/claude", "--model=claude-opus-5-5"]), "claude");
+  assert.equal(processRole(["/home/u/.kimi-code/bin/kimi", "-m", "cline/kimi-k3"]), "kimi");
+  assert.equal(processRole(["claude"]), null);
+  assert.equal(processRole(["claude", "--model", "claude-sonnet-5"]), null);
+  const child = ["--", "/usr/bin/claude", "--model", "claude-opus-5-5"];
+  assert.equal(processRole(["claude bg-pty-host", "--bg-pty-host", "/tmp/x.sock", ...child]), null);
+  assert.equal(processRole(["claude", "bg-pty-host", "--bg-pty-host", "/tmp/x.sock", ...child]), null);
+});
+
+test("nativeProcessGuard: a claude or kimi planner in the pin blocks other targets", () => {
+  const kimi = [{ handle: "term_k", cwd: "/w", role: "kimi" }];
+  assert.equal(nativeProcessGuard("term_k", "/w", "kimi", kimi), true);
+  assert.equal(nativeProcessGuard("term_k", "/w", "efficient", kimi), false);
+  const shared = [
+    { handle: "term_c", cwd: "/w", role: "efficient" },
+    { handle: "term_c", cwd: "/w", role: "claude" },
+  ];
+  assert.equal(nativeProcessGuard("term_c", "/w", "efficient", shared), false);
+  assert.equal(nativeProcessGuard("term_c", "/w", "flash", [
+    { handle: "term_c", cwd: "/w", role: "shell" },
+    { handle: "term_c", cwd: "/w", role: "kimi" },
+  ]), false);
+});
+
+test("listPlannerCmdlines: a bg-pty-host wrapper is not a second claude planner", () => {
+  const dir = mkdtempSync(join(tmpdir(), "spectre-planner-proc-"));
+  try {
+    const proc = join(dir, "proc");
+    const child = ["/usr/bin/claude", "--model", "claude-opus-5-5"];
+    fakeProcess(proc, 901, ["claude bg-pty-host", "--bg-pty-host", "/tmp/x.sock", "148", "55", "--", ...child],
+      "term_c", dir);
+    fakeProcess(proc, 902, child, "term_c", dir);
+    writeFileSync(join(proc, "902", "stat"), "902 (claude) S 901 0 0 0");
+    const lines = listPlannerCmdlines("claude", {}, proc);
+    assert.deepEqual(lines, [child.join(" ")]);
+    assert.equal(plannerPidVerdict(lines, "claude").ok, true);
+    assert.deepEqual(listPlannerCmdlines("kimi", {}, proc), []);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("paneRefusal: flash wrapper prefix may run in a shell", () => {
   const line = flashSendLine("x");
   assert.equal(
@@ -1413,6 +1480,33 @@ test("dispatch CLI: plan plus-burn refuses without terminal create", () => {
     assert.equal(verdict.evt, "dispatch_astra_plus_burn");
     assert.match(verdict.detail, /not creating a terminal/);
     assert.equal(src.includes("orca-ide terminal create"), false);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("dispatch CLI: plan counts the pinned harness, not astra", () => {
+  const dir = mkdtempSync(join(tmpdir(), "spectre-plan-"));
+  try {
+    const workers = join(dir, "workers.json");
+    const plan = (planner) => {
+      writeFileSync(
+        workers,
+        JSON.stringify({ workers: { minecraft: { cwd: dir, tmux: null, terminal: "term_a", planner } } }),
+      );
+      return runBridge(
+        ["--dispatch", "plan", "minecraft", "next packet", "--dry-run", "--workers-file", workers],
+        { SPECTRE_ASTRA_CMDLINES: "codex -m gpt-6-astra" },
+      );
+    };
+    const kimi = plan({ terminal: "term_k", harness: "kimi" });
+    assert.equal(kimi.code, 1, kimi.stdout);
+    const busy = JSON.parse(kimi.stdout.trim());
+    assert.equal(busy.evt, "dispatch_kimi_busy");
+    assert.match(busy.detail, /not creating a terminal/);
+    const unknown = plan({ terminal: "term_x", harness: "gemini" });
+    assert.equal(unknown.code, 1, unknown.stdout);
+    assert.equal(JSON.parse(unknown.stdout.trim()).evt, "dispatch_planner_unknown");
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

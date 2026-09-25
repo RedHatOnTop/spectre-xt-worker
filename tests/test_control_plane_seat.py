@@ -128,6 +128,35 @@ class SeatLadderTest(unittest.TestCase):
         for owner in seat.OWNERS:
             self.assertTrue(seat.seats_for_owner(owner), owner)
 
+    def test_every_owner_has_a_planner_role(self):
+        self.assertEqual(set(seat.PLANNER_ROLES), set(seat.OWNERS))
+        self.assertEqual([seat.planner_role(o) for o in ('codex', 'claude', 'kimi', 'gemini')],
+                         ['astra', 'claude', 'kimi', None])
+
+    def test_transition_takes_the_model_from_the_owners_best_seat(self):
+        now = 1_800_000_000.0
+        state = seat.default_state()
+        claude = seat.transition(state, now, to='claude', brief='brief.md')
+        self.assertTrue(claude['ok'])
+        self.assertEqual((claude['seat']['model'], claude['seat']['provider_chain']),
+                         ('claude-opus-5-5', ['anyrouter']))
+        kimi = seat.transition(state, now, to='kimi', brief='brief.md')
+        self.assertEqual((kimi['seat']['model'], kimi['seat']['provider_chain']),
+                         ('cline-free/kimi-k3', ['cline-free']))
+        back = seat.transition(claude['seat'], now + 1, to='codex', brief='brief.md')
+        self.assertEqual((back['seat']['model'], back['seat']['provider_chain']),
+                         ('gpt-6-astra', ['agentrouter', 'anyrouter']))
+        self.assertEqual(seat.transition(state, now, to='gemini', brief='brief.md'),
+                         {'ok': False, 'error': 'unknown_owner'})
+        with tempfile.TemporaryDirectory() as tmp:
+            path = seat.seat_path(Path(tmp))
+            path.parent.mkdir(parents=True)
+            write_json(path, claude['seat'])
+            self.assertEqual(seat.load(path)['owner'], 'claude')
+            write_json(path, {**claude['seat'], 'owner': 'gemini'})
+            with self.assertRaises(ValueError):
+                seat.load(path)
+
 
 class QuotaTest(unittest.TestCase):
     def test_free_first_only_for_safe_kinds(self):
