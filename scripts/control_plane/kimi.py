@@ -13,7 +13,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-from . import cline_free, inventory, pins, planning, providers, runtime, seat
+from . import cline_free, inventory, orca, pins, planning, providers, runtime, seat
 from .io import locked, read_json, run as run_command, write_json
 
 MODEL_ALIAS = 'cline/kimi-k3'
@@ -180,16 +180,12 @@ def launch(workers_file: Path, provider_state: Path, loop_state: Path, seat_root
                 write_json(provider_state, {**read_json(provider_state), 'ok': False,
                                             'reason': 'kimi_free_exhausted'})
             return checked
-        created = run(['orca-ide', 'terminal', 'create', '--worktree',
-                       f"path:{info['entry']['cwd']}", '--title', 'kimi-standby',
-                       '--command', f'exec {shlex.quote(str(kimi_bin))} -m {MODEL_ALIAS}',
-                       '--json'], timeout=15)
-        if not created.get('ok'):
-            return {'ok': False, 'error': ('orca_create_uncertain; inspect terminal list before retry'
-                                           if created.get('uncertain') else 'orca_create_failed')}
-        result = created.get('parsed', {}).get('result', {})
-        handle = (result.get('terminal') or result).get('handle')
-        if not isinstance(handle, str) or not HANDLE_PATTERN.fullmatch(handle):
+        created = orca.create(info['entry']['cwd'], 'kimi-standby',
+                              f'exec {shlex.quote(str(kimi_bin))} -m {MODEL_ALIAS}', run)
+        if not created['ok']:
+            return created
+        handle = created['handle']
+        if not HANDLE_PATTERN.fullmatch(handle):
             return {'ok': False, 'error': 'orca_handle_missing; inspect terminal list before retry'}
         ws = info['state']['workers']['minecraft']
         pending = {**info['pending'], 'terminal': handle, 'launched_at': now}

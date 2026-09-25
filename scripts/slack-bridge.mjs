@@ -657,10 +657,34 @@ export function packetJobTitle(role, dispatchId) {
   return `${String(role || "packet")} ${id}`;
 }
 
+async function orcaWorktreeId(cwd) {
+  const listed = await runCommandCapture(ORCA_BIN, ["worktree", "ps", "--json"], 20_000);
+  if (!listed.ok) return { ok: false, error: `orca_ps_failed: ${listed.error}` };
+  let payload = null;
+  try {
+    payload = JSON.parse(listed.stdout.trim());
+  } catch {
+    return { ok: false, error: "bad orca worktree ps output" };
+  }
+  const body = (payload && payload.result) || {};
+  if (!Array.isArray(body.worktrees)) return { ok: false, error: "unexpected orca worktree ps shape" };
+  const ids = body.worktrees
+    .filter((row) => row && row.path === cwd && !row.isArchived)
+    .map((row) => row.worktreeId);
+  if (ids.length === 1 && typeof ids[0] === "string" && ids[0]) return { ok: true, worktreeId: ids[0] };
+  if (!ids.length && body.truncated) return { ok: false, error: `orca_ps_truncated: ${cwd}` };
+  return { ok: false, error: `orca_worktree_unregistered: ${cwd} (${ids.length} rows)` };
+}
+
+// Only a registered worktree renders, and only the active selector run from
+// inside it binds to that registration; `path:<dir>` synthesizes an id the UI
+// never shows.
 async function createOrcaTerminal({ cwd, title, command, focus = true }) {
-  const args = ["terminal", "create", "--worktree", `path:${cwd}`, "--title", String(title || ""), "--command", String(command || ""), "--json"];
+  const registered = await orcaWorktreeId(cwd);
+  if (!registered.ok) return registered;
+  const args = ["terminal", "create", "--worktree", "active", "--title", String(title || ""), "--command", String(command || ""), "--json"];
   if (focus) args.splice(args.length - 1, 0, "--focus");
-  const result = await runCommandCapture(ORCA_BIN, args, 20_000);
+  const result = await runCommandCapture(ORCA_BIN, args, 20_000, { cwd });
   if (!result.ok) return { ok: false, error: result.error || "orca create failed" };
   let payload = null;
   try {
@@ -669,9 +693,17 @@ async function createOrcaTerminal({ cwd, title, command, focus = true }) {
     return { ok: false, error: "bad orca create response" };
   }
   const resultBody = (payload && payload.result) || {};
-  const handle = (resultBody.terminal || resultBody).handle;
+  const terminal = resultBody.terminal || resultBody;
+  const handle = terminal.handle;
   if (typeof handle !== "string" || !handle.startsWith("term_")) {
     return { ok: false, error: "orca_handle_missing; inspect terminal list before retry" };
+  }
+  if (terminal.worktreeId !== registered.worktreeId) {
+    const closed = await runCommandCapture(ORCA_BIN, ["terminal", "close", "--terminal", handle, "--tab", "--json"], 15_000);
+    return {
+      ok: false,
+      error: `orca_terminal_invisible: ${handle} bound to ${terminal.worktreeId}, expected ${registered.worktreeId}; closed=${closed.ok}`,
+    };
   }
   return { ok: true, handle, payload };
 }
@@ -1670,9 +1702,9 @@ async function runJob(job) {
   audit({ evt: "job_done", kind: job.kind, speaker: job.speaker, chars: result.text.length });
 }
 
-function runCommandCapture(command, args, timeoutMs) {
+function runCommandCapture(command, args, timeoutMs, { cwd } = {}) {
   return new Promise((resolve) => {
-    execFile(command, args, { timeout: timeoutMs, maxBuffer: 1_000_000 }, (err, stdout) => {
+    execFile(command, args, { timeout: timeoutMs, maxBuffer: 1_000_000, cwd }, (err, stdout) => {
       resolve({ ok: !err, stdout: String(stdout || ""), error: err ? String(err.message) : "" });
     });
   });

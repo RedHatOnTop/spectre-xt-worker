@@ -2,7 +2,7 @@
 // Unit tests for the Slack Socket Mode bridge policy and guards.
 import assert from "node:assert/strict";
 import { execFileSync, spawn, spawnSync } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { createServer } from "node:http";
 import { dirname, join } from "node:path";
@@ -994,41 +994,94 @@ test("packetSurface: pin by default, job opt-in", () => {
   assert.equal(entry.targets.mimo.wrapper, "/usr/local/bin/mimo-clinepass");
 });
 
-test("ensurePacketPin: reuses a live pin and creates flash-packets when missing", async () => {
-  const dir = mkdtempSync(join(tmpdir(), "spectre-pin-ensure-"));
+function fakeCreatingOrca(dir, { registered = dir, boundTo = `wt-1::${dir}` } = {}) {
   const bin = join(dir, "bin");
   mkdirSync(bin);
   const log = join(dir, "orca.log");
+  const createdIn = join(dir, "create.cwd");
   const created = join(dir, "created");
+  const rows = [{ worktreeId: `wt-1::${registered}`, path: registered, isArchived: false }];
   const script = [
     "#!/bin/sh",
     'printf "%s\\n" "$*" >> ' + JSON.stringify(log),
-    'if [ "$1" = "terminal" ] && [ "$2" = "list" ]; then',
+    'if [ "$1" = "worktree" ] && [ "$2" = "ps" ]; then',
+    "  printf '%s' " + JSON.stringify(JSON.stringify({ ok: true, result: { worktrees: rows, truncated: false } })),
+    'elif [ "$1" = "terminal" ] && [ "$2" = "list" ]; then',
     '  if [ -f ' + JSON.stringify(created) + ' ]; then',
     "    printf '%s' " + JSON.stringify(JSON.stringify({ ok: true, result: { terminals: [{ handle: "term_new", worktreePath: dir, connected: true, writable: true, title: "flash-packets" }] } })),
     "  else",
     "    printf '%s' " + JSON.stringify(JSON.stringify({ ok: true, result: { terminals: [] } })),
     "  fi",
     'elif [ "$1" = "terminal" ] && [ "$2" = "create" ]; then',
+    '  pwd > ' + JSON.stringify(createdIn),
     '  touch ' + JSON.stringify(created),
-    "  printf '%s' " + JSON.stringify(JSON.stringify({ ok: true, result: { terminal: { handle: "term_new" } } })),
+    "  printf '%s' " + JSON.stringify(JSON.stringify({ ok: true, result: { terminal: { handle: "term_new", worktreeId: boundTo } } })),
     "else",
     "  printf '%s' '{\"ok\":true}'",
     "fi",
   ].join("\n");
   writeFileSync(join(bin, "orca-ide"), script, { mode: 0o755 });
+  return { bin, log, createdIn };
+}
+
+async function withOrcaOnPath(bin, fn) {
   const prev = process.env.PATH;
   process.env.PATH = `${bin}:${prev}`;
   try {
-    const first = await ensurePacketPin({}, "flash", dir);
-    assert.equal(first.ok, true, JSON.stringify(first));
-    assert.equal(first.created, true);
-    assert.equal(first.handle, "term_new");
-    const second = await ensurePacketPin({ targets: { flash: { terminal: "term_new" } } }, "flash", dir);
-    assert.equal(second.ok, true, JSON.stringify(second));
-    assert.equal(second.created, false);
+    return await fn();
   } finally {
     process.env.PATH = prev;
+  }
+}
+
+test("ensurePacketPin: reuses a live pin and creates flash-packets when missing", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "spectre-pin-ensure-"));
+  try {
+    const orca = fakeCreatingOrca(dir);
+    await withOrcaOnPath(orca.bin, async () => {
+      const first = await ensurePacketPin({}, "flash", dir);
+      assert.equal(first.ok, true, JSON.stringify(first));
+      assert.equal(first.created, true);
+      assert.equal(first.handle, "term_new");
+      const second = await ensurePacketPin({ targets: { flash: { terminal: "term_new" } } }, "flash", dir);
+      assert.equal(second.ok, true, JSON.stringify(second));
+      assert.equal(second.created, false);
+    });
+    const calls = readFileSync(orca.log, "utf8").trim().split("\n");
+    const create = calls.findIndex((line) => line.startsWith("terminal create "));
+    assert.ok(create > calls.indexOf("worktree ps --json"), calls.join("\n"));
+    assert.match(calls[create], /^terminal create --worktree active --title flash-packets /);
+    assert.equal(calls.some((line) => line.includes("path:")), false);
+    assert.equal(readFileSync(orca.createdIn, "utf8").trim(), realpathSync(dir));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("ensurePacketPin: an unregistered worktree gets no terminal", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "spectre-pin-unregistered-"));
+  try {
+    const orca = fakeCreatingOrca(dir, { registered: join(dir, "elsewhere") });
+    const out = await withOrcaOnPath(orca.bin, () => ensurePacketPin({}, "flash", dir));
+    assert.equal(out.ok, false);
+    assert.equal(out.evt, "dispatch_orca_failed");
+    assert.match(out.detail, /^orca_worktree_unregistered: /);
+    assert.equal(readFileSync(orca.log, "utf8").includes("terminal create"), false);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("ensurePacketPin: a tab bound to another worktree is closed, not pinned", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "spectre-pin-ghost-"));
+  try {
+    const orca = fakeCreatingOrca(dir, { boundTo: `repo-9::${dir}` });
+    const out = await withOrcaOnPath(orca.bin, () => ensurePacketPin({}, "flash", dir));
+    assert.equal(out.ok, false);
+    assert.match(out.detail, /^orca_terminal_invisible: term_new bound to repo-9::/);
+    assert.match(out.detail, /closed=true$/);
+    assert.match(readFileSync(orca.log, "utf8"), /^terminal close --terminal term_new --tab --json$/m);
+  } finally {
     rmSync(dir, { recursive: true, force: true });
   }
 });

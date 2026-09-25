@@ -55,15 +55,20 @@ class KimiHandoffTest(unittest.TestCase):
         write_json(self.loop, {'workers': {'minecraft': {'handoff': {
             'to': 'kimi', 'origin': self.origin, 'brief': str(brief)}}}})
         self.calls = []
+        self.bound_to = None
+        self.create_cwd = None
         self.processes = [{'model': 'efficient', 'cwd': str(self.cwd),
                            'handle': 'term_efficient'}]
 
     def tearDown(self):
         self.temp.cleanup()
 
-    def fake_run(self, command, **_kwargs):
+    def fake_run(self, command, **kwargs):
         self.calls.append(command)
         action = command[2]
+        if action == 'ps':
+            return {'ok': True, 'parsed': {'result': {'worktrees': [
+                {'worktreeId': f'wt::{self.cwd}', 'path': str(self.cwd)}]}}}
         if action == 'list':
             terminals = [{'handle': 'term_efficient', 'worktreePath': str(self.cwd),
                           'connected': True, 'writable': True},
@@ -71,8 +76,10 @@ class KimiHandoffTest(unittest.TestCase):
                           'connected': True, 'writable': True}]
             return {'ok': True, 'parsed': {'result': {'terminals': terminals}}}
         if action == 'create':
-            return {'ok': True, 'parsed': {'result': {'terminal': {'handle': 'term_kimi'}}}}
-        if action == 'send':
+            self.create_cwd = kwargs.get('cwd')
+            return {'ok': True, 'parsed': {'result': {'terminal': {
+                'handle': 'term_kimi', 'worktreeId': self.bound_to or f'wt::{self.cwd}'}}}}
+        if action in {'send', 'close'}:
             return {'ok': True, 'parsed': {'ok': True}}
         raise AssertionError(command)
 
@@ -96,6 +103,9 @@ class KimiHandoffTest(unittest.TestCase):
     def test_launch_prompt_confirm_commits_only_after_observation(self):
         launched = self.launch()
         self.assertEqual(launched['next'], 'send_prompt')
+        create = next(command for command in self.calls if command[2] == 'create')
+        self.assertEqual(create[3:5], ['--worktree', 'active'])
+        self.assertEqual(self.create_cwd, str(self.cwd))
         self.assertEqual(seat.load(seat.seat_path(self.root))['owner'], 'codex')
         self.assertEqual(read_json(self.loop)['workers']['minecraft']['handoff']['terminal'], 'term_kimi')
         self.processes = [*self.processes, {'model': 'kimi', 'cwd': str(self.cwd),
@@ -199,6 +209,15 @@ class KimiHandoffTest(unittest.TestCase):
                              scan=lambda: self.processes,
                              probe_fn=lambda *_: {'ok': True})
         self.assertIn('inspect terminal list', result['error'])
+        self.assertNotIn('terminal', read_json(self.loop)['workers']['minecraft']['handoff'])
+
+    def test_terminal_bound_elsewhere_is_closed_and_not_recorded(self):
+        self.bound_to = 'repo-9::/elsewhere'
+        result = self.launch()
+        self.assertEqual(result['error'], 'orca_terminal_invisible')
+        self.assertTrue(result['closed'])
+        self.assertIn(['orca-ide', 'terminal', 'close', '--terminal', 'term_kimi', '--tab',
+                       '--json'], self.calls)
         self.assertNotIn('terminal', read_json(self.loop)['workers']['minecraft']['handoff'])
 
     def test_prompt_timeout_is_not_retried(self):

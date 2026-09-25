@@ -115,25 +115,34 @@ class LaunchFlowTest(unittest.TestCase):
             write_json(root / 'provider.json', {'ok': True, 'id': 'anyrouter', 'checked_at': 100})
             calls = []
             def run(argv, **kwargs):
-                calls.append(argv)
+                calls.append((argv, kwargs.get('cwd')))
                 if argv[1:3] == ['terminal', 'list']:
                     return {'ok': True, 'parsed': {'result': {'terminals': [{'handle': 'term_eff',
                         'worktreePath': '/work/mc', 'connected': True, 'writable': True}]}}}
+                if argv[1:3] == ['worktree', 'ps']:
+                    return {'ok': True, 'parsed': {'result': {'worktrees': [
+                        {'worktreeId': 'wt-mc::/work/mc', 'path': '/work/mc'}]}}}
                 if argv[1:3] == ['terminal', 'create']:
-                    return {'ok': True, 'parsed': {'result': {'terminal': {'handle': 'term_astra'}}}}
+                    return {'ok': True, 'parsed': {'result': {'terminal': {
+                        'handle': 'term_astra', 'worktreeId': 'wt-mc::/work/mc'}}}}
                 return {'ok': True}
             processes = [{'pid': 7, 'model': 'efficient', 'handle': 'term_eff', 'cwd': '/work/mc'}]
             with patch('control_plane.astra.inventory.scan', return_value=processes):
                 output = astra.launch(root / 'workers', root, root / 'provider.json', run=run, now=100)
             self.assertTrue(output['ok'])
-            self.assertEqual(calls[0], ['codex-mode', 'api', 'anyrouter', 'gpt-6-astra'])
+            self.assertEqual(output['worktree_id'], 'wt-mc::/work/mc')
+            self.assertEqual(calls[0][0], ['codex-mode', 'api', 'anyrouter', 'gpt-6-astra'])
+            create, cwd = calls[-1]
+            self.assertEqual(create[:6], ['orca-ide', 'terminal', 'create', '--worktree', 'active',
+                                          '--title'])
+            self.assertEqual(cwd, '/work/mc')
             self.assertEqual((root / 'active-provider').read_text(), 'anyrouter\n')
             updated = json.loads((root / 'workers').read_text())['workers']['minecraft']
             self.assertEqual(updated['planner']['terminal'], 'term_astra')
             self.assertEqual(updated['planner']['harness'], 'codex')
             self.assertEqual(updated['targets']['efficient']['terminal'], 'term_eff')
             self.assertEqual(updated['targets']['flash']['terminal'], 'term_flash')
-            self.assertNotIn('model_provider=openai', ' '.join(calls[-1]))
+            self.assertNotIn('model_provider=openai', ' '.join(create))
 
     def test_pin_sync_updates_all_efficient_aliases_and_planner(self):
         workers = {'minecraft': {'cwd': '/work/mc', 'terminal': 'old', 'planner': {'terminal': 'old_a'},

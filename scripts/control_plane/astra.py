@@ -6,7 +6,7 @@ from pathlib import Path
 import shlex
 import time
 
-from . import cline_free, inventory, pins, providers, runtime, seat
+from . import cline_free, inventory, orca, pins, providers, runtime, seat
 from .io import locked, read_json, run as run_command, write_json, write_text
 
 
@@ -63,14 +63,10 @@ def create_terminal(workers_file, entry, processes, ident, modes, run):
     if not efficient['ok']:
         return {'ok': False, 'error': 'efficient_pin_required_before_second_terminal'}
     command = f'. {shlex.quote(str(modes / "env.sh"))} && CODEX_HOME={shlex.quote(str(modes.parent))} exec codex -m gpt-6-astra'
-    created = run(['orca-ide', 'terminal', 'create', '--worktree', f"path:{entry['cwd']}",
-                   '--title', 'astra-planner', '--command', command, '--json'], timeout=15)
+    created = orca.create(entry['cwd'], 'astra-planner', command, run)
     if not created['ok']:
-        return {'ok': False, 'error': 'orca_create_failed'}
-    result = created['parsed'].get('result', {})
-    handle = (result.get('terminal') or result).get('handle')
-    if not isinstance(handle, str) or not handle.startswith('term_'):
-        return {'ok': False, 'error': 'orca_handle_missing; inspect terminal list before retry'}
+        return created
+    handle = created['handle']
     with locked(workers_file.with_suffix('.lock')):
         registry = read_json(workers_file)
         current = registry['workers']['minecraft']
@@ -80,4 +76,5 @@ def create_terminal(workers_file, entry, processes, ident, modes, run):
                    'planner': {'terminal': handle, 'harness': seat.OWNER_ASTRA,
                                'model': 'gpt-6-astra', 'provider': ident}}
         write_json(workers_file, {**registry, 'workers': {**registry['workers'], 'minecraft': updated}})
-    return {'ok': True, 'terminal': handle, 'provider': ident, 'worktree': entry['cwd']}
+    return {'ok': True, 'terminal': handle, 'provider': ident, 'worktree': entry['cwd'],
+            'worktree_id': created['worktree_id']}

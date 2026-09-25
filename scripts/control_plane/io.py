@@ -54,9 +54,10 @@ def locked(path: Path):
         os.close(fd)
 
 
-def run(argv: list[str], *, environ: dict | None = None, timeout: float = 8) -> dict:
+def run(argv: list[str], *, environ: dict | None = None, timeout: float = 8,
+        cwd: str | None = None) -> dict:
     try:
-        proc = subprocess.run(argv, capture_output=True, text=True, check=False,
+        proc = subprocess.run(argv, capture_output=True, text=True, check=False, cwd=cwd,
                               timeout=timeout, env={**os.environ, **(environ or {})})
     except subprocess.TimeoutExpired:
         return {'ok': False, 'uncertain': True, 'error': f'{Path(argv[0]).name}: timeout'}
