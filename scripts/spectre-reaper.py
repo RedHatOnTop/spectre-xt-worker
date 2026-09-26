@@ -12,6 +12,7 @@ import shlex
 import subprocess
 import sys
 import time
+import traceback
 
 for parent in (Path(__file__).resolve().parent, Path(__file__).resolve().parent.parent / 'lib/spectre-worker-state',
                Path('/usr/local/lib/spectre-worker-state')):
@@ -193,20 +194,19 @@ def summary(row):
 
 
 def reap_processes(args, workers, terminals, listen_text, owned):
-    with locked(args.state.with_suffix('.lock')):
-        rows, state = observe(workers, inventory.scan(), inventory.listeners(listen_text),
-                              read_json(args.state), StateClient(timeout=2), time.time(), terminals,
-                              owned=owned)
-        actions = []
-        for row in rows:
-            if args.apply and row['action'] == 'term':
-                try:
-                    terminate(row)
-                except (OSError, ValueError) as exc:
-                    actions = [*actions, {**summary(row), 'error': str(exc)}]
-                    continue
-            actions = [*actions, summary(row)]
-        write_json(args.state, state)
+    rows, state = observe(workers, inventory.scan(), inventory.listeners(listen_text),
+                          read_json(args.state), StateClient(timeout=2), time.time(), terminals,
+                          owned=owned)
+    actions = []
+    for row in rows:
+        if args.apply and row['action'] == 'term':
+            try:
+                terminate(row)
+            except (OSError, ValueError) as exc:
+                actions = [*actions, {**summary(row), 'error': str(exc)}]
+                continue
+        actions = [*actions, summary(row)]
+    write_json(args.state, state)
     return actions
 
 
@@ -215,25 +215,28 @@ def live(args):
     runtime.validate_workers(workers)
     if not workers:
         raise ValueError('worker registry missing or empty')
-    proc = subprocess.run(['ss', '-ltnpeH'], capture_output=True, text=True, timeout=5, check=True)
-    # An unattributed listener of this uid means /proc hides some of its processes,
-    # so their ports are unknown. Another uid's never belongs to a process scan()
-    # returns: ss reads the same fd tables and would name it.
-    unowned = inventory.unattributed(proc.stdout, os.getuid())
-    listed = run(['orca-ide', 'terminal', 'list', '--json'], timeout=8)
-    if not listed['ok']:
-        raise ValueError(f"Orca inventory unavailable ({listed.get('error') or 'no detail'}); refusing reap")
-    listing = listed['parsed'].get('result', {})
-    terminals = listing.get('terminals', [])
     packet_dir = Path(os.environ.get('SPECTRE_PACKET_DIR',
                                      str(Path.home() / '.local/state/remote-agent/packets')))
     pinned = set()
     for entry in workers.values():
         pinned |= pin_set(workers, entry.get('cwd') or '')
-    owned = frozenset(tidy.records(packet_dir))
-    actions = [] if unowned else reap_processes(args, workers, terminals, proc.stdout, owned)
-    tab_actions, records = tidy.sweep(terminals, pinned, packet_dir, time.time(), apply=args.apply,
-                                      truncated=bool(listing.get('truncated')))
+    # Inventory is read under the lock too: a run that waited for another must not
+    # act on a listing or records taken before that run closed and retired tabs.
+    with locked(args.state.with_suffix('.lock')):
+        proc = subprocess.run(['ss', '-ltnpeH'], capture_output=True, text=True, timeout=5, check=True)
+        # An unattributed listener of this uid means /proc hides some of its processes,
+        # so their ports are unknown. Another uid's never belongs to a process scan()
+        # returns: ss reads the same fd tables and would name it.
+        unowned = inventory.unattributed(proc.stdout, os.getuid())
+        listed = run(['orca-ide', 'terminal', 'list', '--json'], timeout=8)
+        if not listed['ok']:
+            raise ValueError(f"Orca inventory unavailable ({listed.get('error') or 'no detail'}); refusing reap")
+        listing = listed['parsed'].get('result', {})
+        terminals = listing.get('terminals', [])
+        owned = frozenset(tidy.records(packet_dir))
+        actions = [] if unowned else reap_processes(args, workers, terminals, proc.stdout, owned)
+        tab_actions, records = tidy.sweep(terminals, pinned, packet_dir, time.time(), apply=args.apply,
+                                          truncated=bool(listing.get('truncated')))
     killed = [row for row in actions if args.apply and row['action'] == 'term' and 'error' not in row]
     notice = runtime.notify(run, dict(os.environ), 'reaper', json.dumps(killed), channel='fleet') if killed else {'ok': True}
     refusal = ({'error': f'listener ownership incomplete: {", ".join(unowned)}; refusing process reap'}
@@ -264,6 +267,10 @@ def main(argv=None):
             output = live(args)
     except (OSError, ValueError, subprocess.SubprocessError) as exc:
         output = {'ok': False, 'error': str(exc)}
+    except Exception as exc:
+        # A timer run must still leave one JSON verdict on stdout; the journal keeps the trace.
+        traceback.print_exc()
+        output = {'ok': False, 'error': f'{type(exc).__name__}: {exc}'}
     print(json.dumps(output, sort_keys=True))
     return 0 if output['ok'] else 1
 

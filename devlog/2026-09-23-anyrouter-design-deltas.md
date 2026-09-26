@@ -781,3 +781,73 @@ Still open:
 - Astra and Kimi do not write tab records yet. `terminal list` truncation,
   exceptions that escape `main()`, and the tab sweep running outside the lock
   are also still open.
+
+## The reaper holds its lock for the whole run — 2026-09-26
+
+This slice closes two of the reaper items above. The third turned out to be
+closed already.
+
+**The tab sweep runs under the lock.** `reap_processes()` held `reaper.lock`
+only around `observe()` and the kills. `tidy.sweep()` ran after the lock was
+released, and on the listener-refusal path it ran with no lock at all. Now
+`live()` takes the lock before it reads `ss`, the Orca listing and the tab
+records, and releases it after the sweep. A run that waited for another run
+therefore cannot close or retire tabs from a listing taken before the other run
+acted. When another run holds the lock, the reaper exits 1 before it reads any
+inventory. The error is `[Errno 11] Resource temporarily unavailable`, which
+does not name the lock. `io.locked()` has eight other callers, so the message
+is left as it is.
+
+**`main()` always prints a verdict.** An exception outside `OSError`,
+`ValueError` and `SubprocessError` used to escape as a bare traceback, with
+nothing on stdout. Now it is reported as `{"ok": false, "error": "<Type>:
+<message>"}` with exit 1. The traceback still goes to stderr, where the journal
+keeps it. The test case is a malformed Orca listing whose `result` is a list:
+`AttributeError: 'list' object has no attribute 'get'`.
+
+**`terminal list` truncation was already fail-safe.** `sweep()` skips
+`stale()` when the listing is truncated, and `select()` closes only tabs it
+sees. On the process side, a tab missing from the listing cannot make its shell
+`untitled`, and `duplicate` does not read the listing. A truncated listing can
+only turn a `term` into a `keep`.
+
+### Verification
+
+Dry-runs of the working-tree script on Spectre from an ssh shell, without
+`--apply`, with a scratch `--state`:
+
+| Run | Result |
+| --- | --- |
+| lock free | `ok: true`, 101 decisions, 101 `keep`; `term_e25e81fa…` `tab_gone`, dry-run |
+| `flock -n` holding the scratch `reaper.lock` | `{"error": "[Errno 11] Resource temporarily unavailable", "ok": false}`, rc 1 |
+| lock released again | `ok: true`, 102 decisions |
+
+`verify.sh` ran through `spectre-offload` for `git archive HEAD` (`8e8be50`)
+and for the same tree plus the two changed files, with the toolchain of the
+previous slice (Node 22.23.2, `/usr/bin/python3` 3.12.3):
+
+| Gate | HEAD `8e8be50` | This slice |
+| --- | --- | --- |
+| `bash -n` | 32 ok | 32 ok |
+| shellcheck | SKIP, not installed | SKIP, not installed |
+| `py_compile` | ok | ok |
+| slack bridge, `node --test` | 77 pass | 77 pass |
+| devcodex, vendored | 69 pass, 8 fail | 69 pass, the same 8 fail |
+| unit tests | 517 run, 1 failure | 519 run, the same 1 failure |
+
+The failures are the two Studio issues recorded for the previous slice. The
+same run copied the new test file onto the HEAD tree and ran the two new tests
+against the HEAD reaper. Both fail there:
+`test_a_held_lock_stops_inventory_and_sweep` fails because `ss` ran while the
+lock was held (`AssertionError: reaper read inventory or swept while another run
+held the lock`), and `test_unexpected_error_still_prints_a_json_verdict` errors
+with the escaped `AttributeError: 'list' object has no attribute 'get'`.
+
+Still open:
+
+- Reinstalling `/usr/local/bin/spectre-reaper` is still the operator's deploy
+  step, and the timer stays disabled.
+- Lock contention reports `[Errno 11] Resource temporarily unavailable`
+  without naming the lock.
+- Astra and Kimi do not write tab records yet. A launcher that records a
+  long-lived agent tab must pin it too, or the RSS rule selects it.

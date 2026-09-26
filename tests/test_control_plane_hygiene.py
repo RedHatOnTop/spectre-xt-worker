@@ -1,5 +1,7 @@
 """Process-backed hygiene and launcher regression tests."""
 import argparse
+import contextlib
+import io
 import json
 import os
 from pathlib import Path
@@ -12,7 +14,7 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'scripts'))
 from control_plane import inventory, pins, astra
-from control_plane.io import write_json
+from control_plane.io import locked, write_json
 import importlib.util
 spec = importlib.util.spec_from_file_location('reaper', ROOT / 'scripts/spectre-reaper.py')
 reaper = importlib.util.module_from_spec(spec)
@@ -192,6 +194,35 @@ class LiveTest(unittest.TestCase):
         self.assertEqual([(row['handle'], row['reason'], row['dry_run']) for row in out['tab_records']],
                          [('term_gone', 'tab_gone', True)])
         self.assertTrue(self.record.exists())
+
+    def test_a_held_lock_stops_inventory_and_sweep(self):
+        def untouched(*args, **kwargs):
+            raise AssertionError('reaper read inventory or swept while another run held the lock')
+
+        with locked(self.args.state.with_suffix('.lock')), \
+                patch.object(reaper.subprocess, 'run', side_effect=untouched), \
+                patch.object(reaper, 'run', side_effect=untouched), \
+                patch.object(reaper.tidy, 'sweep', side_effect=untouched):
+            with self.assertRaises(BlockingIOError):
+                reaper.live(self.args)
+        self.assertTrue(self.record.exists())
+
+    def test_unexpected_error_still_prints_a_json_verdict(self):
+        malformed = {'ok': True, 'parsed': {'result': []}}
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with patch.dict(os.environ, {'SPECTRE_PACKET_DIR': str(self.packet_dir)}), \
+                patch.object(reaper.subprocess, 'run',
+                             return_value=subprocess.CompletedProcess([], 0, '', '')), \
+                patch.object(reaper, 'run', return_value=malformed), \
+                contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            code = reaper.main(['--workers-file', str(self.args.workers_file),
+                                '--state', str(self.args.state)])
+        self.assertEqual(code, 1)
+        self.assertEqual(json.loads(stdout.getvalue()),
+                         {'ok': False, 'error': "AttributeError: 'list' object has no attribute 'get'"})
+        self.assertIn('Traceback', stderr.getvalue())
+        with locked(self.args.state.with_suffix('.lock')):
+            pass
 
 
 class PinTest(unittest.TestCase):
