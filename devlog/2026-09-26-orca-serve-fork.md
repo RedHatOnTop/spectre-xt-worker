@@ -249,4 +249,51 @@ off (`caller:"remote-view"`, `background:false`). When a stale screen next
 appears, first check whether that flip was logged for the session; if not,
 the daemon was thinning a stream someone was watching. Caveat: the rate limit
 is per event name, so a flip within 30 s of another sync shows only as a
-`suppressedSinceLastEmit` count.
+`suppressedSinceLastEmit` count (fixed by patch 9 below).
+
+## Patch 9: PTY resize logging (2026-09-27, after midnight)
+
+Why: serve has no renderer process (checked on the box: zygotes, GPU process,
+Xvfb `:99` and the network service, no `--type=renderer`), so nothing measures
+a pane. `orca-runtime-create-terminal.ts` spawns CLI terminals at a fixed
+120×40, and the size changes only when a remote viewer claims its viewport
+(`RemoteDesktopTerminalFloor`) and again on the host reclaim when the last
+viewer leaves, back to the pre-claim size since serve has no renderer size to
+restore. Each change is a full TUI repaint at a new width, and none was
+recorded. The other renderer gaps found in the same read (lazy tab mount
+waits 10 s for a renderer that does not exist, then `no_connected_pty`; no
+renderer serializer as a snapshot source) are recorded here, not patched.
+
+Patch 9 (`9e4c765cc6`): `applyLayout`, the only resize path in serve, logs
+`ptyResize` with `from`/`to`, `kind` (`remote-desktop` claim, `desktop`
+reclaim, `phone`), `owner` (`multiplex:<connection>:<stream>`, the same
+stream id as the patch 8 `remote*` lines), `seq`, and `failed:true` when the
+provider refuses. The sink's rate limit now takes an optional key.
+`ptyResize` is keyed per kind and session, and `mainBackgroundSync` per
+direction and session. The box journal had already shown the need: between the
+patch 8 and patch 9 deploys, per-event-name keying folded session flips into
+`suppressedSinceLastEmit: 1` and `: 4`. Past 256 keys, closed windows with
+nothing suppressed are dropped.
+
+Real data from that window (patch 8 live, 21:33 → 00:34): 7 lines, all
+`mainBackgroundSync`. Five `spawn` → `background:true` for new CLI terminals,
+and two `remote-view` → `background:false` (`@@d92e03c2` at 21:51,
+`@@253b6fb0` at 00:21) when the ADE client (100.64.11.53) opened a terminal.
+So the flip-off works when a viewer attaches. No `remote*` overflow line
+appeared.
+
+Verification:
+
+- fedora: `make test` 77/77 plus the runtime fragment 2/2; typecheck, oxlint,
+  oxfmt clean. The `src/main/ipc/pty` suite plus the layout suites (89 files,
+  849 tests) pass. Red check: without the source hunks, 4 of the new resize
+  and probe tests fail, and the producer-sync test fails.
+- Pre-existing, unrelated: 7 bash-wrapper tests
+  (`bash-prompt-command-composition`, `shell-ready-bash-wrapper`) fail on
+  fedora's bash 5.3.9 with and without the patch, with identical names. An
+  8th in the wide run was a load flake.
+- Package `orca-ide_1.4.212_serve-9e4c765cc6b5_amd64.deb`: `ptyResize:` and
+  `mainBackgroundSync:` keys present in `app.asar`.
+- Spectre deploy 00:34 KST: clean stop (`SIGTERM received` → `exiting with
+  code 0`), daemon 2796 preserved with 26 live sessions, 26/26 terminals
+  after, `NRestarts=0`, web-index 200, the ADE client reconnected.
