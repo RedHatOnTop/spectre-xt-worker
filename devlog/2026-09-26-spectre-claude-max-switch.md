@@ -170,4 +170,80 @@ describe the Max harness instead, and the launcher's "only resume a shallow
 history" comment is gone (backups `*.bak-unrelay-20260926-204412` beside each
 file).
 
-<!-- unrelay run and restart results go here -->
+The settings change was again an operator script (`unrelay-spectre.sh`, run
+from fedora at 21:19:28 as `ssh spectre 'bash -s' < …`). It backs up
+`settings.json` and `~/.claude.json` to `*.bak-unrelay-20260926-211928`, removes
+the table above in one `jq` pass that is checked to leave `model`,
+`effortLevel` and `modelSettings` unchanged, and then probes. The probe after
+removal read
+
+```
+model contextWindow=1000000  auto-compact window=1m
+```
+
+so the script's fallbacks (restore `ANTHROPIC_BETAS`, then drop the 1M pin)
+did not fire. `obscura` came back in `mcpServers` with
+`mcp --stealth --allow-private-network`; `permissions.defaultMode` is still
+`bypassPermissions`.
+
+### The second restart, and an input that was not the operator's
+
+Both sessions were restarted again to pick the new settings up.
+
+Tier-0 went wrong first. `orca-ide terminal send --text "/exit" --enter` was
+sent into its idle prompt, but the input box still held the `2` typed earlier
+to answer the auto-mode dialog. `--enter` appends to whatever is in the box, so
+the TUI submitted
+
+```
+❯ 2/exit
+```
+
+and Tier-0, which was waiting for the operator to choose among numbered
+options, read it as "do item 2" and started. Before a raw Escape interrupted
+it, it had:
+
+- written `merge-conflict-free-prs.md` into the minecraft-server-project memory
+  and appended its line to that `MEMORY.md`. The memory records a real operator
+  statement from 07:06Z the same day ("PR 머지의 경우 충돌이 없으면 머지해도
+  무관함"), so it was kept;
+- run `git fetch origin main` in `~/wt/release-readiness-spectre`, which moves
+  remote refs only;
+- asked for a second, read-only `ls`/`sed` of old artifacts, which the
+  interrupt refused.
+
+Nothing else changed. After the restart Tier-0 was told, in a message marked as
+not from the operator, that `2/exit` was an accident and option 2 had not been
+chosen; it acknowledged and went back to waiting.
+
+Both restarts were then done without typing into the TUI: `SIGTERM` to the
+`claude` pid, which exits in 2–3 s and prints its `--resume` line, then the
+launch command sent into the same Orca tab's shell after a raw Ctrl+U:
+
+| Session | Old pid | Stopped at | New pid, start |
+| --- | --- | --- | --- |
+| Tier-0 `9fc50e14` | 121165 | idle, after the interrupt | 144848, 21:24:29 |
+| control plane `5522c1fa` | 121132 | mid-`/goal`, blocked in a read-only poll of a Lightning offload log | 146547, 21:27:14 |
+
+The control-plane session was stopped only after checking that its only child
+processes were that poll and its Monitor. The offload itself
+(`spectre-offload`, pid 144736) runs under `systemd --user`, not under
+`claude`, and kept running; the resumed session was told to re-read its log,
+found the run finished and the Studio stopped, and continued the goal.
+
+Evidence the new limits are in effect:
+
+- neither status line shows *N% until auto-compact* any more; before the
+  restart the control plane showed `9% until auto-compact` at 133 k, and after
+  it ran past 153 k with no warning;
+- both processes hold connections only to `160.79.104.10:443` (Anthropic) plus
+  two Google-hosted telemetry endpoints, and the box has no connection to
+  anyrouter;
+- neither process environment contains an `ANTHROPIC_*`, `API_TIMEOUT_MS` or
+  auto-compact variable.
+
+Left as found: both TUIs still say *Update installed · Restart to update*;
+`/usr/local/bin/claude` is the root-owned 2.1.281 from 2026-09-25, so the
+downloaded update is not what these restarts launched. The Tier-0 briefs'
+*Visibility* sections still name `term_1a600437-…`; the live Tier-0 tab is
+`term_49b16cd1-…`.

@@ -496,3 +496,17 @@ window, so a person has to run it.
 backups from the start (`ssh spectre 'bash -s' < script`, run by the operator
 via `!`), and do everything around it — login, preflight, restart — in the
 agent's own lane. (2026-09-26, Spectre Max switch.)
+
+## `terminal send --enter` into a Claude TUI submits whatever was already typed
+
+To restart an idle Tier-0 session, `orca-ide terminal send --text "/exit"
+--enter` was sent into its prompt. A `2` typed earlier to answer a one-time
+dialog was still in the input box, so the TUI submitted `2/exit`. Tier-0 was
+waiting for the operator to pick among numbered options, read it as "do item
+2", and wrote a memory and ran `git fetch` before it was interrupted.
+*Rule:* do not type into a Claude TUI to stop it. `SIGTERM` the `claude` pid
+(it exits in seconds and prints its `--resume` line), then send the launch
+command into the tab's shell after a raw Ctrl+U. When text must go into a TUI,
+read the screen first, and clear the box with a raw `\x15` if it is not empty.
+If a stray input is submitted anyway, tell the session plainly that it was not
+from the operator. (2026-09-26, Spectre Max switch.)
