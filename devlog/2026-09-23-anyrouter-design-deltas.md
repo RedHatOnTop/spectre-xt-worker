@@ -988,3 +988,42 @@ Still open:
 
 - `ASTRA_ENABLED` gates every seat, as above.
 - The dry run does not model the codex gates.
+
+## A held lock names itself — 2026-09-26
+
+The reaper slice above left lock contention reporting `[Errno 11] Resource
+temporarily unavailable`, which does not say which lock was held. The loop
+reported it the same way. `io.locked()` now re-raises the `BlockingIOError`
+with the lock path as its filename, so contention reads `[Errno 11] lock is
+held: '<path>/spectre-loop.lock'`. It is still a `BlockingIOError`, so every
+caller that catches `OSError` reports it as before, only with the name. The
+loop, the reaper, `spectre-kimi`, `spectre-astra` and pin sync all catch it at
+their entry points. The seat store's lock is taken only inside `spectre-kimi`.
+
+### Verification
+
+On Spectre, `flock -n` held a scratch `reaper.lock` and ran the working-tree
+`spectre-reaper.py --state <scratch>/reaper.json` as its child, without
+`--apply`. It exited 1 with an empty stderr and printed
+`{"error": "[Errno 11] lock is held: '<scratch>/reaper.lock'", "ok": false}`.
+It wrote no state file. The loop was not run against a held lock on the box,
+because a live tick that won the lock would dispatch. The unit test covers
+that path.
+
+`verify.sh` ran through `spectre-offload` for `git archive b66e350` and for
+the same tree plus the two changed files. The merge of `b6ce059` that followed
+touched only RUNBOOK.md and a devlog, which no test reads.
+
+| Gate | `b66e350` | This slice |
+| --- | --- | --- |
+| `bash -n` | 32 ok | 32 ok |
+| shellcheck | SKIP, not installed | SKIP, not installed |
+| `py_compile` | ok | ok |
+| slack bridge, `node --test` | 77 pass | 77 pass |
+| devcodex, vendored | 69 pass, 8 fail | 69 pass, the same 8 fail |
+| unit tests | 524 run, 1 failure | 526 run, the same 1 failure |
+
+The two new tests fail against the `b66e350` `io.py` with the old text
+(`'[Errno 11] Resource temporarily unavailable' != "[Errno 11] lock is held:
+'/tmp/…/spectre-loop.lock'"`). The boundary, hygiene and handoff-runtime suites,
+which hold or contend for locks, pass on the changed tree (53 tests).

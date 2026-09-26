@@ -1,5 +1,6 @@
 """Bounded I/O, provider and validation failure paths."""
 from contextlib import redirect_stdout
+import errno
 import http.client
 import io
 import json
@@ -15,7 +16,7 @@ import urllib.error
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'scripts'))
 from control_plane import cli, providers, packets, astra
-from control_plane.io import checked, read_json, run, write_json
+from control_plane.io import checked, locked, read_json, run, write_json
 
 
 class BoundaryTest(unittest.TestCase):
@@ -27,6 +28,15 @@ class BoundaryTest(unittest.TestCase):
         self.assertTrue(run([sys.executable, '-c', 'import time; time.sleep(10)'], timeout=.02)['uncertain'])
         with self.assertRaises(RuntimeError):
             checked((409, {'ok': False, 'error': 'conflict'}))
+
+    def test_a_held_lock_names_itself(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'spectre-loop.lock'
+            with locked(path), self.assertRaises(BlockingIOError) as caught, locked(path):
+                pass
+            self.assertEqual(str(caught.exception), f"[Errno {errno.EAGAIN}] lock is held: '{path}'")
+            with locked(path):
+                pass
 
     def test_invalid_objects_and_packet_fields(self):
         value = {'request_id': 'r1', 'worker': 'minecraft', 'wake_reason': 'completed',
@@ -157,6 +167,18 @@ class CliBoundaryTest(unittest.TestCase):
                 self.assertEqual(cli.loop_main(['--workers-file', str(workers), '--dry-run', '--snapshot-file', str(snaps)]), 0)
                 self.assertEqual(cli.loop_main(['--workers-file', str(root / 'missing')]), 1)
             self.assertIn('disabled', output.getvalue())
+
+    def test_loop_reports_which_lock_is_held(self):
+        with tempfile.TemporaryDirectory() as tmp, redirect_stdout(io.StringIO()) as output:
+            root = Path(tmp)
+            workers = root / 'workers.json'
+            state = root / 'spectre-loop.json'
+            write_json(workers, {'workers': {'w': {'cwd': tmp}}})
+            with (patch.dict(os.environ, {'SPECTRE_LOOP': '1', 'SPECTRE_LOOP_STATE': str(state)}),
+                  locked(state.with_suffix('.lock'))):
+                self.assertEqual(cli.loop_main(['--workers-file', str(workers)]), 1)
+            self.assertEqual(json.loads(output.getvalue()),
+                             {'ok': False, 'error': f"[Errno {errno.EAGAIN}] lock is held: '{state.with_suffix('.lock')}'"})
 
     def test_provider_cli_records_rate_limit_and_probe_result(self):
         with tempfile.TemporaryDirectory() as tmp, redirect_stdout(io.StringIO()):
