@@ -1220,3 +1220,46 @@ On the HEAD loop the new test fails at its first assertion, the dry run
 (`('plan', None) != ('escalate', 'kimi_free_exhausted')`). On the changed tree
 the handoff-runtime, control-plane, Kimi and `spectre-loop` suites pass (86
 tests).
+
+## The provider tick says when a relay could take a Kimi seat back — 2026-09-26
+
+This slice answers the P2 item "A non-codex seat has no relay recovery". Seat
+transfer stays operator-confirmed. `kimi.release()` needs an explicit
+observed-stopped confirmation, so the tick does not move the seat itself. It
+now tells the operator when a release would succeed. When `providers.choose()`
+selects a relay and the seat is Kimi, `seat_alerts()` adds
+`kimi_seat_relay_recovered` to the tick's alerts. `alerted()` already posts a
+changed alert set once, so the alert posts once while the state lasts and
+clears when the seat is released. A Claude seat gets no such alert, because it
+ranks above the codex seat. The seat root is `runtime.seat_root()` of the
+provider state, the same directory the loop uses by default. A seat file the
+tick cannot read becomes a `seat_state_invalid` alert instead of an exception,
+so a corrupt seat does not stop provider health from being written.
+
+### Verification
+
+On Spectre, `seat_alerts()` was called directly with a chosen `agentrouter`.
+Against the live seat root, which has no seat file (codex), it added nothing.
+Against the scratch Kimi seat from the previous slice, it added
+`kimi_seat_relay_recovered`. With `kimi_free` chosen it added nothing. The
+provider tick itself was not run on the box, because it probes the relays and
+would post the alert to Slack.
+
+`verify.sh` ran through `spectre-offload` for `git archive 5838074` and for
+the same tree plus the two changed files:
+
+| Gate | HEAD `5838074` | This slice |
+| --- | --- | --- |
+| `bash -n` | 32 ok | 32 ok |
+| shellcheck | SKIP, not installed | SKIP, not installed |
+| `py_compile` | ok | ok |
+| slack bridge, `node --test` | 79 pass | 79 pass |
+| devcodex, vendored | 69 pass, 8 fail | 69 pass, the same 8 fail |
+| unit tests | 529 run, 1 failure | 531 run, the same 1 failure |
+
+Both new tests fail against the HEAD CLI. With a Kimi seat the alert is never
+sent (`[False] != [True]`), and a corrupt seat raises no alert
+(`'seat_state_invalid' not found in ['anyrouter:relay_missing']`). A
+supplementary run in the same session named a test module that does not exist
+and reported that as one import error. The full unit run above covers the same
+tests.

@@ -15,7 +15,7 @@ import urllib.error
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'scripts'))
-from control_plane import cli, providers, packets, astra
+from control_plane import cli, providers, packets, astra, seat
 from control_plane.io import checked, locked, read_json, run, write_json
 
 
@@ -179,6 +179,43 @@ class CliBoundaryTest(unittest.TestCase):
                 self.assertEqual(cli.loop_main(['--workers-file', str(workers)]), 1)
             self.assertEqual(json.loads(output.getvalue()),
                              {'ok': False, 'error': f"[Errno {errno.EAGAIN}] lock is held: '{state.with_suffix('.lock')}'"})
+
+    def test_provider_cli_says_once_when_a_relay_could_take_a_kimi_seat_back(self):
+        with tempfile.TemporaryDirectory() as tmp, redirect_stdout(io.StringIO()):
+            root = Path(tmp)
+            state = root / 'provider.json'
+            write_json(root / 'providers.json', {'providers': [{'id': 'agentrouter'}]})
+            args = ['--modes', tmp, '--state', str(state)]
+            owners = (('kimi', ['kimi_seat_relay_recovered']), ('codex', []))
+            for owner, alerts in owners:
+                with self.subTest(owner=owner):
+                    state.unlink(missing_ok=True)
+                    write_json(seat.seat_path(root), {**seat.default_state(), 'owner': owner})
+                    with (patch.dict(os.environ, {'SPECTRE_SEAT_ROOT': tmp}),
+                          patch('control_plane.cli.providers.probe', return_value={'ok': True, 'status': 200}),
+                          patch('control_plane.cli.runtime.notify', return_value={'ok': True}) as notify):
+                        self.assertEqual(cli.provider_main(args), 0)
+                        self.assertEqual(cli.provider_main(args), 0)
+                    self.assertEqual(read_json(state)['id'], 'agentrouter')
+                    sent = [call.args[3] for call in notify.call_args_list]
+                    self.assertEqual(['kimi_seat_relay_recovered' in text for text in sent],
+                                     [True] if alerts else [False] * len(sent))
+                    self.assertEqual([a for a in read_json(state)['alerts_sent'] if 'seat' in a], alerts)
+
+    def test_provider_cli_keeps_probing_when_the_seat_file_is_corrupt(self):
+        with tempfile.TemporaryDirectory() as tmp, redirect_stdout(io.StringIO()):
+            root = Path(tmp)
+            state = root / 'provider.json'
+            write_json(root / 'providers.json', {'providers': [{'id': 'agentrouter'}]})
+            path = seat.seat_path(root)
+            path.parent.mkdir(parents=True)
+            path.write_text('{')
+            with (patch.dict(os.environ, {'SPECTRE_SEAT_ROOT': tmp}),
+                  patch('control_plane.cli.providers.probe', return_value={'ok': True, 'status': 200}),
+                  patch('control_plane.cli.runtime.notify', return_value={'ok': True})):
+                self.assertEqual(cli.provider_main(['--modes', tmp, '--state', str(state)]), 0)
+            self.assertEqual(read_json(state)['id'], 'agentrouter')
+            self.assertIn('seat_state_invalid', read_json(state)['alerts_sent'])
 
     def test_provider_cli_records_rate_limit_and_probe_result(self):
         with tempfile.TemporaryDirectory() as tmp, redirect_stdout(io.StringIO()):

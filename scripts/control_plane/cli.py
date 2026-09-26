@@ -8,7 +8,7 @@ from pathlib import Path
 import time
 import traceback
 
-from . import cline_free, providers, runtime
+from . import cline_free, providers, runtime, seat
 from .io import read_json, run, write_json
 from worker_state.client import StateClient
 from worker_state.qoder_jsonl import load_workers, workers_path
@@ -69,15 +69,28 @@ def provider_main(argv=None):
             def kimi_status():
                 return providers.kimi_candidate(os.environ,
                     lambda: cline_free.status(cline_free.load(), now))
-            output = alerted(providers.choose(read_json(args.modes / 'providers.json'), previous, now,
-                                              lambda row: providers.probe(row, args.modes),
-                                              kimi_fn=kimi_status),
-                             previous, os.environ)
+            chosen = providers.choose(read_json(args.modes / 'providers.json'), previous, now,
+                                      lambda row: providers.probe(row, args.modes),
+                                      kimi_fn=kimi_status)
+            output = alerted(seat_alerts(chosen, args.state, os.environ), previous, os.environ)
         write_json(args.state, output)
     except (OSError, ValueError) as exc:
         output = {'ok': False, 'error': type(exc).__name__}
     print(json.dumps(output, sort_keys=True))
     return 0 if output['ok'] else 1
+
+
+def seat_alerts(output: dict, state: Path, env) -> dict:
+    """Seat transfer is operator-confirmed, so say when a relay could take a Kimi seat back."""
+    if not output.get('ok') or output.get('id') not in providers.RELAYS:
+        return output
+    try:
+        owner = seat.load(seat.seat_path(runtime.seat_root(state, env)))['owner']
+    except ValueError:
+        return {**output, 'alerts': [*output.get('alerts', []), 'seat_state_invalid']}
+    if owner != seat.OWNER_KIMI:
+        return output
+    return {**output, 'alerts': [*output.get('alerts', []), 'kimi_seat_relay_recovered']}
 
 
 def alerted(output: dict, previous: dict, env) -> dict:
