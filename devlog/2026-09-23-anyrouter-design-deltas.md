@@ -1069,3 +1069,49 @@ On the HEAD launcher, the new test's Kimi and Claude rows run on to the Codex
 mode switch and fail there (`('codex_mode_failed', None) !=
 ('top_level_agent_already_running', [7])`). The rows with a Claude elsewhere
 and an Efficient in the worktree pass on both trees.
+
+## The bridge counts Claude and Kimi planners in the worktree — 2026-09-26
+
+This slice closes the P2 item "The planner pid count is box-wide". Before a
+`plan` dispatch, `plannerPidVerdict()` demands exactly one process of the
+pinned harness's role. `listPlannerCmdlines()` collected them from the whole
+box. A Claude seat therefore refused with `dispatch_claude_busy` whenever a
+second `claude --model claude-opus-5-5` ran anywhere, an operator session
+included. That is the normal state of this box now. The scan on Spectre shows
+one leaf Claude planner, in `/home/person/wt/release-readiness-spectre`, and
+none in the minecraft worktree (`/home/person/Projects/minecraft-server-project`).
+The box-wide count also accepted such a session as the minecraft planner. That
+could not type into the wrong tab, because `nativeProcessGuard()` later
+requires the planner in the pinned tab before any input.
+
+`listPlannerCmdlines()` now takes the worker's cwd. It counts Claude and Kimi
+leaves only when their cwd is that worktree, and the dispatch passes
+`entry.cwd`. Astra stays box-wide. Its launcher refuses box-wide, and the
+plus-burn refusal is not scoped to one worktree. The `SPECTRE_ASTRA_CMDLINES`
+test override is unchanged.
+
+### Verification
+
+`dispatch-process.mjs` was imported on its own on Spectre, and its
+`processes()` classified the box as above. That module is the bridge's own
+scanner. The dispatch itself was not run on the box. A Claude-seat plan
+dispatch needs a registry that names the Claude harness, and the live
+registry's minecraft pin is codex.
+
+`verify.sh` ran through `spectre-offload` for `git archive 632206d` and for
+the same tree plus the two changed files:
+
+| Gate | HEAD `632206d` | This slice |
+| --- | --- | --- |
+| `bash -n` | 32 ok | 32 ok |
+| shellcheck | SKIP, not installed | SKIP, not installed |
+| `py_compile` | ok | ok |
+| `node --check slack-bridge.mjs` | ok | ok |
+| slack bridge, `node --test` | 77 pass | 79 pass |
+| devcodex, vendored | 69 pass, 8 fail | 69 pass, the same 8 fail |
+| unit tests | 527 run, 1 failure | 527 run, the same 1 failure |
+
+Both new bridge tests fail against the HEAD bridge. The CLI test, which
+dispatches a Claude-seat plan with one Claude in the worktree and one
+elsewhere, gets `dispatch_claude_busy` instead of reaching the state probe
+(`dispatch_probe_failed`, since the socket is a missing scratch path).

@@ -1397,6 +1397,29 @@ test("listPlannerCmdlines: a bg-pty-host wrapper is not a second claude planner"
   }
 });
 
+test("listPlannerCmdlines: claude and kimi count only in the worktree, astra box-wide", () => {
+  const dir = mkdtempSync(join(tmpdir(), "spectre-planner-proc-"));
+  try {
+    const proc = join(dir, "proc");
+    const worktree = join(dir, "minecraft");
+    const elsewhere = join(dir, "operator");
+    const claude = ["/usr/bin/claude", "--model", "claude-opus-5-5"];
+    const astra = ["codex", "-m", "gpt-6-astra"];
+    fakeProcess(proc, 911, claude, "term_planner", worktree);
+    fakeProcess(proc, 912, claude, "term_operator", elsewhere);
+    fakeProcess(proc, 913, astra, "term_a", worktree);
+    fakeProcess(proc, 914, astra, "term_b", elsewhere);
+    assert.deepEqual(listPlannerCmdlines("claude", {}, proc, worktree), [claude.join(" ")]);
+    assert.deepEqual(plannerPidVerdict(listPlannerCmdlines("claude", {}, proc), "claude"),
+      { ok: false, evt: "dispatch_claude_busy", count: 2 });
+    assert.deepEqual(listPlannerCmdlines("kimi", {}, proc, worktree), []);
+    assert.deepEqual(plannerPidVerdict(listPlannerCmdlines("astra", {}, proc, worktree), "astra"),
+      { ok: false, evt: "dispatch_astra_busy", count: 2 });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("paneRefusal: flash wrapper prefix may run in a shell", () => {
   const line = flashSendLine("x");
   assert.equal(
@@ -1669,6 +1692,28 @@ test("dispatch CLI: plan counts the pinned harness, not astra", () => {
     const unknown = plan({ terminal: "term_x", harness: "gemini" });
     assert.equal(unknown.code, 1, unknown.stdout);
     assert.equal(JSON.parse(unknown.stdout.trim()).evt, "dispatch_planner_unknown");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("dispatch CLI: plan counts a claude planner in the worker's worktree only", () => {
+  const dir = mkdtempSync(join(tmpdir(), "spectre-plan-"));
+  try {
+    const workers = join(dir, "workers.json");
+    const proc = join(dir, "proc");
+    const worktree = join(dir, "minecraft");
+    const claude = ["/usr/bin/claude", "--model", "claude-opus-5-5"];
+    fakeProcess(proc, 921, claude, "term_c", worktree);
+    fakeProcess(proc, 922, claude, "term_operator", join(dir, "operator"));
+    writeFileSync(workers, JSON.stringify({ workers: { minecraft: {
+      cwd: worktree, tmux: null, terminal: "term_a", planner: { terminal: "term_c", harness: "claude" } } } }));
+    const out = runBridge(
+      ["--dispatch", "plan", "minecraft", "next packet", "--dry-run", "--workers-file", workers],
+      { SPECTRE_PROC_ROOT: proc, SPECTRE_WORKER_STATE_SOCK: join(dir, "missing.sock") },
+    );
+    assert.equal(out.code, 1, out.stdout);
+    assert.equal(JSON.parse(out.stdout.trim()).evt, "dispatch_probe_failed");
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
