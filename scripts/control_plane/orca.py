@@ -5,19 +5,40 @@ from . import tidy
 from .io import run as run_command
 
 
-def registered(cwd: str, run=run_command) -> dict:
-    listed = run(['orca-ide', 'worktree', 'ps', '--json'], timeout=15)
+# `worktree ps` has a row cap and no offset; a page without the worktree is re-read
+# once with the reported total as the cap, never with an unbounded one.
+MAX_WORKTREES = 1000
+
+
+def listing(run, limit=None) -> dict:
+    argv = ['orca-ide', 'worktree', 'ps', '--json', *(['--limit', str(limit)] if limit else [])]
+    listed = run(argv, timeout=15)
     if not listed.get('ok'):
         return {'ok': False, 'error': 'orca_ps_failed'}
     body = listed.get('parsed', {}).get('result')
     rows = body.get('worktrees') if isinstance(body, dict) else None
     if not isinstance(rows, list):
         return {'ok': False, 'error': 'orca_ps_invalid'}
-    ids = [row.get('worktreeId') for row in rows
-           if isinstance(row, dict) and row.get('path') == cwd and not row.get('isArchived')]
+    return {'ok': True, 'rows': rows, 'truncated': bool(body.get('truncated')),
+            'total': body.get('totalCount')}
+
+
+def matching(rows: list, cwd: str) -> list:
+    return [row.get('worktreeId') for row in rows
+            if isinstance(row, dict) and row.get('path') == cwd and not row.get('isArchived')]
+
+
+def registered(cwd: str, run=run_command) -> dict:
+    page = listing(run)
+    if (page['ok'] and page['truncated'] and not matching(page['rows'], cwd)
+            and type(page['total']) is int and len(page['rows']) < page['total'] <= MAX_WORKTREES):
+        page = listing(run, page['total'])
+    if not page['ok']:
+        return page
+    ids = matching(page['rows'], cwd)
     if len(ids) == 1 and isinstance(ids[0], str) and ids[0]:
         return {'ok': True, 'worktree_id': ids[0]}
-    if not ids and body.get('truncated'):
+    if not ids and page['truncated']:
         return {'ok': False, 'error': 'orca_ps_truncated'}
     return {'ok': False, 'error': 'orca_worktree_unregistered', 'rows': len(ids)}
 

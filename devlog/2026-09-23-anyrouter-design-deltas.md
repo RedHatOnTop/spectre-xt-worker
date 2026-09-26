@@ -1263,3 +1263,45 @@ sent (`[False] != [True]`), and a corrupt seat raises no alert
 supplementary run in the same session named a test module that does not exist
 and reported that as one import error. The full unit run above covers the same
 tests.
+
+## A truncated worktree listing is read whole once — 2026-09-26
+
+This slice closes "A truncated `worktree ps` listing without the row refuses
+creation; nothing pages through it", from the Orca section. `orca-ide worktree
+ps` has a row cap (`--limit <n>`) and no offset. Its JSON carries `truncated`
+and `totalCount`. Measured on Spectre: `--limit 3` returns 3 rows with
+`truncated: true, totalCount: 16`, and `--limit 16` returns all 16 with
+`truncated: false`. `orca.registered()` and the bridge's `orcaWorktreeId()`
+both refused with `orca_ps_truncated` when the first page lacked the worktree.
+Both now read the listing once more with `--limit <totalCount>` when the page
+is truncated, lacks the worktree, and reports a total above the page size and
+at most 1000. The second read decides. A missing or implausible total keeps
+the old refusal. The Astra and Kimi launchers use `orca.create()`, and the
+Flash and Mimo packet pins use the bridge.
+
+### Verification
+
+On Spectre, `orca.registered()` ran against the live Orca with a `run` wrapper
+that added `--limit 3` to the first call only, for a registered worktree that
+is not in the first three rows. It found the worktree id with two calls:
+`['--json', '--limit', '3']`, then `['--json', '--limit', '16']`. Both calls are
+read-only listings.
+
+`verify.sh` ran through `spectre-offload` for `git archive d23f6a2` and for
+the same tree plus the four changed files:
+
+| Gate | HEAD `d23f6a2` | This slice |
+| --- | --- | --- |
+| `bash -n` | 32 ok | 32 ok |
+| shellcheck | SKIP, not installed | SKIP, not installed |
+| `py_compile` | ok | ok |
+| `node --check slack-bridge.mjs` | ok | ok |
+| slack bridge, `node --test` | 79 pass | 80 pass |
+| devcodex, vendored | 69 pass, 8 fail | 69 pass, the same 8 fail |
+| unit tests | 531 run, 1 failure | 534 run, the same 1 failure |
+
+Against the HEAD code, the three new Python tests fail or error. The whole-read
+case has no worktree id, the implausible-total case has no `MAX_WORKTREES`, and
+the unregistered case gets `'orca_ps_truncated' != 'orca_worktree_unregistered'`.
+The new bridge test fails with `ok: false`. The Orca suite passes on the
+changed tree (11 tests).

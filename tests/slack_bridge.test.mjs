@@ -994,19 +994,26 @@ test("packetSurface: pin by default, job opt-in", () => {
   assert.equal(entry.targets.mimo.wrapper, "/usr/local/bin/mimo-clinepass");
 });
 
-function fakeCreatingOrca(dir, { registered = dir, boundTo = `wt-1::${dir}`, title = "flash-packets", preexisting = [] } = {}) {
+function fakeCreatingOrca(dir, { registered = dir, boundTo = `wt-1::${dir}`, title = "flash-packets", preexisting = [], paged = false } = {}) {
   const bin = join(dir, "bin");
   mkdirSync(bin);
   const log = join(dir, "orca.log");
   const createdIn = join(dir, "create.cwd");
   const created = join(dir, "created");
   const rows = [{ worktreeId: `wt-1::${registered}`, path: registered, isArchived: false }];
+  const other = { worktreeId: "wt-0::/work/other", path: "/work/other", isArchived: false };
+  const whole = paged ? [other, ...rows] : rows;
+  const first = paged
+    ? { worktrees: [other], truncated: true, totalCount: whole.length }
+    : { worktrees: rows, truncated: false };
   const fresh = { handle: "term_new", worktreePath: dir, connected: true, writable: true, title };
   const script = [
     "#!/bin/sh",
     'printf "%s\\n" "$*" >> ' + JSON.stringify(log),
-    'if [ "$1" = "worktree" ] && [ "$2" = "ps" ]; then',
-    "  printf '%s' " + JSON.stringify(JSON.stringify({ ok: true, result: { worktrees: rows, truncated: false } })),
+    'if [ "$1" = "worktree" ] && [ "$2" = "ps" ] && [ "$4" = "--limit" ]; then',
+    "  printf '%s' " + JSON.stringify(JSON.stringify({ ok: true, result: { worktrees: whole, truncated: false, totalCount: whole.length } })),
+    'elif [ "$1" = "worktree" ] && [ "$2" = "ps" ]; then',
+    "  printf '%s' " + JSON.stringify(JSON.stringify({ ok: true, result: first })),
     'elif [ "$1" = "terminal" ] && [ "$2" = "list" ]; then',
     '  if [ -f ' + JSON.stringify(created) + ' ]; then',
     "    printf '%s' " + JSON.stringify(JSON.stringify({ ok: true, result: { terminals: [...preexisting, fresh] } })),
@@ -1079,6 +1086,21 @@ test("ensurePacketPin: an unregistered worktree gets no terminal", async () => {
     assert.equal(out.evt, "dispatch_orca_failed");
     assert.match(out.detail, /^orca_worktree_unregistered: /);
     assert.equal(readFileSync(orca.log, "utf8").includes("terminal create"), false);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("ensurePacketPin: a worktree past the first ps page is found by one whole read", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "spectre-pin-paged-"));
+  try {
+    const orca = fakeCreatingOrca(dir, { paged: true });
+    const out = await withFakeOrca(orca.bin, () => ensurePacketPin({}, "flash", dir));
+    assert.equal(out.ok, true, JSON.stringify(out));
+    const log = readFileSync(orca.log, "utf8");
+    assert.match(log, /^worktree ps --json$/m);
+    assert.match(log, /^worktree ps --json --limit 2$/m);
+    assert.match(log, /^terminal create /m);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

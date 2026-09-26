@@ -17,10 +17,12 @@ WORKTREE_ID = f'repo-1::{CWD}'
 
 class FakeOrca:
     def __init__(self, rows=None, truncated=False, ps_ok=True, bound_to=WORKTREE_ID,
-                 create=None):
+                 create=None, total=None, whole=None):
         self.rows = ([{'worktreeId': WORKTREE_ID, 'path': CWD, 'isArchived': False}]
                      if rows is None else rows)
         self.truncated = truncated
+        self.total = total
+        self.whole = whole
         self.ps_ok = ps_ok
         self.bound_to = bound_to
         self.create = create
@@ -31,8 +33,12 @@ class FakeOrca:
         if argv[1:3] == ['worktree', 'ps']:
             if not self.ps_ok:
                 return {'ok': False, 'parsed': {}}
+            if '--limit' in argv:
+                return {'ok': True, 'parsed': {'result': {'worktrees': self.whole, 'truncated': False,
+                                                          'totalCount': self.total}}}
             return {'ok': True, 'parsed': {'result': {'worktrees': self.rows,
-                                                      'truncated': self.truncated}}}
+                                                      'truncated': self.truncated,
+                                                      'totalCount': self.total}}}
         if argv[1:3] == ['terminal', 'create']:
             if self.create is not None:
                 return self.create
@@ -78,6 +84,28 @@ class CreateTest(unittest.TestCase):
 
     def test_truncated_listing_is_not_proof_of_absence(self):
         fake = FakeOrca(rows=[], truncated=True)
+        self.assertEqual(orca.create(CWD, 't', 'c', fake)['error'], 'orca_ps_truncated')
+        self.assertEqual(fake.actions(), ['ps'])
+
+    def test_a_worktree_past_the_first_page_is_found_by_one_whole_read(self):
+        other = {'worktreeId': 'repo-1::/work/other', 'path': '/work/other'}
+        mine = {'worktreeId': WORKTREE_ID, 'path': CWD, 'isArchived': False}
+        fake = FakeOrca(rows=[other], truncated=True, total=2, whole=[other, mine])
+        self.assertEqual(orca.create(CWD, 't', 'c', fake)['worktree_id'], WORKTREE_ID)
+        self.assertEqual([argv[3:] for argv, _ in fake.calls if argv[2] == 'ps'],
+                         [['--json'], ['--json', '--limit', '2']])
+        self.assertEqual(fake.actions(), ['ps', 'ps', 'create'])
+
+    def test_a_whole_read_without_the_worktree_is_unregistered(self):
+        other = {'worktreeId': 'repo-1::/work/other', 'path': '/work/other'}
+        fake = FakeOrca(rows=[other], truncated=True, total=2,
+                        whole=[other, {'worktreeId': 'repo-1::/work/x', 'path': '/work/x'}])
+        self.assertEqual(orca.create(CWD, 't', 'c', fake)['error'], 'orca_worktree_unregistered')
+        self.assertEqual(fake.actions(), ['ps', 'ps'])
+
+    def test_an_implausible_total_is_not_read_whole(self):
+        mine = {'worktreeId': WORKTREE_ID, 'path': CWD, 'isArchived': False}
+        fake = FakeOrca(rows=[], truncated=True, total=orca.MAX_WORKTREES + 1, whole=[mine])
         self.assertEqual(orca.create(CWD, 't', 'c', fake)['error'], 'orca_ps_truncated')
         self.assertEqual(fake.actions(), ['ps'])
 

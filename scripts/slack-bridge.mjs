@@ -709,8 +709,13 @@ function readTabRecords(env = process.env) {
   });
 }
 
-async function orcaWorktreeId(cwd) {
-  const listed = await runCommandCapture(ORCA_BIN, ["worktree", "ps", "--json"], 20_000);
+// `worktree ps` has a row cap and no offset; a page without the worktree is re-read
+// once with the reported total as the cap, never with an unbounded one.
+const MAX_ORCA_WORKTREES = 1000;
+
+async function orcaWorktreeList(limit = null) {
+  const args = ["worktree", "ps", "--json", ...(limit ? ["--limit", String(limit)] : [])];
+  const listed = await runCommandCapture(ORCA_BIN, args, 20_000);
   if (!listed.ok) return { ok: false, error: `orca_ps_failed: ${listed.error}` };
   let payload = null;
   try {
@@ -720,11 +725,22 @@ async function orcaWorktreeId(cwd) {
   }
   const body = (payload && payload.result) || {};
   if (!Array.isArray(body.worktrees)) return { ok: false, error: "unexpected orca worktree ps shape" };
-  const ids = body.worktrees
+  return { ok: true, rows: body.worktrees, truncated: Boolean(body.truncated), total: body.totalCount };
+}
+
+async function orcaWorktreeId(cwd) {
+  const matching = (rows) => rows
     .filter((row) => row && row.path === cwd && !row.isArchived)
     .map((row) => row.worktreeId);
+  let page = await orcaWorktreeList();
+  if (page.ok && page.truncated && !matching(page.rows).length && Number.isInteger(page.total)
+      && page.rows.length < page.total && page.total <= MAX_ORCA_WORKTREES) {
+    page = await orcaWorktreeList(page.total);
+  }
+  if (!page.ok) return page;
+  const ids = matching(page.rows);
   if (ids.length === 1 && typeof ids[0] === "string" && ids[0]) return { ok: true, worktreeId: ids[0] };
-  if (!ids.length && body.truncated) return { ok: false, error: `orca_ps_truncated: ${cwd}` };
+  if (!ids.length && page.truncated) return { ok: false, error: `orca_ps_truncated: ${cwd}` };
   return { ok: false, error: `orca_worktree_unregistered: ${cwd} (${ids.length} rows)` };
 }
 
