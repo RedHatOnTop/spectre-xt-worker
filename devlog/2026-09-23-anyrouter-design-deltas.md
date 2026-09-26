@@ -1027,3 +1027,45 @@ The two new tests fail against the `b66e350` `io.py` with the old text
 (`'[Errno 11] Resource temporarily unavailable' != "[Errno 11] lock is held:
 '/tmp/…/spectre-loop.lock'"`). The boundary, hygiene and handoff-runtime suites,
 which hold or contend for locks, pass on the changed tree (53 tests).
+
+## The Astra launcher refuses while any planner runs in the worktree — 2026-09-26
+
+This slice closes the P2 item "`astra.launch()` still looks only for a running
+Astra in the worktree". The launcher refused only when an Astra process ran
+anywhere on the box. A Kimi or Claude planner left running in the minecraft
+worktree did not stop it, so the launcher could put a second planner beside
+it. `kimi.launch()` and `kimi.release()` already refuse while any planner
+process runs in the worktree. The launcher now does the same, with the same
+error, `top_level_agent_already_running`, and the pids. It checks right after
+it reads the registry, before the seat, the provider and the Codex mode switch,
+so a dry run reports the refusal too. The box-wide Astra check stays in front
+of it. Planners elsewhere on the box, an operator's Claude session included,
+do not block the launcher.
+
+### Verification
+
+`spectre-astra --dry-run` ran on Spectre from the working tree and from the
+installed copy, with the real registry and `/proc`, `SPECTRE_SEAT_ROOT` set to
+the live state directory (which holds no seat file) and a scratch provider
+state recording a fresh `anyrouter`. Both exited 0 with `ok: true`, `dry_run:
+true` and provider `anyrouter`, because no planner runs in the minecraft
+worktree now. Only the scratch launch lock was created. The refusal path was
+not exercised on the box. A fake planner process in the worktree would also be
+counted by the bridge's planner check, so the unit test covers it instead.
+
+`verify.sh` ran through `spectre-offload` for `git archive 135209a` and for
+the same tree plus the two changed files:
+
+| Gate | HEAD `135209a` | This slice |
+| --- | --- | --- |
+| `bash -n` | 32 ok | 32 ok |
+| shellcheck | SKIP, not installed | SKIP, not installed |
+| `py_compile` | ok | ok |
+| slack bridge, `node --test` | 77 pass | 77 pass |
+| devcodex, vendored | 69 pass, 8 fail | 69 pass, the same 8 fail |
+| unit tests | 526 run, 1 failure | 527 run, the same 1 failure |
+
+On the HEAD launcher, the new test's Kimi and Claude rows run on to the Codex
+mode switch and fail there (`('codex_mode_failed', None) !=
+('top_level_agent_already_running', [7])`). The rows with a Claude elsewhere
+and an Efficient in the worktree pass on both trees.

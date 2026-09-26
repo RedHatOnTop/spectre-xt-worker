@@ -256,6 +256,30 @@ class AstraKimiGuardTest(unittest.TestCase):
             self.assertEqual(result['error'], 'seat_owned_by_kimi')
             run.assert_not_called()
 
+    def test_planner_in_the_worktree_blocks_astra_launcher(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_json(root / 'workers.json', {'workers': {
+                'minecraft': {'cwd': '/work/minecraft', 'class': 'toplevel'}}})
+            write_json(root / 'provider.json', {
+                'ok': True, 'id': 'anyrouter', 'checked_at': fixtures.NOW})
+            cases = (
+                ({'pid': 7, 'model': 'kimi', 'cwd': '/work/minecraft'}, 'top_level_agent_already_running', [7]),
+                ({'pid': 8, 'model': 'claude', 'cwd': '/work/minecraft'}, 'top_level_agent_already_running', [8]),
+                ({'pid': 9, 'model': 'claude', 'cwd': '/work/operator'}, 'codex_mode_failed', None),
+                ({'pid': 10, 'model': 'efficient', 'cwd': '/work/minecraft'}, 'codex_mode_failed', None),
+            )
+            for process, error, pids in cases:
+                with self.subTest(process=process):
+                    run = Mock(return_value={'ok': False})
+                    with patch('control_plane.astra.inventory.scan', return_value=[process]):
+                        result = astra.launch(root / 'workers.json', root / 'modes',
+                                              root / 'provider.json', now=fixtures.NOW,
+                                              run=run)
+
+                    self.assertEqual((result['error'], result.get('pids')), (error, pids))
+                    self.assertEqual(run.call_count, 0 if pids else 1)
+
     def test_kimi_health_cannot_launch_codex_as_astra(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
