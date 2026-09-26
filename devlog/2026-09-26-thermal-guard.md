@@ -133,12 +133,55 @@ Two shell traps worth remembering: `sh -lc '…'` inside the Studio dies with
 `Bad substitution` (dash + a non-POSIX login profile), and the Studio's ssh
 login shell is zsh. The wrapper runs commands in the default shell.
 
+## Storage is billed, so the offload leaves nothing behind
+
+The operator's warning was right, and the billing FAQ confirms it: "the first
+10 GB of data in the Drive are unbilled" (then **$0.10/GB/month, billed daily**;
+Free caps the Drive at 50 GB) and "there is no cost for sleeping Studios, other
+than the storage costs for the files on that Studio". A fat Studio also sleeps
+slower (documented: sleep time scales with stored data).
+
+What was actually in the Studio after a day of testing:
+
+| Item | Size | Disposition |
+| --- | --- | --- |
+| uploaded `~/offload/coin-bridge` | 10.6 MB | **deleted by the wrapper**, verified `remote_cleaned: "yes"` |
+| leftover trees from the killed test run | 14 MB | found by hand and removed (the wrapper now has an EXIT trap) |
+| `~/.gradle` (wrapper dist + caches) | 590 MB → 443 MB | kept: it is why the repeat build ran `FROM-CACHE` in **7 s** |
+| Temurin 25 in `$HOME/.jdks` | ≈300 MB | kept: persistent, Gradle auto-detects it |
+| Studio home total | **894 MB ≈ 9 % of the free 10 GB** | audited with `spectre-offload --studio-report` |
+
+Two findings changed the recipe. (1) **The root filesystem is not yours**: a
+Temurin tarball extracted into `/usr/lib/jvm` was gone after the next Studio
+start, while apt packages and everything under `$HOME` survived — so the JDK
+now goes to `$HOME/.jdks`, which Gradle's toolchain detection scans. (2) **A
+killed wrapper leaks**: when a local `timeout` killed the ssh client mid-run, the
+uploaded tree stayed and the Studio kept running. The wrapper now traps
+`EXIT/HUP/INT/TERM`, deletes the tree unless `--keep-remote`, and documents
+`setsid nohup spectre-offload …` for builds that may outlive the caller.
+`--prune-caches` drops the build caches too (slower next build); `--studio-report`
+prints the audit fields (`home_used`, `free`, `offload_trees`, `cache_mb`,
+`uptime_s`, `boot`, `lifecycle`).
+
+## The 4-hour cap: documented, and staged for measurement
+
+The only statement found is the pricing footnote: "Free Studios run 24/7 but
+require restart every 4 hours. No restrictions in Pro or higher." The API does
+not expose it (`V1CloudSpace.max_run_duration = 0`, `operating_cost` empty). So
+the platform's behaviour is being observed rather than assumed: the Studio now
+carries `~/.lightning_studio/on_start.sh` (appends a line at every launch) plus a
+bounded 6 h heartbeat that records `uptime -s` every 5 minutes, and the box has a
+one-off `systemd-run --user --on-active=4h15m` check writing
+`~/.local/state/remote-agent/studio-cap-check.log`. A new `boot=` line, a gap in
+the heartbeat, or a `Running` status with a small `uptime_s` answers
+auto-vs-manual relaunch. Result goes into RUNBOOK §7.21.
+
 ## Not verified, and what is left
 
 - **Lightning:** whether the free Studio actually accrues no credits (check the
-  billing UI), the 4-hour cap's behaviour against an in-flight build, and
-  `sandbox`/`job` billing. The full integration suite that cost the box 11 h has
-  not been run in the Studio, so its duration there is unknown.
+  billing UI), the 4-hour cap's behaviour against an in-flight build (staged
+  above), and `sandbox`/`job` billing. The full integration suite that cost the
+  box 11 h has not been run in the Studio, so its duration there is unknown.
 - **Battery/EC heat** is outside the guard's view: no charge-threshold node on
   this EC (100 % on AC) and no fan tachometer, so a mechanical fan fault or
   battery heat would look normal. Physical checks stay the operator's.
