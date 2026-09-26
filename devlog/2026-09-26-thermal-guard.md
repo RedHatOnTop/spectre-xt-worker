@@ -311,3 +311,30 @@ HEAD script, the four new behaviours fail and the three earlier tests pass:
 - the setup message is not waited out.
 
 All seven pass on the changed script.
+
+## A signal ends an offload at once — 2026-09-27
+
+The trap was `trap 'cleanup_remote; stop_studio' EXIT HUP INT TERM`. A trapped
+HUP, INT or TERM ran the cleanup and then resumed the script, which went on
+with remote calls against a Studio it had just released. It also printed a
+verdict. The read-only review of 2026-09-27 found this. The problem predates
+this session, but it now releases leases, so it mattered more. EXIT keeps the
+cleanup, and each signal now exits with 128 plus the signal number (129, 130,
+143), which runs the EXIT trap once. A new test sends SIGTERM to the process
+group during the remote command. It expects exit 143 at once, no verdict, no
+later `du -sb`, one Studio stop and an empty lease directory.
+
+Verification: `verify.sh` ran through the working-tree `spectre-offload` for
+`git archive 22cc27e` and for the same tree plus the six changed files. Both
+trees gave the same gate results, apart from unit tests going from 550 to 553
+run, with the same one known Studio failure. Against the HEAD tree the three
+new tests fail:
+
+- the retried confirm raises `ValueError: seat_owned_by_claude`;
+- the dry run gives `{'worker': 'minecraft', 'action': 'plan'}` instead of the
+  occupancy skip;
+- the terminated offload prints `{"ok":false,"exit":143,…}` after its cleanup.
+
+The Claude, handoff-runtime, offload and control-plane suites pass on the
+change (79 tests). The run itself ended with `leaving Studio buildbox running:
+it was already up when this offload began`.

@@ -2,8 +2,10 @@
 that a lease started, with the last lease."""
 import os
 from pathlib import Path
+import signal
 import subprocess
 import tempfile
+import time
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -117,6 +119,22 @@ class OffloadStopTest(unittest.TestCase):
         probes = [line for line in self.log.read_text().splitlines() if 'spectre-ready' in line]
         self.assertEqual(len(probes), 2)
         self.assertEqual(len(self.stops()), 1)
+
+    def test_a_terminated_run_exits_at_once_and_releases_the_studio(self):
+        self.ssh('case "${!#}" in *"cd "*) sleep 30 ;; esac\nexit 0')
+        proc = subprocess.Popen(['bash', str(SCRIPT), '--repo', str(self.repo), '--', 'true'],
+                                env=self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                text=True, start_new_session=True)
+        deadline = time.monotonic() + 15
+        while ' && ' not in self.log.read_text() and time.monotonic() < deadline:
+            time.sleep(0.1)
+        os.killpg(proc.pid, signal.SIGTERM)
+        stdout, stderr = proc.communicate(timeout=30)
+        self.assertEqual(proc.returncode, 143, stderr)
+        self.assertEqual(stdout, '')
+        self.assertNotIn('du -sb', self.log.read_text())
+        self.assertEqual(len(self.stops()), 1)
+        self.assertEqual([path.name for path in self.leases().iterdir()], ['.lock'])
 
     def test_keep_and_the_report_leave_the_studio_alone(self):
         self.ssh('exit 0')

@@ -11,7 +11,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 from tests import test_control_plane as fixtures
-from control_plane import astra, cli, cline_free, providers, seat
+from control_plane import astra, cli, cline_free, providers, runtime, seat
 from control_plane.io import locked, read_json, write_json
 
 
@@ -167,6 +167,20 @@ class HandoffRuntimeTest(unittest.TestCase):
                 self.assertEqual(result['actions'][0]['reason'], reason)
                 self.assertFalse(any('--dispatch' in command for command in self.sent))
                 self.assertEqual(self.client.snapshot('minecraft')['goal']['state'], 'COMPLETED')
+
+    def test_dry_run_skips_occupancy_like_the_live_tick(self):
+        class Recovering:
+            def snapshot(self, worker):
+                return {'goal': {'state': 'COMPLETED'},
+                        'policy': {'grokbot_may_advance': True, 'continuity_recovery_allowed': True}}
+
+        for dry in (True, False):
+            with self.subTest(dry=dry):
+                result = runtime.tick({'minecraft': self.entry}, Recovering(), self.path, self.env,
+                                      now=fixtures.NOW, dry=dry, run=self.run_command)
+                self.assertEqual(result['actions'][0],
+                                 {'worker': 'minecraft', 'action': 'skip', 'reason': 'occupancy'})
+        self.assertEqual(self.sent, [])
 
     def test_dry_run_reports_the_seat_verdict(self):
         fixtures.completed(self.store)

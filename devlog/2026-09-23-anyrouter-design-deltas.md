@@ -1462,3 +1462,44 @@ change gave the same gate results (546 unit tests, the same one known Studio
 failure). The extended test fails on HEAD (`('sit', 1) != ('escalate', 2)`).
 The nine Claude tests pass on the change. This logic-only change was not run
 separately on Spectre.
+
+## Findings from a read-only review — 2026-09-27
+
+A read-only reviewer went over the Claude launcher, the loop gates and the
+offload leases. Its two control-plane findings are fixed here.
+
+**A confirm that failed after the seat commit could not be finished.**
+`confirm` commits the seat, then writes the registry pin, then clears
+`claude_handoff`. If either write failed, the call reported the error with
+`seat_committed: true`, but a second `confirm` was refused with
+`seat_owned_by_claude`. The seat said Claude, while the pin, or the pending
+handoff, still said otherwise. A retried `confirm` now resumes. It does so when
+the seat is Claude with the same terminal and the pending handoff names that
+terminal. It skips the seat commit and the daily cap, and it writes the pin and
+clears the pending handoff (`"resumed": true`). `kimi.confirm()` has the same
+gap and is left open. Its `context()` requires a `kimi_free` selection fresh
+within 600 s, so a resume minutes later would need its own rules.
+
+**The dry run lacked the occupancy skip.** `live_tick()` skips a worker whose
+goal is `UNKNOWN` or whose policy allows continuity recovery, before any
+planning. `dry_action()` went straight to the advance check. The policy module
+happens never to allow both recovery and an advance at once, which hid this.
+The dry run now skips `occupancy` first, as the live tick does. The
+`UNKNOWN` fixture default now reports `occupancy` instead of the goal state.
+
+The third finding, the offload trap, is in `devlog/2026-09-26-thermal-guard.md`.
+
+Verification: `verify.sh` ran through the working-tree `spectre-offload` for
+`git archive 22cc27e` and for the same tree plus the six changed files. Both
+trees gave the same gate results, apart from unit tests going from 550 to 553
+run, with the same one known Studio failure. Against the HEAD tree the three
+new tests fail:
+
+- the retried confirm raises `ValueError: seat_owned_by_claude`;
+- the dry run gives `{'worker': 'minecraft', 'action': 'plan'}` instead of the
+  occupancy skip;
+- the terminated offload prints `{"ok":false,"exit":143,…}` after its cleanup.
+
+The Claude, handoff-runtime, offload and control-plane suites pass on the
+change (79 tests). The run itself ended with `leaving Studio buildbox running:
+it was already up when this offload began`.

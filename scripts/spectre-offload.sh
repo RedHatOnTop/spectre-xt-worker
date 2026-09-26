@@ -171,7 +171,11 @@ stop_studio() {
   note "stopping Studio ${STUDIO}"
   "${LIGHTNING_BIN}" studio stop --name "${STUDIO}" --teamspace "${TEAMSPACE}" >&2 || true
 }
-trap 'cleanup_remote; stop_studio' EXIT HUP INT TERM
+trap 'cleanup_remote; stop_studio' EXIT
+# A trapped signal would otherwise resume the script after the cleanup; exiting runs it.
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 if ((REPORT == 1)); then
   status="$(studio_status)"

@@ -60,6 +60,8 @@ def escalation(worker, ws, reason, run, env):
 
 def dry_action(worker, entry, snapshot, env, path, now):
     policy = snapshot.get('policy', {})
+    if snapshot.get('goal', {}).get('state') == 'UNKNOWN' or policy.get('continuity_recovery_allowed'):
+        return {'worker': worker, 'action': 'skip', 'reason': 'occupancy'}
     planner = entry.get('planner')
     if planner and not enabled(env, 'ASTRA_ENABLED'):
         return {'worker': worker, 'action': 'skip', 'reason': 'planner_pin'}

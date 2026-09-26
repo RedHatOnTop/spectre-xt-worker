@@ -4,6 +4,7 @@ from __future__ import annotations
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from tests import test_control_plane as fixtures
 from control_plane import claude, runtime, seat
@@ -112,6 +113,34 @@ class ClaudeHandoffTest(unittest.TestCase):
                          {'terminal': 'term_claude', 'harness': 'claude',
                           'model': 'claude-opus-5-5', 'provider': 'claude-max'})
         self.assertIsNone(self.pending())
+
+    def prompted(self):
+        self.step('launch')
+        self.running()
+        self.step('send_prompt', 'term_claude', observed_input=True, now=fixtures.NOW + 1)
+
+    def test_a_confirm_that_fails_after_the_seat_commit_is_finished_by_confirming_again(self):
+        failures = (('control_plane.claude.kimi.set_planner', 'registry_update_failed'),
+                    ('control_plane.claude.write_json', 'loop_state_update_failed'))
+        for target, error in failures:
+            with self.subTest(error=error):
+                self.tearDown()
+                self.setUp()
+                self.prompted()
+                with patch(target, side_effect=OSError('disk full')):
+                    failed = self.step('confirm', 'term_claude', observed_ready=True,
+                                       now=fixtures.NOW + 2)
+                self.assertEqual((failed['error'], failed['seat_committed']), (error, True))
+                self.assertEqual(seat.load(seat.seat_path(self.root))['owner'], 'claude')
+
+                again = self.step('confirm', 'term_claude', observed_ready=True, now=fixtures.NOW + 3)
+
+                self.assertEqual(again, {'ok': True, 'owner': 'claude', 'terminal': 'term_claude',
+                                         'resumed': True})
+                self.assertEqual(read_json(self.workers)['workers']['minecraft']['planner']['harness'],
+                                 'claude')
+                self.assertIsNone(self.pending())
+                self.assertEqual(seat.load(seat.seat_path(self.root))['handoff_count'], 1)
 
     def test_dry_run_creates_nothing(self):
         result = self.step('launch', dry=True)

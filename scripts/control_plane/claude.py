@@ -35,7 +35,7 @@ def cold_start_prompt(root: Path) -> str:
 
 
 def context(workers_file: Path, loop_state: Path, seat_root: Path, client, now: float,
-            env: dict) -> dict:
+            env: dict, resume: str | None = None) -> dict:
     if not seat_root.is_absolute():
         raise ValueError('SPECTRE_SEAT_ROOT must be absolute')
     if not runtime.enabled(env, 'SPECTRE_CLAUDE_ENABLED'):
@@ -53,12 +53,16 @@ def context(workers_file: Path, loop_state: Path, seat_root: Path, client, now: 
     if goal in {'UNKNOWN', 'ASSIGNING'} or ws.get('planning'):
         raise ValueError('planner_request_in_flight')
     current = seat.load(seat.seat_path(seat_root))
-    if current['owner'] == seat.OWNER_CLAUDE:
+    # A confirm that committed the seat and then failed to write the pin or the loop
+    # state is finished by confirming the same terminal again.
+    resumed = (resume is not None and current['owner'] == seat.OWNER_CLAUDE
+               and current.get('terminal') == resume and pending.get('terminal') == resume)
+    if current['owner'] == seat.OWNER_CLAUDE and not resumed:
         raise ValueError('seat_owned_by_claude')
-    if not seat.can_handoff(current, now)[0]:
+    if not resumed and not seat.can_handoff(current, now)[0]:
         raise ValueError('handoff_day_cap')
     return {'entry': entry, 'state': state, 'ws': ws, 'pending': pending, 'seat': current,
-            'snapshot': snapshot}
+            'snapshot': snapshot, 'resumed': resumed}
 
 
 def loop_worker(loop_state: Path) -> tuple[dict, dict, dict]:
@@ -170,21 +174,22 @@ def confirm(workers_file: Path, loop_state: Path, seat_root: Path, client, handl
     now = time.time() if now is None else now
     env = dict(os.environ) if env is None else env
     with locked(loop_state.with_suffix('.lock')):
-        info = context(workers_file, loop_state, seat_root, client, now, env)
+        info = context(workers_file, loop_state, seat_root, client, now, env, resume=handle)
         pending = info['pending']
         if pending.get('terminal') != handle or not pending.get('prompt_sent_at'):
             raise ValueError('prompted Claude terminal required')
         if not kimi.live_terminal(kimi.orca_terminals(run), scan(), info['entry']['cwd'],
                                   handle, 'claude'):
             return {'ok': False, 'error': 'claude_terminal_unconfirmed'}
-        updated = seat.transition(info['seat'], now, to=seat.OWNER_CLAUDE,
-                                  brief=pending.get('brief') or str(seat.brief_path(seat_root)))
-        if not updated['ok']:
-            return updated
-        committed = seat.commit_if_current(seat.seat_path(seat_root), info['seat'],
-                                           {**updated['seat'], 'terminal': handle})
-        if not committed['ok']:
-            return committed
+        if not info['resumed']:
+            updated = seat.transition(info['seat'], now, to=seat.OWNER_CLAUDE,
+                                      brief=pending.get('brief') or str(seat.brief_path(seat_root)))
+            if not updated['ok']:
+                return updated
+            committed = seat.commit_if_current(seat.seat_path(seat_root), info['seat'],
+                                               {**updated['seat'], 'terminal': handle})
+            if not committed['ok']:
+                return committed
         try:
             kimi.set_planner(workers_file, {'terminal': handle, 'harness': seat.OWNER_CLAUDE,
                                             'model': MODEL, 'provider': PROVIDER})
@@ -196,7 +201,8 @@ def confirm(workers_file: Path, loop_state: Path, seat_root: Path, client, handl
         except OSError:
             return {'ok': False, 'error': 'loop_state_update_failed',
                     'seat_committed': True, 'terminal': handle}
-        return {'ok': True, 'owner': seat.OWNER_CLAUDE, 'terminal': handle}
+        return {'ok': True, 'owner': seat.OWNER_CLAUDE, 'terminal': handle,
+                **({'resumed': True} if info['resumed'] else {})}
 
 
 def cancel(loop_state: Path, *, observed_closed=False, scan=inventory.scan) -> dict:
