@@ -367,6 +367,43 @@ for ws_legacy in qoder-nudge.timer qoder-continuity.timer \
     ok "${ws_legacy} disabled"
   fi
 done
+
+echo "== thermal / compile-farm guard (RUNBOOK 7.20) =="
+if [[ -x /usr/local/bin/spectre-thermal-guard ]]; then
+  ok "spectre-thermal-guard installed"
+  tg_timer="$(RUN_AS_USER systemctl --user is-enabled spectre-thermal-guard.timer 2>/dev/null || true)"
+  if [[ "${tg_timer}" == "enabled" ]]; then
+    check_cmd "spectre-thermal-guard.timer active (user unit)" "$(declare -f RUN_AS_USER); RUN_AS_USER systemctl --user is-active spectre-thermal-guard.timer 2>/dev/null | grep -qx active"
+  else
+    bad "spectre-thermal-guard.timer not enabled — compile-farm work is unguarded (RUNBOOK 7.20)"
+  fi
+  # Run as the agent user: as root the guard would sample root's /proc and state.
+  tg_probe="$(RUN_AS_USER env HOME="${TARGET_HOME}" /usr/local/bin/spectre-thermal-guard --check 2>/dev/null || true)"
+  tg_level="$(printf '%s' "${tg_probe}" | python3 -c "import json,sys; print(json.load(sys.stdin).get('level') or '')" 2>/dev/null || true)"
+  tg_temp="$(printf '%s' "${tg_probe}" | python3 -c "import json,sys; print(json.load(sys.stdin).get('temp_c') or '')" 2>/dev/null || true)"
+  if [[ -z "${tg_probe}" || -z "${tg_level}" ]]; then
+    bad "spectre-thermal-guard --check produced no readable status"
+  elif [[ "${tg_level}" == "ok" ]]; then
+    ok "thermal guard ok (package ${tg_temp}C)"
+  elif [[ "${tg_level}" == "unknown" ]]; then
+    warn "thermal guard cannot read a package temperature sensor"
+  else
+    bad "thermal guard level=${tg_level} (package ${tg_temp}C) — inspect ~/.local/state/remote-agent/thermal.jsonl"
+  fi
+  tg_log="${TARGET_HOME}/.local/state/remote-agent/thermal.jsonl"
+  if [[ -f "${tg_log}" ]]; then
+    tg_age=$(( $(date +%s) - $(stat -c %Y "${tg_log}" 2>/dev/null || echo 0) ))
+    if (( tg_age <= 300 )); then
+      ok "thermal sample ${tg_age}s old"
+    else
+      bad "thermal sample stale (${tg_age}s) — timer not sampling (RUNBOOK 7.20)"
+    fi
+  else
+    bad "no thermal sample log at ${tg_log} (RUNBOOK 7.20)"
+  fi
+else
+  bad "spectre-thermal-guard not installed — build-class work is unguarded (RUNBOOK 7.20)"
+fi
 ws_gs="$(RUN_AS_USER systemctl --user is-enabled goal-supervisor.timer 2>/dev/null || true)"
 if [[ "${ws_gs}" == "enabled" ]]; then
   bad "goal-supervisor.timer enabled — Grok CLI supervisor stays installed-off (control plane)"
