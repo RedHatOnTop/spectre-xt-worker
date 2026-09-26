@@ -297,3 +297,40 @@ Verification:
 - Spectre deploy 00:34 KST: clean stop (`SIGTERM received` → `exiting with
   code 0`), daemon 2796 preserved with 26 live sessions, 26/26 terminals
   after, `NRestarts=0`, web-index 200, the ADE client reconnected.
+
+### First live ptyResize data: tab switches shrink agent PTYs to 80x24
+
+Within minutes of the operator reconnecting (00:35-00:44 KST), the journal
+showed the same pattern on every terminal the ADE client opened and then left:
+
+```
+ptyResize {"sessionIdSuffix":"@@3f4d4deb","from":null,"to":"149x55","kind":"remote-desktop","owner":"multiplex:953506ff08500055:5","seq":1}
+ptyResize {"sessionIdSuffix":"@@3f4d4deb","from":"149x55","to":"80x24","kind":"desktop","seq":2}
+```
+
+Five sessions were claimed to the client's 149x55 and then reclaimed to
+**80x24** 1-7 s later, when the viewer moved on. Mechanism, from the code:
+
+- `getTerminalSize` is `ptyController.getSize`, which serve only knows for
+  PTYs it spawned itself (`@@Omj_DvqQ`, spawned at 00:38, logged
+  `from:"120x40"`). For sessions re-attached from the preserved daemon after
+  a serve restart it is `null` (`from:null` above).
+- On a first claim, `RemoteDesktopTerminalFloor` records the host reclaim
+  target via `resolveDesktopRestoreTarget`: mobile baseline (none) → last
+  renderer size (no renderer in serve) → current size (`null`) → the hard
+  default `{80,24}`, which upstream's comment says is "reached only under
+  bug". In serve it is reached for every re-attached PTY.
+- When the last viewer leaves, the floor resizes the PTY to that target.
+
+So every visit to an agent tab costs two full TUI reflows (149 → 80 → 149).
+The time at 80 columns also leaves output wrapped at 80 in scrollback. The
+80x24 `qodercli` PTYs seen on the box earlier fit this. This is the strongest
+candidate so far for the "stale screen remnants" report: Ink-style TUIs erase
+their previous frame by line count, and a width change rewraps that frame.
+It is not proven to be the cause, but the resize churn itself is now
+observed, not inferred.
+
+Candidate patch 10 (not written): in serve there is no host display to give
+width back to, so when the last remote viewer leaves, keep the PTY at the
+viewer's size instead of reclaiming. Alternative: seed the re-attached
+PTY's real size from the daemon so the reclaim target is at least not 80x24.
