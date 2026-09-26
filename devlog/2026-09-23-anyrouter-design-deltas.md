@@ -540,3 +540,131 @@ Still open after this slice:
 - The other open items of the P2 first slice stand.
 
 Still not deployed.
+
+## Tab records, the listener guard and null titles — 2026-09-25/26
+
+Three commits close the title item above and the first two things that stopped
+the reaper from producing any output on Spectre.
+
+**`2afa98d` — a tab is owned by its create-time record.** Every tab the bridge
+creates is written as `<packet_dir>/tabs/<handle>.json` (role, kind,
+`dispatch_id`, cwd, `worktree_id`, `created_at`, mode 600), and that record is
+the only ownership evidence tidy accepts. `ensurePacketPin()` reuses the newest
+live recorded shell for the same role and cwd, so a missing registry pin no
+longer creates a shell per dispatch. The record directory is checked before the
+create, and a record that cannot be saved closes the tab it describes. A failed
+`persistWorkersPin()` is audited as `dispatch_pin_persist_failed` instead of
+being dropped. The reaper closes recorded job tabs whose `.exit` sidecar is past
+the grace window, and retires records whose tab has left a non-truncated
+listing. A failed close now carries an error, so `ok` reports it.
+
+Smoke on Spectre against the live Orca, packet dir `/tmp/tabrec-smoke-6a6k6p`:
+
+```
+first {"ok":true,"created":true,"handle":"term_7cec49c2-…"}
+record {"role":"flash","kind":"shell","dispatch_id":null,
+        "cwd":"/home/person/Projects/minecraft-server-project",
+        "worktree_id":"bbc15fac-…::/home/person/Projects/minecraft-server-project",…} mode 600
+row {"connected":true,"writable":true,"titleStillFlashPackets":false}
+second {"ok":true,"created":false,"sameHandle":true}
+closed true
+listed_after_close false
+```
+
+The second `ensurePacketPin()` reused the recorded shell even though its title
+had already been replaced. A `tidy.sweep()` dry-run over the same listing
+(47 of 47 tabs, `truncated: false`) saw the one record and selected nothing for
+closing at the default grace.
+
+**`827c65f` — root's listeners no longer block the reaper.** Run as a user
+unit, `ss -ltnpH` cannot name root's listeners: 10 of Spectre's 21 (sshd,
+tailscaled, cups, cockpit) lack `pid=`, so every run refused with
+`listener ownership incomplete; refusing reap` before any decision or sweep.
+The reaper now reads `ss -ltnpeH`, which prints no `uid:` for root. Only this
+uid's unattributed listeners refuse. A refusal skips process reaping alone: the
+tab sweep still runs, and the error names the listeners.
+
+**`d7f43e9` — an unreported title is no evidence.** Spectre's Orca lists 46 of
+47 tabs with `title: null`. `terminal.get('title', '')` returned `None` for
+those, and `startswith` raised `AttributeError`, so the first live run past the
+listener guard died without printing JSON. Only a reported string title can
+mark a shell untitled now; a null or missing one keeps the shell.
+
+Gates, local and then from `git archive <rev>` staged on Spectre:
+
+| Rev | Local | Spectre staged |
+| --- | --- | --- |
+| `2afa98d` | bridge 77, devcodex 77, `Ran 481 tests` | bridge 77, devcodex 77, `Ran 463 tests` |
+| `827c65f` | `Ran 484 tests` | bridge 77, devcodex 77, `Ran 466 tests` |
+| `d7f43e9` | not run | bridge 77, devcodex 77, `Ran 467 tests` |
+
+Each staged run ended `verify: all gates passed` with `SKIP shellcheck not
+installed`. The local count again includes `tests/test_relay_probe.py`.
+
+### The first full dry-run shows the reaper is not safe to enable
+
+With both guards fixed, a dry-run from an ssh shell on Spectre (`d7f43e9`,
+`--state` in `/tmp/reaper-smoke-oOFCqn`) produced the first complete decision
+set: 185 processes, 172 `keep` and **13 `term`**. Every one of the 13 was
+something the operator wants running:
+
+| Class | Processes | Rule that fired |
+| --- | --- | --- |
+| Live agent sessions | `cline`, `codex` ×2, `claude`, `qodercli` | RSS ≥ 256 MiB or `duplicate` |
+| Game servers | `java` on 42571; `sh` + `java` on 25566 | listening port |
+| Podman forwarders | `pasta` on 5432 and 15433, no Orca handle | listening port |
+| A dev preview | `npm`/`sh`/`vite` on 5180, no Orca handle | listening port |
+
+The rules are generic hygiene heuristics (a listening port, RSS above a limit,
+a second agent in a registered cwd), and on a box where people run things they
+match whatever is running. Apart from the fixed allow-lists, the guard meant
+to exempt live work is `protected`, and it points the wrong way.
+
+`protected` walks each process's ancestry to `roots = {getpid(), getppid()}`
+plus the registered tmux panes. From an ssh shell, `getppid()` is that shell,
+which protects almost nothing. Under the transient user unit the timer would
+use, `getppid()` is the user manager (`systemd --user`, pid 1408), which is an
+ancestor of nearly every user process. A check of the 13 candidates inside
+such a unit found 10 alive under 1408, protected, the two `pasta`
+forwarders outside it, so still `term`, and `cline` already gone. The same guard therefore protects
+nearly everything in one context and nearly nothing in the other, and in
+neither does it track what the control plane actually owns.
+
+The unit run itself (`/tmp/reaper-unit-QhVKAC`) ended before any decision:
+
+```
+UNIT_EXIT=1
+{"ok": false, "error": "Orca inventory unavailable; refusing reap"}
+```
+
+It printed nothing on stderr. `orca-ide terminal list --json` run directly in
+a unit with the same properties succeeded three times, so the cause is still
+unknown. The message drops `run()`'s own error, which is the first thing to
+fix.
+
+### Deployment state and what it means for this slice
+
+`devlog/2026-09-26-control-plane-deploy.md` records the first deploy of the
+control plane to Spectre, at `d7f43e9`, which replaces the "Still not deployed"
+lines above. For the reaper this means:
+
+- `/usr/local/bin/spectre-reaper` is byte-identical to `scripts/spectre-reaper.py`
+  at `d7f43e9`, the unscoped version described here.
+- `spectre-reaper.timer` (`OnBootSec=180s`, `OnUnitActiveSec=5min`) is
+  installed and **disabled**, as are the loop, pin-sync and provider-health
+  timers.
+- Enabling it, or running the binary with `--apply` from a shell, would
+  terminate the processes in the table above. Both stay off until the reaper
+  terminates only what the control plane owns.
+
+Still open after this slice:
+
+- Ownership scoping (next slice): `term` only for a process whose Orca handle
+  has a tab record or a registry pin; everything else is kept regardless of
+  port, RSS or duplicate. `protected` becomes the reaper's own ancestor chain
+  plus the tmux panes instead of the `getppid()` subtree.
+- The Orca-unavailable refusal must carry `run()`'s error.
+- Processes started by a tab whose record was retired lose their owner and are
+  kept. That is the intended failure direction.
+- The 24 idle minecraft shells remain open, and no creator other than the bridge
+  (Astra, Kimi) writes tab records yet.
