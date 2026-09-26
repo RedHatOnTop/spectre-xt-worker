@@ -74,8 +74,11 @@ def loop_worker(loop_state: Path) -> tuple[dict, dict, dict]:
 
 
 def remember(loop_state: Path, info: dict, pending: dict | None) -> None:
-    write_json(loop_state, runtime.worker_state(info['state'], 'minecraft',
-                                               {**info['ws'], 'claude_handoff': pending}))
+    ws = {**info['ws'], 'claude_handoff': pending}
+    if pending is None and ws.get('notified') == 'claude_handoff_stale':
+        # Escalations are deduplicated on `notified`; the next abandoned handoff must alert.
+        ws = {**ws, 'notified': None}
+    write_json(loop_state, runtime.worker_state(info['state'], 'minecraft', ws))
 
 
 def launch(workers_file: Path, loop_state: Path, seat_root: Path, client, *, now=None,

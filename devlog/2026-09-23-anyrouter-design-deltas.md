@@ -1449,3 +1449,16 @@ HEAD tree (`module 'control_plane.runtime' has no attribute
 'CLAUDE_HANDOFF_STALE'`, `module 'control_plane.claude' has no attribute
 'cancel'`). The Claude, handoff-runtime and control-plane suites pass on the
 changed tree (69 tests).
+
+### The next abandoned handoff alerts too — 2026-09-27
+
+Escalations are deduplicated on `ws.notified`, and only a finished plan clears
+it. After `cancel`, a second handoff that went stale before any plan finished
+therefore sat silently (`('sit', 1)` on the old code). `claude.remember()` now
+clears a `claude_handoff_stale` marker whenever it clears the pending handoff,
+on `cancel` and on `confirm`. The stale test extends to cancel, go stale again,
+and expect a second alert. `verify.sh` on `git archive bba1067` and on the
+change gave the same gate results (546 unit tests, the same one known Studio
+failure). The extended test fails on HEAD (`('sit', 1) != ('escalate', 2)`).
+The nine Claude tests pass on the change. This logic-only change was not run
+separately on Spectre.

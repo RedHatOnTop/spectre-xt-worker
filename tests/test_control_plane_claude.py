@@ -205,6 +205,15 @@ class ClaudeHandoffTest(unittest.TestCase):
         self.assertEqual(len(sent), 1)
         self.assertFalse(any('--dispatch' in argv for argv in sent))
 
+        write_json(self.loop, state)
+        self.assertTrue(claude.cancel(self.loop, observed_closed=True, scan=lambda: [])['ok'])
+        stale_again = {**read_json(self.loop)['workers']['minecraft'], 'claude_handoff': {
+            'terminal': 'term_claude_2', 'launched_at': fixtures.NOW}}
+        _, third = runtime.start_plan(
+            'minecraft', entry, snapshot, runtime.worker_state(read_json(self.loop), 'minecraft', stale_again),
+            self.loop, self.client, {}, fixtures.NOW + runtime.CLAUDE_HANDOFF_STALE + 1, notify)
+        self.assertEqual((third['action'], len(sent)), ('escalate', 2))
+
     def test_cancel_drops_an_abandoned_handoff_once_claude_is_gone(self):
         with self.assertRaisesRegex(ValueError, 'observed-closed'):
             claude.cancel(self.loop)
