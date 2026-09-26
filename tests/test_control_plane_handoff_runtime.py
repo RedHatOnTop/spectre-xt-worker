@@ -132,14 +132,14 @@ class HandoffRuntimeTest(unittest.TestCase):
         self.assertEqual(self.tick(now=fixtures.NOW + 60)['actions'][0]['action'], 'plan')
         self.assertEqual(len([c for c in self.sent if '--dispatch' in c]), 1)
 
-    def test_claude_seat_outlasts_one_anyrouter_edge_window(self):
+    def test_claude_seat_plans_on_max_with_a_long_assignment_timeout(self):
         fixtures.completed(self.store)
         write_json(seat.seat_path(self.root), {**seat.default_state(), 'owner': 'claude'})
         self.entry = {**self.entry, 'planner': {'terminal': 'term_claude', 'harness': 'claude'}}
 
         self.assertEqual(self.tick()['actions'][0]['action'], 'plan')
         state = read_json(self.path)
-        self.assertEqual(state['plans'][-1]['provider'], 'anyrouter')
+        self.assertEqual(state['plans'][-1]['provider'], 'claude-max')
         self.assertEqual(state['workers']['minecraft']['planning']['timeout'], 900)
         self.assertEqual(self.tick(now=fixtures.NOW + 301)['actions'][0]['action'], 'waiting')
         self.assertEqual(self.client.snapshot('minecraft')['goal']['state'], 'ASSIGNING')

@@ -20,9 +20,9 @@ class InstallTest(unittest.TestCase):
                                     env=env, cwd=tmp, capture_output=True, text=True)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             binaries = root / 'usr/local/bin'
-            for command in ('spectre-loop', 'spectre-state', 'spectre-astra', 'spectre-reaper',
-                            'spectre-pin-sync', 'spectre-codex-provider-health', 'dsh-clinepass',
-                            'mimo-clinepass'):
+            for command in ('spectre-loop', 'spectre-state', 'spectre-astra', 'spectre-claude',
+                            'spectre-reaper', 'spectre-pin-sync', 'spectre-codex-provider-health',
+                            'dsh-clinepass', 'mimo-clinepass'):
                 help_ = subprocess.run([str(binaries / command), '--help'], env=env,
                                        cwd=tmp, capture_output=True, text=True)
                 self.assertEqual(help_.returncode, 0, command + ': ' + help_.stderr)
@@ -30,6 +30,13 @@ class InstallTest(unittest.TestCase):
                                       capture_output=True, text=True)
             self.assertEqual(disabled.returncode, 0, disabled.stdout + disabled.stderr)
             self.assertTrue(json.loads(disabled.stdout)['disabled'])
+            claude_env = {key: value for key, value in env.items()
+                          if key != 'SPECTRE_CLAUDE_ENABLED'}
+            claude_off = subprocess.run([str(binaries / 'spectre-claude'), 'launch', '--dry-run'],
+                                        env=claude_env, cwd=tmp, capture_output=True, text=True)
+            self.assertEqual(claude_off.returncode, 1, claude_off.stdout + claude_off.stderr)
+            self.assertEqual(json.loads(claude_off.stdout),
+                             {'ok': False, 'error': 'SPECTRE_CLAUDE_ENABLED is off'})
             watchdog = subprocess.run([str(binaries / 'spectre-worker-state-watchdog')],
                                       env=env, cwd=tmp, capture_output=True, text=True)
             self.assertEqual(watchdog.returncode, 0, watchdog.stdout + watchdog.stderr)

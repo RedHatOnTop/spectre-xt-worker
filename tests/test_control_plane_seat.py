@@ -83,7 +83,7 @@ class SeatLadderTest(unittest.TestCase):
         self.assertEqual(
             [(r['rank'], r['harness'], r['provider'], r['model'], r['wire_api'])
              for r in rows],
-            [(1, 'claude', 'anyrouter', 'claude-opus-5-5', 'messages'),
+            [(1, 'claude', 'claude-max', 'claude-opus-5-5', 'messages'),
              (2, 'codex', 'agentrouter', 'gpt-6-astra', 'responses'),
              (3, 'kimi', 'cline-free', 'cline-free/kimi-k3', 'chat'),
              (4, 'codex', 'openai', 'gpt-6-astra', 'responses')])
@@ -139,7 +139,7 @@ class SeatLadderTest(unittest.TestCase):
         claude = seat.transition(state, now, to='claude', brief='brief.md')
         self.assertTrue(claude['ok'])
         self.assertEqual((claude['seat']['model'], claude['seat']['provider_chain']),
-                         ('claude-opus-5-5', ['anyrouter']))
+                         ('claude-opus-5-5', ['claude-max']))
         kimi = seat.transition(state, now, to='kimi', brief='brief.md')
         self.assertEqual((kimi['seat']['model'], kimi['seat']['provider_chain']),
                          ('cline-free/kimi-k3', ['cline-free']))

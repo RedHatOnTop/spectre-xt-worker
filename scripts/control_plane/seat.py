@@ -31,13 +31,14 @@ WIRE_APIS = frozenset({'messages', 'responses', 'chat'})
 
 # Operator-locked routing policy, best seat first. `harness` names the client
 # that must run for that model; `wire_api` is the surface that harness uses.
-# Rank 1 is Claude Opus 5.5 on anyrouter's Anthropic surface, which additionally
-# requires the 1M-context beta. Ranks 2 and 4 share the Codex harness, so moving
-# between them is a native resume. This constant is validated by
+# Rank 1 is Claude Opus 5.5 under the box's own Claude Code login, the Max
+# subscription (operator decision 2026-09-26; it was anyrouter's Anthropic
+# surface). Ranks 2 and 4 share the Codex harness, so moving between them is a
+# native resume. This constant is validated by
 # tests/test_control_plane_seat.py rather than at import time: a bad edit must
 # fail the gate, not take the control plane down at import.
 SEAT_LADDER = (
-    {'rank': 1, 'harness': OWNER_CLAUDE, 'provider': 'anyrouter',
+    {'rank': 1, 'harness': OWNER_CLAUDE, 'provider': 'claude-max',
      'model': 'claude-opus-5-5', 'wire_api': 'messages'},
     {'rank': 2, 'harness': OWNER_ASTRA, 'provider': 'agentrouter',
      'model': 'gpt-6-astra', 'wire_api': 'responses'},
@@ -50,8 +51,8 @@ SEAT_LADDER = (
 # Process role of each owner's planner, as inventory.model() and
 # scripts/dispatch-process.mjs name it. The three tables must agree.
 PLANNER_ROLES = {OWNER_ASTRA: 'astra', OWNER_CLAUDE: 'claude', OWNER_KIMI: 'kimi'}
-# anyrouter's edge answers 524 at ~301 s per request and prefill costs ~1 s per
-# 1k tokens, so a Claude plan needs more than one edge window.
+# An Opus planning turn over the whole worktree runs for minutes, well past the
+# 300 s the other planners get.
 PLAN_TIMEOUTS = {OWNER_CLAUDE: 900}
 
 

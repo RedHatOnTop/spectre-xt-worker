@@ -1305,3 +1305,94 @@ case has no worktree id, the implausible-total case has no `MAX_WORKTREES`, and
 the unregistered case gets `'orca_ps_truncated' != 'orca_worktree_unregistered'`.
 The new bridge test fails with `ok: false`. The Orca suite passes on the
 changed tree (11 tests).
+
+## The Claude seat launcher — 2026-09-26/27
+
+This slice closes the first P2 item, "Nothing moves the seat to Claude yet".
+The operator decided three things on 2026-09-26:
+
+- The Claude planner runs with `--dangerously-skip-permissions`, because it
+  runs unattended.
+- It uses the box's own Claude Code login, the Max subscription, instead of
+  anyrouter.
+- `ASTRA_ENABLED` stays the kill switch for every seat.
+
+**Ladder.** Rank 1 is now `(claude, claude-max, claude-opus-5-5, messages)`.
+The provider label is read only as the loop's plan ledger and the seat's
+`provider_chain`, so nothing else changes. `PLAN_TIMEOUTS` keeps 900 s for
+Claude. The anyrouter 524 window was the old reason. The new one is that an
+Opus planning turn over the whole worktree runs for minutes.
+
+**`spectre-claude`** (`control_plane/claude.py`) follows `spectre-kimi` step for
+step. Each step holds the loop lock.
+
+1. `launch` requires `SPECTRE_CLAUDE_ENABLED`, the minecraft planner entry, no
+   plan request in flight (goal not `ASSIGNING` or `UNKNOWN`, no loop
+   `planning`), a seat that is not already Claude, the daily handoff cap, no
+   planner process in the worktree, an Efficient pin, and a `claude`
+   executable on `PATH`. It writes the brief and creates the `claude-planner`
+   tab with `orca.create()`. The tab runs `exec <claude> --model
+   claude-opus-5-5 --dangerously-skip-permissions`. The step records the
+   handle under `claude_handoff` in the loop state. The executable is the
+   `claude` entry point itself, not the versioned file it links to, because
+   the planner's identity is the basename.
+2. `send-prompt --observed-input` types the cold-start prompt. It needs the
+   operator's word that the tab shows Claude's input box, because a fresh tab
+   can open on the workspace-trust or bypass-permissions dialog, and typed
+   text would answer it. It also needs exactly one `claude` process in that
+   tab.
+3. `confirm --observed-ready` commits the seat to Claude with that terminal.
+   It then writes the planner pin `{terminal, harness: claude, model:
+   claude-opus-5-5, provider: claude-max}` and clears `claude_handoff`.
+4. `release --observed-stopped` is `kimi.release()` with `owner='claude'`. It
+   moves the seat back to codex, clears the pin's terminal, and returns
+   `next: launch_astra`.
+
+Nothing in the loop requests this handoff. Claude is the best seat, so the
+operator starts it. The pending state lives under its own key because
+`planner_seat()` clears `handoff` whenever a relay is healthy. While
+`claude_handoff` is set, `start_plan()` and the dry run skip the worker with
+`claude_handoff_pending`. A plan requested after the old planner stopped would
+otherwise sit unanswered and block the confirm.
+
+Not verified on Spectre, because no Claude planner tab has been launched.
+Three questions stay open from P2: whether the Claude process in an Orca tab
+carries the tab's handle through its ancestors, whether the TUI submits on
+`orca-ide terminal send --enter`, and whether the dialogs above appear under
+this login. `live_terminal()` fails closed on the first: the prompt and the
+confirm refuse with `claude_terminal_unconfirmed`. RUNBOOK.md has no
+`spectre-claude` section yet. Another session is editing that file.
+
+### Verification
+
+`spectre-claude launch --dry-run` ran on Spectre from the working tree, with
+`SPECTRE_CLAUDE_ENABLED=1` and a scratch `--loop-state`, against the live
+registry, state service, seat root, `/proc` and Orca listing. It exited 0 with
+`{"command": "exec /home/person/.local/bin/claude --model claude-opus-5-5
+--dangerously-skip-permissions", "dry_run": true, "ok": true, "worktree":
+"/home/person/Projects/minecraft-server-project"}` and wrote only the scratch
+lock. It wrote no seat, brief or loop state. Without the gate it printed
+`{"error": "SPECTRE_CLAUDE_ENABLED is off", "ok": false}` and exited 1.
+
+`verify.sh` ran through `spectre-offload` for `git archive d87879c` and for
+the same tree plus the ten changed or new files. `spectre-claude` is not in
+`verify.sh`'s `py_compile` list, because another session is editing that file.
+It was compiled separately and passed.
+
+| Gate | HEAD `d87879c` | This slice |
+| --- | --- | --- |
+| `bash -n` | 32 ok | 32 ok |
+| shellcheck | SKIP, not installed | SKIP, not installed |
+| `py_compile` | ok | ok, and `spectre-claude` ok |
+| slack bridge, `node --test` | 80 pass | 80 pass |
+| devcodex, vendored | 69 pass, 8 fail | 69 pass, the same 8 fail |
+| unit tests | 534 run, 1 failure | 541 run, the same 1 failure |
+
+Against the HEAD tree the changed tests fail. `control_plane.claude` does not
+import, the staged install has no `spectre-claude`, and the ladder, the
+seat's `provider_chain` and the loop ledger still say `anyrouter`. The first
+Studio run of this slice had one error in the new test file. A refusal case
+built its planner row from the previous fixture's worktree, so the launch it
+meant to block succeeded (`KeyError: 'error'`). The row is now built inside the
+case, and the rerun above is clean. The Claude, seat, handoff-runtime, Kimi and
+install suites pass on the changed tree (63 tests).

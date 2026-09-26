@@ -65,6 +65,8 @@ def dry_action(worker, entry, snapshot, env, path, now):
         return {'worker': worker, 'action': 'skip', 'reason': snapshot.get('goal', {}).get('state')}
     if not planner:
         return {'worker': worker, 'action': 'goal'}
+    if read_json(path).get('workers', {}).get(worker, {}).get('claude_handoff'):
+        return {'worker': worker, 'action': 'skip', 'reason': 'claude_handoff_pending'}
     owner = seat.load(seat.seat_path(seat_root(path, env), worker))['owner']
     reason = pin_refusal(planner, owner)
     if not reason and owner == seat.OWNER_ASTRA:
@@ -160,6 +162,10 @@ def codex_gate(worker, entry, snapshot, state, path, env, now, run):
 
 
 def start_plan(worker, entry, snapshot, state, path, client, env, now, run):
+    # spectre-claude stops the old planner before it launches Claude; a plan requested
+    # meanwhile would sit unanswered and block the confirm.
+    if state.get('workers', {}).get(worker, {}).get('claude_handoff'):
+        return state, {'worker': worker, 'action': 'skip', 'reason': 'claude_handoff_pending'}
     planner = entry.get('planner', {})
     owner = seat.load(seat.seat_path(seat_root(path, env), worker))['owner']
     refusal = pin_refusal(planner, owner)

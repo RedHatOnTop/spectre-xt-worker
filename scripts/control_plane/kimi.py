@@ -271,7 +271,7 @@ def confirm(workers_file: Path, provider_state: Path, loop_state: Path,
 
 def release(workers_file: Path, provider_state: Path, loop_state: Path,
             seat_root: Path, *, observed_stopped=False, now=None,
-            scan=inventory.scan) -> dict:
+            scan=inventory.scan, owner=seat.OWNER_KIMI) -> dict:
     if not observed_stopped:
         raise ValueError('explicit observed-stopped confirmation required')
     if not seat_root.is_absolute():
@@ -293,7 +293,7 @@ def release(workers_file: Path, provider_state: Path, loop_state: Path,
                 or checked_at > now + 30):
             raise ValueError('fresh Astra provider selection required')
         current = seat.load(seat.seat_path(seat_root))
-        if current['owner'] != seat.OWNER_KIMI:
+        if current['owner'] != owner:
             raise ValueError(f"seat_owned_by_{current['owner']}")
         if any(row.get('model') in PLANNER_MODELS and row.get('cwd') == entry['cwd']
                for row in scan()):
