@@ -559,7 +559,8 @@ github.com already accepts it (`ssh -T git@github.com`).
 
 The box's worker is no longer the ZCode desktop. It is:
 
-- **Control plane**: Orca ADE (`orca-ide` 1.4.198 deb) running headless
+- **Control plane**: Orca ADE (`orca-ide` 1.4.212 serve-fork deb since
+  2026-09-26, see "Serve fork" below) running headless
   `orca serve --port 6768 --pairing-address 100.119.252.88 --json` as the
   systemd user unit `orca-serve.service` (linger on). Any tailnet client
   pairs via the URL printed at startup, or through the embedded web client
@@ -583,7 +584,10 @@ Gotcha that cost an hour: user units inherit lightdm/XFCE session
 variables (`DESKTOP_SESSION`, `XDG_CURRENT_DESKTOP`, `XDG_SESSION_TYPE`)
 from the user manager; any of them makes Electron `serve` attach to the
 dead desktop session and hang forever at ~0 CPU. The unit carries an
-`UnsetEnvironment=` list for exactly those — keep it when editing.
+`UnsetEnvironment=` list for exactly those — keep it when editing. The
+user manager still carries 11 such vars (re-checked 2026-09-26 with
+`systemctl --user show-environment`); the serve fork scrubs them as well and
+logs `[serve] headless env guard: …` when it has to, but the unit list stays.
 
 Restart durability (2026-09-12): the unit runs `Restart=always` +
 `RestartSec=3`, not `on-failure`. `orca serve` can end with status 0 (a
@@ -591,6 +595,30 @@ clean self-exit) which `on-failure` ignores — on 2026-09-12 that left the
 unit dead for 8 h after a 05:02 exit 0. The only exit that must stay down
 is 3 (singleton conflict, `RestartPreventExitStatus=3`). The box copy and
 `systemd/orca-serve.service` must stay identical.
+
+`KillMode=mixed` is load-bearing too (verified 2026-09-26): under the default
+`control-group` mode systemd SIGTERMs Chromium's zygote and GPU children
+directly, and serve dies with `FATAL … GPU process isn't usable. Goodbye.`
+(`Orca serve exited via SIGILL.`) instead of quitting.
+
+**Serve fork (since 2026-09-26).** The box runs
+`orca-ide_1.4.212_serve-<sha>_amd64.deb`, built from `~/Projects/orca-serve-fork`
+on fedora: a patch series on upstream v1.4.212 (env scrub, serve signal
+handlers that actually fire, synchronous readiness line, quit/exit
+breadcrumbs, daemon evidence logging). The fork README maps each patch to its
+incident. Build and install from fedora only (`make deb`, then
+`scripts/deploy-spectre.sh`), never on the box. Rollback (not exercised):
+`sudo dpkg -i ~/pkgs/orca/orca-ide_1.4.198_amd64.deb`, then restart the unit.
+The Electron main moves into `app-orca-<pid>.scope` a few seconds after
+start, so its readiness and `[serve]` lines only show up with
+
+```sh
+journalctl --user -u orca-serve.service -u 'app-orca-*.scope'
+```
+
+A healthy restart logs `[serve] SIGTERM received; quitting` → `before-quit` →
+`exiting with code 0`, then `[daemon] Preserving daemon …` on the way back
+up: the terminal daemon keeps its pid and its sessions.
 
 Credits: Qoder Pro plan (expires 2026-10-02), Efficient tier. Verified
 2026-09-08 that an Efficient request leaves Plan Credits at 0/2000 (promo
