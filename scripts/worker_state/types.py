@@ -6,10 +6,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 SCHEMA_VERSION = 1
-# 1.0.1: session.phase.finished is no longer a turn boundary, and hook.finished
-# no longer raises IDLE to RUNNING (design I3). Both changes alter resolved
-# output for the same journal, so the version moves with them.
-RESOLVER_VERSION = "1.0.1"
+RESOLVER_VERSION = "1.2.1"
 
 # API-down / never-asked. Distinct from IDLE (unseen worker, dispatch allowed).
 GOAL_STATES = (
@@ -20,6 +17,7 @@ GOAL_STATES = (
     "ACCEPTED",
     "RUNNING",
     "WAITING",
+    "ASSIGNING",
     "COMPLETED",
     "FAILED",
     "PARKED",
@@ -27,7 +25,7 @@ GOAL_STATES = (
 
 TERMINAL_ATTEMPT = frozenset({"COMPLETED", "FAILED", "PARKED"})
 OCCUPIED = frozenset(
-    {"INJECTED", "UNCONFIRMED", "ACCEPTED", "RUNNING", "WAITING", "PARKED"}
+    {"INJECTED", "UNCONFIRMED", "ASSIGNING", "ACCEPTED", "RUNNING", "WAITING", "PARKED"}
 )
 
 AUTH_AUTHORITATIVE = 1
@@ -91,8 +89,8 @@ AUTHORITATIVE_TERMINAL = frozenset(
 
 COMPLETE_REASONS = frozenset({"goal_complete", "goal_done", "update_goal_complete"})
 
-UNCONFIRMED_SEC = 120.0
-STALL_DEFAULT_SEC = 1800.0
+UNCONFIRMED_SEC = 240.0
+STALL_DEFAULT_SEC = 900.0
 STALL_MODEL_SEC = 900.0
 STRUCTURED_HEALTHY_SEC = 300.0
 HEARTBEAT_HEALTHY_SEC = 60.0
@@ -106,6 +104,7 @@ FAIL_CLOSED_POLICY = {
     "continuity_eligible": False,
     "continuity_recovery_allowed": False,
     "grokbot_may_advance": False,
+    "idle_slo_violated": False,
 }
 
 CLAIM_ACTIONS = frozenset({"dispatch_goal", "resume", "advance"})
@@ -154,6 +153,10 @@ def authority_for(source: str, kind: str) -> int:
     src = str(source or "")
     if src == "tui" or src.startswith("pty"):
         return AUTH_TUI
+    if src == "dsh_exit":
+        return AUTH_AUTHORITATIVE
+    if src == "dsh_jsonl":
+        return AUTH_EXECUTION
     if src in {"cgroup", "process", "proc", "tmux", "orca"}:
         return AUTH_PROCESS
     if kind == "heartbeat":

@@ -1,0 +1,140 @@
+#!/usr/bin/env python3
+"""Run one Flash packet visibly; only the wall timeout terminates its process group."""
+from __future__ import annotations
+
+import argparse
+import math
+import os
+from pathlib import Path
+import re
+import signal
+import subprocess
+import sys
+import tempfile
+
+WALL_SEC = 6 * 3600
+KEY_FILE = Path.home() / '.config/fullmoon-agent-control/cline_api_key'
+DSH_BIN = Path.home() / '.local/share/deepseek-harness-venv/bin/dsh'
+DSH_HOME = Path.home() / '.local/share/fullmoon-dsh'
+FREE_KEY_FILE = Path.home() / '.config/omni-proxy/client_key'
+FREE_DSH_HOME = Path.home() / '.local/share/fullmoon-dsh-free'
+PACKET_DIR = Path.home() / '.local/state/remote-agent/packets'
+MAX_PACKET_BYTES = 64 * 1024
+
+
+def write_exit(packet: Path, code: int) -> None:
+    fd, name = tempfile.mkstemp(prefix=f'.{packet.stem}.', dir=packet.parent)
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as output:
+            output.write(f'{code}\n')
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(name, packet.with_suffix('.exit'))
+    finally:
+        Path(name).unlink(missing_ok=True)
+
+
+def packet_path(raw: str) -> Path:
+    packet = Path(raw)
+    root = Path(os.environ.get('SPECTRE_PACKET_DIR', str(PACKET_DIR))).resolve()
+    if (not packet.is_absolute() or packet.is_symlink() or packet.parent.resolve() != root
+            or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]{0,95}\.txt', packet.name)):
+        raise ValueError('packet must be an absolute, non-symlink file inside the packet spool')
+    return packet
+
+
+def stop_group(proc: subprocess.Popen) -> None:
+    try:
+        os.killpg(proc.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    try:
+        proc.wait(timeout=8)
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    proc.wait(timeout=2)
+
+
+def execute(packet: Path, task: str, env: dict, wall: float) -> int:
+    binary = os.environ.get('SPECTRE_DSH_BIN', str(DSH_BIN))
+    profile = os.environ.get('SPECTRE_DSH_PROFILE', 'headless')
+    try:
+        proc = subprocess.Popen([binary, '--profile', profile, task], env=env, start_new_session=True)
+    except OSError:
+        print('dsh-clinepass: cannot start dsh', file=sys.stderr)
+        return 127
+    def interrupted(signum, frame):
+        stop_group(proc)
+        write_exit(packet, 128 + signum)
+        raise SystemExit(128 + signum)
+    signal.signal(signal.SIGTERM, interrupted)
+    signal.signal(signal.SIGINT, interrupted)
+    try:
+        returncode = proc.wait(timeout=wall)
+        return returncode if returncode >= 0 else 128 - returncode
+    except subprocess.TimeoutExpired:
+        stop_group(proc)
+        return 124
+
+
+def prepare(packet: Path, tier: str = 'paid') -> tuple[str, dict, float]:
+    free = tier == 'free'
+    key = Path(os.environ.get('SPECTRE_DSH_FREE_KEY' if free else 'SPECTRE_DSH_KEY',
+                              str(FREE_KEY_FILE if free else KEY_FILE)))
+    if not key.is_file() or key.is_symlink() or key.stat().st_mode & 0o777 != 0o600:
+        raise ValueError('selected key must be a private regular file with mode 600')
+    value = key.read_text(encoding='utf-8').strip()
+    if not value:
+        raise ValueError('selected key is empty')
+    home = Path(os.environ.get('SPECTRE_DSH_FREE_HOME' if free else 'SPECTRE_DSH_HOME',
+                               str(FREE_DSH_HOME if free else DSH_HOME)))
+    if free:
+        config = home / 'settings.yaml'
+        if (config.is_symlink() or not config.is_file()
+                or config.stat().st_mode & 0o077):
+            raise ValueError('free DSH profile must be a private regular file')
+    if packet.stat().st_size > MAX_PACKET_BYTES:
+        raise ValueError('packet is too large')
+    task = packet.read_text(encoding='utf-8').strip()
+    if not task or '\x00' in task:
+        raise ValueError('packet text is empty or invalid')
+    wall = float(os.environ.get('SPECTRE_DSH_WALL_SEC', WALL_SEC))
+    if not math.isfinite(wall) or wall <= 0:
+        raise ValueError('wall timeout must be positive and finite')
+    env = {**os.environ, 'DSH_HOME': str(home),
+           'DSH_TELEMETRY_MODE': 'DISABLED', 'DSH_PERMISSION_MODE': 'danger-full-access',
+           'DSH_REASONING_EFFORT': os.environ.get('SPECTRE_DSH_EFFORT', 'max'),
+           'CLINE_API_KEY': value}
+    return task, env, wall
+
+
+def main(argv=None) -> int:
+    parser = argparse.ArgumentParser(prog='dsh-clinepass')
+    parser.add_argument('--file', required=True)
+    parser.add_argument('--tier', choices=('paid', 'free'), default='paid')
+    args = parser.parse_args(argv)
+    try:
+        packet = packet_path(args.file)
+    except ValueError as exc:
+        print(f'dsh-clinepass: {exc}', file=sys.stderr)
+        return 2
+    try:
+        task, env, wall = prepare(packet, args.tier)
+        code = execute(packet, task, env, wall)
+    except (OSError, ValueError):
+        print('dsh-clinepass: invalid packet, key, or timeout configuration', file=sys.stderr)
+        code = 2
+    try:
+        write_exit(packet, code)
+    except OSError:
+        print('dsh-clinepass: cannot publish exit status', file=sys.stderr)
+        return 2
+    return code
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

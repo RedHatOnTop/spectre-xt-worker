@@ -8,6 +8,7 @@
     "qoder": {"username": "qoder", "icon_emoji": ":brain:"},
     "antigravity": {"username": "antigravity", "icon_emoji": ":milky_way:"},
     "grok": {"username": "grok", "icon_emoji": ":crystal_ball:"},
-    "spectre": {"username": "spectre", "icon_emoji": ":desktop_computer:"}
+    "spectre": {"username": "spectre", "icon_emoji": ":desktop_computer:"},
+    "loop": {"username": "loop", "icon_emoji": ":repeat:"}
   }
 }

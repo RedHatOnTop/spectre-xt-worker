@@ -133,6 +133,54 @@ class MeminfoTest(unittest.TestCase):
         self.assertIsNotNone(result)
         self.assertIn("swap=", result)
 
+    def test_swap_used_gib_alerts_without_percent_trip(self) -> None:
+        # 7 GiB used of ~8 GiB total is under 90% but over 4 GiB.
+        used = self.SAMPLE.replace(
+            "SwapFree:        8388604", "SwapFree:         1048576"
+        )
+        result = healthcheck.probe_memory(
+            800, 90, meminfo_text=used, swap_used_gib=4.0
+        )
+        self.assertIsNotNone(result)
+        self.assertIn("swap_used=", result)
+        self.assertNotIn("swap=", result)
+
+
+class LoadProbeTest(unittest.TestCase):
+    def test_threshold_is_max_8_or_twice_nproc(self) -> None:
+        self.assertEqual(healthcheck.load_fail_threshold(1), 8.0)
+        self.assertEqual(healthcheck.load_fail_threshold(4), 8.0)
+        self.assertEqual(healthcheck.load_fail_threshold(8), 16.0)
+
+    def test_parse_loadavg_first_field(self) -> None:
+        self.assertEqual(
+            healthcheck.parse_loadavg("10.57 12.00 13.29 21/1371 4052711"),
+            10.57,
+        )
+        self.assertIsNone(healthcheck.parse_loadavg(""))
+        self.assertIsNone(healthcheck.parse_loadavg("not-a-number"))
+
+    def test_probe_load_trips_at_threshold(self) -> None:
+        self.assertIsNone(
+            healthcheck.probe_load("7.99 1.00 1.00 1/1 1", nproc=4)
+        )
+        hit = healthcheck.probe_load("8.00 1.00 1.00 1/1 1", nproc=4)
+        self.assertIsNotNone(hit)
+        self.assertTrue(hit.startswith("load1="))
+
+    def test_collect_failures_includes_load_and_does_not_need_proxy(self) -> None:
+        cfg = healthcheck.config_from_env(
+            {"REQUIRE_PROXY": "0", "REQUIRE_ZCODE": "0", "REQUIRE_ORCA": "0"}
+        )
+        with mock.patch.object(healthcheck, "probe_temp", return_value=None), \
+                mock.patch.object(healthcheck, "probe_memory", return_value=None), \
+                mock.patch.object(healthcheck, "probe_tmux", return_value=None), \
+                mock.patch.object(healthcheck, "probe_ac", return_value=None), \
+                mock.patch.object(healthcheck, "probe_tailscale", return_value=None), \
+                mock.patch.object(healthcheck, "probe_disks", return_value=[]), \
+                mock.patch.object(healthcheck, "probe_load", return_value="load1=9.00>=8"):
+            self.assertIn("load1=9.00>=8", healthcheck.collect_failures(cfg))
+
 
 class TempExtractTest(unittest.TestCase):
     def test_extracts_nested_temp_inputs(self) -> None:
@@ -160,6 +208,7 @@ class OrcaProbeTest(unittest.TestCase):
         with mock.patch.object(healthcheck, "probe_orca", return_value="orca_down"), \
                 mock.patch.object(healthcheck, "probe_temp", return_value=None), \
                 mock.patch.object(healthcheck, "probe_memory", return_value=None), \
+                mock.patch.object(healthcheck, "probe_load", return_value=None), \
                 mock.patch.object(healthcheck, "probe_tmux", return_value=None), \
                 mock.patch.object(healthcheck, "probe_ac", return_value=None), \
                 mock.patch.object(healthcheck, "probe_tailscale", return_value=None), \

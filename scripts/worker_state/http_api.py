@@ -37,7 +37,7 @@ def handle(
         snap_match = PATH_SNAPSHOT.match(path)
         if method == "GET" and snap_match:
             worker = _worker(unquote(snap_match.group(1)))
-            return 200, store.snapshot(worker, now)
+            return 200, store.snapshot(worker, now, rebuild=False)
         shadow_match = PATH_SHADOW.match(path)
         if method == "GET" and shadow_match:
             worker = _worker(unquote(shadow_match.group(1)))
@@ -48,12 +48,20 @@ def handle(
             return 200, snapshot
         if method == "POST" and path == "/v1/actions/claim":
             worker = _worker(str(payload.get("worker") or ""))
+            extra = {}
+            if payload.get("target"):
+                extra["target"] = str(payload.get("target"))
+            if payload.get("terminal"):
+                extra["terminal"] = str(payload.get("terminal"))
+            if payload.get("pin"):
+                extra["pin"] = str(payload.get("pin"))
             claim = store.claim(
                 worker,
                 str(payload.get("action") or ""),
                 int(payload.get("expected_snapshot_version")),
                 str(payload.get("idempotency_key") or ""),
                 now,
+                extra or None,
             )
             return 200, {"ok": True, **claim}
         result_match = PATH_RESULT.match(path)

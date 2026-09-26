@@ -217,7 +217,9 @@ if [[ -n "${PERSON_HOME}" ]]; then
   # the cutover still has them enabled; a fresh bootstrap never installs them.
   for legacy in qoder-nudge.timer qoder-continuity.timer \
                 codex-goal-healer.timer grokbot-goal-event.timer \
-                grokbot-goal-event.path; do
+                grokbot-goal-event.path \
+                local-listener-reaper.timer qoder-idle-reaper.timer \
+                native-worker-pin-sync.timer; do
     sudo -u "${PERSON_USER}" XDG_RUNTIME_DIR="/run/user/${USER_UID}" \
       systemctl --user disable --now "${legacy}" 2>/dev/null || true
   done
@@ -232,15 +234,9 @@ if [[ -n "${PERSON_HOME}" ]]; then
     sudo -u "${PERSON_USER}" XDG_RUNTIME_DIR="/run/user/${USER_UID}" \
       systemctl --user enable devspace.service 2>/dev/null || true
   fi
-  # Goal supervisor (RUNBOOK 7.15): enabled only when the reviewer can actually
-  # run — grok present AND its isolated GROK_HOME profile installed. Otherwise
-  # every tick would fail closed for nothing; the timer stays installed-off and
-  # the RUNBOOK enable step is the switch.
-  if [[ -x "${PERSON_HOME}/.local/bin/grok" && \
-        -f "${PERSON_HOME}/.local/share/remote-agent/grok-supervisor/config.toml" ]]; then
-    sudo -u "${PERSON_USER}" XDG_RUNTIME_DIR="/run/user/${USER_UID}" \
-      systemctl --user enable goal-supervisor.timer 2>/dev/null || true
-  fi
+  # Goal supervisor (RUNBOOK 7.16): unit files stay installed-off even if
+  # grok reappears. Occupancy handoff is spectre-loop (control plane), not
+  # a grok CLI reviewer. Do not start that timer from bootstrap.
   # If the user bus was not up yet (fresh boot), start the timer on next login.
   if command -v loginctl >/dev/null 2>&1; then
     loginctl enable-linger "${PERSON_USER}" 2>/dev/null || true
@@ -269,8 +265,7 @@ install -m 0755 "${REPO_DIR}/scripts/slack-brief.py" /usr/local/bin/spectre-slac
 install -m 0755 "${REPO_DIR}/scripts/slack-bridge.mjs" /usr/local/bin/spectre-slack-bridge
 install -m 0755 "${REPO_DIR}/scripts/worker-state-client.mjs" /usr/local/bin/worker-state-client.mjs
 install -m 0644 "${REPO_DIR}/config/slack-agents.json" /usr/local/share/remote-agent/slack-agents.json
-# Goal supervisor (RUNBOOK 7.15): the Grokbot reviewer. Installed off — the
-# timer is enabled above only once grok and its isolated profile exist.
+# Goal supervisor (RUNBOOK 7.16): binary stays installed; the timer stays off.
 install -m 0755 "${REPO_DIR}/scripts/goal-supervisor.py" /usr/local/bin/spectre-goal-supervisor
 # Authoritative worker-state daemon (RUNBOOK 7.17): the single resolver every
 # consumer asks. Package lives next to the CLI so `serve` and the client share
@@ -281,6 +276,8 @@ install -m 0644 "${REPO_DIR}/scripts/worker_state/"*.py \
   /usr/local/lib/spectre-worker-state/worker_state/
 install -m 0755 "${REPO_DIR}/scripts/spectre-state.py" /usr/local/bin/spectre-state
 install -m 0755 "${REPO_DIR}/scripts/spectre-continuity.py" /usr/local/bin/spectre-continuity
+PERSON_USER="${PERSON_USER}" PERSON_HOME="${PERSON_HOME}" \
+  bash "${REPO_DIR}/scripts/install-control-plane.sh"
 install -m 0644 "${REPO_DIR}/config/goal-supervisor-prompt.md" \
   /usr/local/share/remote-agent/goal-supervisor-prompt.md
 # The reviewer's isolated GROK_HOME profile: without it the grok CLI would scan

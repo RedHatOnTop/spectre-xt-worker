@@ -1,0 +1,11 @@
+[Unit]
+Description=Spectre process reaper (dry-run)
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/spectre-reaper
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+Environment=HOME=%h
+NoNewPrivileges=true
+TimeoutStartSec=90
+Nice=10

@@ -2,8 +2,9 @@
 // Unit tests for the Slack Socket Mode bridge policy and guards.
 import assert from "node:assert/strict";
 import { execFileSync, spawn, spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
+import { createServer } from "node:http";
 import { dirname, join } from "node:path";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
@@ -22,8 +23,27 @@ import {
   dayKey,
   debateMerged,
   debateMergeRecord,
+  astraPidVerdict,
+  listPlannerCmdlines,
+  plannerPidVerdict,
+  plannerRole,
+  dispatchAction,
   dispatchAllowed,
   dispatchLine,
+  flashSendLine,
+  flashReady,
+  freeProxyReady,
+  flashPin,
+  finalizeFlashInjection,
+  injectionLine,
+  ensurePacketPin,
+  startPacketJob,
+  packetSurface,
+  packetShellTitle,
+  packetJobTitle,
+  applyPacketPin,
+  pinTreeHasDsh,
+  writeFlashPacket,
   formatThreadContext,
   isPassText,
   isRecoveryText,
@@ -43,6 +63,7 @@ import {
   speakerReady,
   validateConfig,
 } from "../scripts/slack-bridge.mjs";
+import { nativeProcessGuard, processRole } from "../scripts/dispatch-process.mjs";
 
 const NOW = 1_800_000_000; // 2027-01-15T08:00:00Z
 
@@ -403,6 +424,12 @@ test("controlDispatchArgs: Slack dispatch carries the classified worker", () => 
   assert.equal(controlDispatchArgs({ kind: "control", command: "why is the proxy down?" }).builtin, null);
 });
 
+test("dispatchAction: plan is not a goal inject", () => {
+  assert.equal(dispatchAction("plan"), "plan");
+  assert.equal(dispatchAction("goal"), "dispatch_goal");
+  assert.equal(dispatchAction("resume"), "resume");
+});
+
 test("dispatchAllowed: policy flags only, fail-closed without policy", () => {
   const closed = dispatchAllowed({ state: "idle" });
   assert.equal(closed.ok, false);
@@ -441,6 +468,19 @@ test("dispatchAllowed: policy flags only, fail-closed without policy", () => {
     false,
   );
 
+  const planOk = dispatchAllowed({
+    goal: { state: "COMPLETED" },
+    policy: { grokbot_may_advance: true, can_dispatch_goal: true },
+  }, "plan");
+  assert.equal(planOk.ok, true);
+  assert.equal(
+    dispatchAllowed({
+      goal: { state: "RUNNING" },
+      policy: { grokbot_may_advance: false, can_dispatch_goal: false },
+    }, "plan").ok,
+    false,
+  );
+
   const gate = dispatchAllowed({
     goal: { state: "PARKED", park_reason: "plan_gate" },
     policy: { can_dispatch_goal: false, can_resume: false },
@@ -455,7 +495,7 @@ test("paneRefusal: shells and foreign cwds are refused", () => {
   assert.equal(paneRefusal("node", "/home/person/Projects/orca-rust", "/home/person/Projects/orca-rust"), null);
   assert.match(paneRefusal("node", "/home/person/Projects/other", "/home/person/Projects/orca-rust"), /pane cwd/);
   // Unknown pane path: the shell check still applies, the cwd check abstains.
-  assert.equal(paneRefusal("node", "", "/home/person/Projects/orca-rust"), null);
+  assert.match(paneRefusal("node", "", "/home/person/Projects/orca-rust"), /missing/);
   assert.equal(paneRefusal("node", undefined, undefined), null);
 });
 
@@ -898,8 +938,7 @@ test("dispatchLine: goal carries the clause on one line, resume is the bare comm
   assert.equal(dispatchLine("resume", "ignored", clause), "/goal resume");
   assert.equal(dispatchLine("goal", "no clause yet", ""), "/goal no clause yet");
   assert.equal(dispatchLine("goal", "x", "   "), "/goal x");
-  const capped = dispatchLine("goal", "y".repeat(5000), "clause");
-  assert.equal(capped.length, 4000);
+  assert.throws(() => dispatchLine("goal", "y".repeat(5000), "clause"), /goal line exceeds 4000/);
 });
 
 test("parseDispatchArgs: supervisor CLI shape", () => {
@@ -911,6 +950,9 @@ test("parseDispatchArgs: supervisor CLI shape", () => {
     dryRun: false,
     operator: "supervisor",
     workersFile: null,
+    target: "efficient",
+    tier: "paid",
+    requestId: null,
     error: null,
   });
 
@@ -932,9 +974,486 @@ test("parseDispatchArgs: supervisor CLI shape", () => {
   assert.equal(full.operator, "grok-supervisor");
   assert.equal(full.workersFile, "/tmp/workers.json");
   assert.equal(full.text, "text");
+  assert.equal(parseDispatchArgs(["goal", "q", "task", "--target", "flash", "--tier", "free"]).tier, "free");
+  assert.equal(parseDispatchArgs(["goal", "q", "task", "--tier", "free"]).error, "free tier requires a Flash goal");
+  assert.equal(parseDispatchArgs(["goal", "q", "task", "--target", "flash", "--tier", "unknown"]).error, "invalid dispatch tier");
 
   // A hyphenated or multi-word goal stays one literal; only flags are consumed.
   assert.equal(parseDispatchArgs(["goal", "q", "fix --dry-run bug"]).text, "fix --dry-run bug");
+});
+
+test("packetSurface: pin by default, job opt-in", () => {
+  assert.equal(packetSurface({}), "pin");
+  assert.equal(packetSurface({ SPECTRE_PACKET_SURFACE: "job" }), "job");
+  assert.equal(packetSurface({ SPECTRE_PACKET_SURFACE: "nope" }), "pin");
+  assert.equal(packetShellTitle("flash"), "flash-packets");
+  assert.equal(packetShellTitle("mimo"), "mimo-packets");
+  assert.equal(packetJobTitle("mimo", "d-1"), "mimo d-1");
+  const entry = applyPacketPin({ targets: {} }, "mimo", "term_9");
+  assert.equal(entry.targets.mimo.terminal, "term_9");
+  assert.equal(entry.targets.mimo.wrapper, "/usr/local/bin/mimo-clinepass");
+});
+
+function fakeCreatingOrca(dir, { registered = dir, boundTo = `wt-1::${dir}`, title = "flash-packets", preexisting = [], paged = false } = {}) {
+  const bin = join(dir, "bin");
+  mkdirSync(bin);
+  const log = join(dir, "orca.log");
+  const createdIn = join(dir, "create.cwd");
+  const created = join(dir, "created");
+  const rows = [{ worktreeId: `wt-1::${registered}`, path: registered, isArchived: false }];
+  const other = { worktreeId: "wt-0::/work/other", path: "/work/other", isArchived: false };
+  const whole = paged ? [other, ...rows] : rows;
+  const first = paged
+    ? { worktrees: [other], truncated: true, totalCount: whole.length }
+    : { worktrees: rows, truncated: false };
+  const fresh = { handle: "term_new", worktreePath: dir, connected: true, writable: true, title };
+  const script = [
+    "#!/bin/sh",
+    'printf "%s\\n" "$*" >> ' + JSON.stringify(log),
+    'if [ "$1" = "worktree" ] && [ "$2" = "ps" ] && [ "$4" = "--limit" ]; then',
+    "  printf '%s' " + JSON.stringify(JSON.stringify({ ok: true, result: { worktrees: whole, truncated: false, totalCount: whole.length } })),
+    'elif [ "$1" = "worktree" ] && [ "$2" = "ps" ]; then',
+    "  printf '%s' " + JSON.stringify(JSON.stringify({ ok: true, result: first })),
+    'elif [ "$1" = "terminal" ] && [ "$2" = "list" ]; then',
+    '  if [ -f ' + JSON.stringify(created) + ' ]; then',
+    "    printf '%s' " + JSON.stringify(JSON.stringify({ ok: true, result: { terminals: [...preexisting, fresh] } })),
+    "  else",
+    "    printf '%s' " + JSON.stringify(JSON.stringify({ ok: true, result: { terminals: preexisting } })),
+    "  fi",
+    'elif [ "$1" = "terminal" ] && [ "$2" = "create" ]; then',
+    '  pwd > ' + JSON.stringify(createdIn),
+    '  touch ' + JSON.stringify(created),
+    "  printf '%s' " + JSON.stringify(JSON.stringify({ ok: true, result: { terminal: { handle: "term_new", worktreeId: boundTo } } })),
+    "else",
+    "  printf '%s' '{\"ok\":true}'",
+    "fi",
+  ].join("\n");
+  writeFileSync(join(bin, "orca-ide"), script, { mode: 0o755 });
+  return { bin, log, createdIn };
+}
+
+async function withFakeOrca(bin, fn) {
+  const prev = { PATH: process.env.PATH, SPECTRE_PACKET_DIR: process.env.SPECTRE_PACKET_DIR };
+  process.env.PATH = `${bin}:${prev.PATH}`;
+  process.env.SPECTRE_PACKET_DIR = join(dirname(bin), "packets");
+  try {
+    return await fn();
+  } finally {
+    for (const [key, value] of Object.entries(prev)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+}
+
+function writeRecord(dir, handle, fields = {}) {
+  const tabs = join(dir, "packets", "tabs");
+  mkdirSync(tabs, { recursive: true });
+  const record = { handle, role: "flash", kind: "shell", dispatch_id: null, cwd: dir, worktree_id: `wt-1::${dir}`, created_at: 1, ...fields };
+  writeFileSync(join(tabs, `${handle}.json`), JSON.stringify(record));
+}
+
+test("ensurePacketPin: reuses a live pin and creates flash-packets when missing", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "spectre-pin-ensure-"));
+  try {
+    const orca = fakeCreatingOrca(dir);
+    await withFakeOrca(orca.bin, async () => {
+      const first = await ensurePacketPin({}, "flash", dir);
+      assert.equal(first.ok, true, JSON.stringify(first));
+      assert.equal(first.created, true);
+      assert.equal(first.handle, "term_new");
+      const second = await ensurePacketPin({ targets: { flash: { terminal: "term_new" } } }, "flash", dir);
+      assert.equal(second.ok, true, JSON.stringify(second));
+      assert.equal(second.created, false);
+    });
+    const calls = readFileSync(orca.log, "utf8").trim().split("\n");
+    const create = calls.findIndex((line) => line.startsWith("terminal create "));
+    assert.ok(create > calls.indexOf("worktree ps --json"), calls.join("\n"));
+    assert.match(calls[create], /^terminal create --worktree active --title flash-packets /);
+    assert.equal(calls.some((line) => line.includes("path:")), false);
+    assert.equal(readFileSync(orca.createdIn, "utf8").trim(), realpathSync(dir));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("ensurePacketPin: an unregistered worktree gets no terminal", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "spectre-pin-unregistered-"));
+  try {
+    const orca = fakeCreatingOrca(dir, { registered: join(dir, "elsewhere") });
+    const out = await withFakeOrca(orca.bin, () => ensurePacketPin({}, "flash", dir));
+    assert.equal(out.ok, false);
+    assert.equal(out.evt, "dispatch_orca_failed");
+    assert.match(out.detail, /^orca_worktree_unregistered: /);
+    assert.equal(readFileSync(orca.log, "utf8").includes("terminal create"), false);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("ensurePacketPin: a worktree past the first ps page is found by one whole read", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "spectre-pin-paged-"));
+  try {
+    const orca = fakeCreatingOrca(dir, { paged: true });
+    const out = await withFakeOrca(orca.bin, () => ensurePacketPin({}, "flash", dir));
+    assert.equal(out.ok, true, JSON.stringify(out));
+    const log = readFileSync(orca.log, "utf8");
+    assert.match(log, /^worktree ps --json$/m);
+    assert.match(log, /^worktree ps --json --limit 2$/m);
+    assert.match(log, /^terminal create /m);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("ensurePacketPin: a tab bound to another worktree is closed, not pinned", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "spectre-pin-ghost-"));
+  try {
+    const orca = fakeCreatingOrca(dir, { boundTo: `repo-9::${dir}` });
+    const out = await withFakeOrca(orca.bin, () => ensurePacketPin({}, "flash", dir));
+    assert.equal(out.ok, false);
+    assert.match(out.detail, /^orca_terminal_invisible: term_new bound to repo-9::/);
+    assert.match(out.detail, /closed=true$/);
+    assert.match(readFileSync(orca.log, "utf8"), /^terminal close --terminal term_new --tab --json$/m);
+    assert.equal(existsSync(join(dir, "packets", "tabs", "term_new.json")), false);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("ensurePacketPin: a recorded shell is reused after the shell retitles it", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "spectre-pin-record-"));
+  try {
+    const orca = fakeCreatingOrca(dir, { title: "person@spectre: ~/x" });
+    await withFakeOrca(orca.bin, async () => {
+      const first = await ensurePacketPin({}, "flash", dir);
+      assert.equal(first.created, true, JSON.stringify(first));
+      const second = await ensurePacketPin({}, "flash", dir);
+      assert.deepEqual(second, { ok: true, handle: "term_new", created: false });
+    });
+    const path = join(dir, "packets", "tabs", "term_new.json");
+    assert.equal(statSync(path).mode & 0o777, 0o600);
+    assert.equal(statSync(dirname(path)).mode & 0o777, 0o700);
+    const record = JSON.parse(readFileSync(path, "utf8"));
+    assert.equal(typeof record.created_at, "number");
+    assert.deepEqual({ ...record, created_at: 0 }, {
+      handle: "term_new", role: "flash", kind: "shell", dispatch_id: null, cwd: dir,
+      worktree_id: `wt-1::${dir}`, created_at: 0,
+    });
+    const creates = readFileSync(orca.log, "utf8").split("\n").filter((line) => line.startsWith("terminal create "));
+    assert.equal(creates.length, 1);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("ensurePacketPin: titles, other roles, jobs and dead tabs are never reused", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "spectre-pin-foreign-"));
+  try {
+    const live = (handle, title, extra = {}) => ({ handle, worktreePath: dir, connected: true, writable: true, title, ...extra });
+    const orca = fakeCreatingOrca(dir, {
+      preexisting: [
+        live("term_titled", "flash-packets"),
+        live("term_mimo", "mimo-packets"),
+        live("term_job", "flash d-1"),
+        live("term_other_cwd", "flash-packets"),
+        live("term_dead", "flash-packets", { connected: false }),
+      ],
+    });
+    writeRecord(dir, "term_mimo", { role: "mimo" });
+    writeRecord(dir, "term_job", { kind: "job", dispatch_id: "d-1" });
+    writeRecord(dir, "term_other_cwd", { cwd: join(dir, "other") });
+    writeRecord(dir, "term_dead");
+    writeFileSync(join(dir, "packets", "tabs", "term_alias.json"), JSON.stringify({ handle: "term_titled", role: "flash", kind: "shell", cwd: dir }));
+    const out = await withFakeOrca(orca.bin, () => ensurePacketPin({}, "flash", dir));
+    assert.deepEqual(out, { ok: true, handle: "term_new", created: true, title: "flash-packets" });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("ensurePacketPin: an unwritable record directory creates nothing", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "spectre-pin-unwritable-"));
+  try {
+    const orca = fakeCreatingOrca(dir);
+    mkdirSync(join(dir, "packets"));
+    writeFileSync(join(dir, "packets", "tabs"), "");
+    const out = await withFakeOrca(orca.bin, () => ensurePacketPin({}, "flash", dir));
+    assert.equal(out.evt, "dispatch_orca_failed");
+    assert.match(out.detail, /^orca_record_unwritable: /);
+    const calls = readFileSync(orca.log, "utf8");
+    assert.equal(calls.includes("worktree ps"), false);
+    assert.equal(calls.includes("terminal create"), false);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("ensurePacketPin: a tab whose record cannot be saved is closed", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "spectre-pin-unsaved-"));
+  try {
+    const orca = fakeCreatingOrca(dir);
+    mkdirSync(join(dir, "packets", "tabs", "term_new.json"), { recursive: true });
+    const out = await withFakeOrca(orca.bin, () => ensurePacketPin({}, "flash", dir));
+    assert.equal(out.detail, "orca_record_failed: term_new: EISDIR; closed=true");
+    assert.match(readFileSync(orca.log, "utf8"), /^terminal close --terminal term_new --tab --json$/m);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("startPacketJob: records the job tab under its dispatch id", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "spectre-job-record-"));
+  try {
+    const orca = fakeCreatingOrca(dir);
+    const line = "/usr/local/bin/mimo-clinepass --file x";
+    const out = await withFakeOrca(orca.bin, () => startPacketJob({ role: "mimo", cwd: dir, line, dispatchId: "d-7" }));
+    assert.deepEqual(out, { ok: true, handle: "term_new", title: "mimo d-7", created: true });
+    const record = JSON.parse(readFileSync(join(dir, "packets", "tabs", "term_new.json"), "utf8"));
+    assert.deepEqual([record.role, record.kind, record.dispatch_id], ["mimo", "job", "d-7"]);
+    assert.match(readFileSync(orca.log, "utf8"), /^terminal create --worktree active --title mimo d-7 --command \/usr\/local\/bin\/mimo-clinepass --file x --focus --json$/m);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("injectionLine: mimo never types /goal and targets mimo-clinepass", () => {
+  const mimo = injectionLine({ builtin: "goal", target: "mimo", dispatchId: "m1" });
+  assert.ok(mimo.startsWith("/usr/local/bin/mimo-clinepass --file "));
+  assert.ok(!mimo.includes("/goal"));
+  assert.equal(parseDispatchArgs(["goal", "minecraft", "hi", "--target", "mimo"]).target, "mimo");
+  assert.ok(parseDispatchArgs(["goal", "minecraft", "hi", "--target", "gemini"]).error);
+});
+
+test("injectionLine: flash never types /goal; efficient does", () => {
+  const flash = injectionLine({ builtin: "goal", target: "flash", dispatchId: "abc" });
+  assert.equal(flash, flashSendLine("abc"));
+  assert.ok(flash.startsWith("/usr/local/bin/dsh-clinepass --file "));
+  assert.ok(!flash.includes("/goal"));
+  const efficient = injectionLine({
+    builtin: "goal",
+    target: "efficient",
+    goalText: "fix parser",
+    clauseText: "PROTOCOL",
+  });
+  assert.ok(efficient.startsWith("/goal "));
+  assert.ok(efficient.includes("fix parser"));
+});
+
+test("writeFlashPacket: names the file after the claimed dispatch_id", () => {
+  const dir = mkdtempSync(join(tmpdir(), "spectre-packet-"));
+  try {
+    const env = { SPECTRE_PACKET_DIR: dir };
+    const written = writeFlashPacket("d-claimed1", "fix   the nether\nnext", env);
+    assert.equal(written.ok, true);
+    assert.equal(written.path, join(dir, "d-claimed1.txt"));
+    assert.equal(readFileSync(written.path, "utf8"), "fix   the nether\nnext\n");
+    assert.equal(statSync(written.path).mode & 0o777, 0o600);
+    const made = finalizeFlashInjection({ claim: { dispatch_id: "d-claimed1" } }, "fix the nether", env);
+    assert.equal(made.ok, true);
+    assert.equal(made.dispatch_id, "d-claimed1");
+    assert.equal(made.line, flashSendLine("d-claimed1", env));
+    assert.equal(flashSendLine("d-claimed1", env, "free"), `${made.line} --tier free`);
+    assert.equal(finalizeFlashInjection({ claim: { dispatch_id: "d-claimed2" } }, "free work", env, "free").line,
+      flashSendLine("d-claimed2", env, "free"));
+    assert.ok(!made.line.includes("fix the nether"));
+    assert.equal(finalizeFlashInjection({ claim: {} }, "x", env).ok, false);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("flashReady: fail-closes missing wrapper/key/dsh/pin and busy pin-tree dsh", () => {
+  const dir = mkdtempSync(join(tmpdir(), "spectre-flash-ready-"));
+  try {
+    const wrapper = join(dir, "dsh-clinepass");
+    const key = join(dir, "key");
+    const dsh = join(dir, "dsh");
+    const proc = join(dir, "proc");
+    mkdirSync(proc);
+    writeFileSync(wrapper, "#!/bin/sh\n", { mode: 0o644 });
+    chmodSync(wrapper, 0o644);
+    writeFileSync(key, "secret\n", { mode: 0o600 });
+    chmodSync(key, 0o600);
+    writeFileSync(dsh, "#!/bin/sh\n", { mode: 0o755 });
+    chmodSync(dsh, 0o755);
+    const env = {
+      SPECTRE_DSH_WRAPPER: wrapper,
+      SPECTRE_DSH_KEY: key,
+      SPECTRE_DSH_BIN: dsh,
+      SPECTRE_PROC_ROOT: proc,
+    };
+    assert.equal(flashReady({}, env).evt, "dispatch_flash_unavailable");
+    const entry = { targets: { flash: { terminal: "term_flash" } } };
+    assert.match(flashReady(entry, env).detail, /755/);
+    chmodSync(wrapper, 0o755);
+    assert.equal(flashReady(entry, env).ok, true);
+    assert.equal(flashPin(entry), "term_flash");
+
+    mkdirSync(join(proc, "42"));
+    writeFileSync(join(proc, "42", "cmdline"), "dsh\0--profile\0headless\0task");
+    writeFileSync(join(proc, "42", "environ"), "ORCA_TERMINAL_HANDLE=term_flash\0");
+    writeFileSync(join(proc, "42", "stat"), "42 (dsh) S 1 0 0 0 0 0 0 0 0 0 10 5 0 0 0 0 0\n");
+    assert.equal(pinTreeHasDsh("term_flash", proc), true);
+    assert.equal(flashReady(entry, env).evt, "dispatch_flash_busy");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("flashReady: free tier requires flag, private profile and proxy client key", () => {
+  const dir = mkdtempSync(join(tmpdir(), "spectre-free-ready-"));
+  try {
+    const wrapper = join(dir, "dsh-clinepass");
+    const key = join(dir, "client_key");
+    const dsh = join(dir, "dsh");
+    const home = join(dir, "free-home");
+    mkdirSync(home);
+    writeFileSync(wrapper, "#!/bin/sh\n", { mode: 0o755 });
+    chmodSync(wrapper, 0o755);
+    writeFileSync(dsh, "#!/bin/sh\n", { mode: 0o755 });
+    chmodSync(dsh, 0o755);
+    writeFileSync(key, "client-key\n", { mode: 0o600 });
+    chmodSync(key, 0o600);
+    const entry = { targets: { flash: { terminal: "term_free" } } };
+    const env = { SPECTRE_DSH_WRAPPER: wrapper, SPECTRE_DSH_BIN: dsh,
+      SPECTRE_DSH_FREE_KEY: key, SPECTRE_DSH_FREE_HOME: home };
+    assert.equal(flashReady(entry, env, "free").evt, "dispatch_flash_free_unavailable");
+    env.SPECTRE_FREE_PACKETS_ENABLED = "1";
+    assert.equal(flashReady(entry, env, "free").evt, "dispatch_flash_free_unavailable");
+    writeFileSync(join(home, "settings.yaml"), "free profile\n", { mode: 0o600 });
+    chmodSync(join(home, "settings.yaml"), 0o600);
+    assert.equal(flashReady(entry, env, "free").ok, true);
+    rmSync(join(home, "settings.yaml"));
+    symlinkSync(key, join(home, "settings.yaml"));
+    assert.equal(flashReady(entry, env, "free").evt, "dispatch_flash_free_unavailable");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("freeProxyReady: only a live loopback proxy with both providers is accepted", async () => {
+  assert.equal((await freeProxyReady({ SPECTRE_OMNI_ENDPOINT: "http://example.com/v1" })).ok, false);
+  const server = createServer((_req, response) => {
+    response.setHeader("Content-Type", "application/json");
+    response.end(JSON.stringify({ ok: true, providers: ["cline-free", "cline-paid"] }));
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  try {
+    const endpoint = `http://127.0.0.1:${server.address().port}/v1`;
+    assert.equal((await freeProxyReady({ SPECTRE_OMNI_ENDPOINT: endpoint })).ok, true);
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
+
+test("astraPidVerdict: plus-burn and busy", () => {
+  assert.equal(
+    astraPidVerdict(["codex -m gpt-6-astra -c model_provider=openai"]).evt,
+    "dispatch_astra_plus_burn",
+  );
+  assert.equal(astraPidVerdict(["codex -m gpt-6-astra", "codex -m gpt-6-astra"]).evt, "dispatch_astra_busy");
+  assert.equal(astraPidVerdict(["codex -m gpt-6-astra"]).ok, true);
+});
+
+test("plannerRole: the pinned harness names the planner process", () => {
+  assert.equal(plannerRole({}), "astra");
+  assert.equal(plannerRole({ planner: { terminal: "term_a" } }), "astra");
+  assert.equal(plannerRole({ planner: { harness: "codex" } }), "astra");
+  assert.equal(plannerRole({ planner: { harness: "claude" } }), "claude");
+  assert.equal(plannerRole({ planner: { harness: "kimi" } }), "kimi");
+  assert.equal(plannerRole({ planner: { harness: "gemini" } }), null);
+});
+
+test("plannerPidVerdict: only the astra role knows plus-burn", () => {
+  assert.equal(plannerPidVerdict(["/usr/bin/claude --model claude-opus-5-5"], "claude").ok, true);
+  assert.deepEqual(plannerPidVerdict([], "claude"), { ok: false, evt: "dispatch_claude_busy", count: 0 });
+  assert.deepEqual(
+    plannerPidVerdict(["codex -m gpt-6-astra -c model_provider=openai"], "kimi"),
+    { ok: false, evt: "dispatch_kimi_busy", count: 0 },
+  );
+  assert.equal(plannerPidVerdict(["kimi -m cline/kimi-k3"], "kimi").ok, true);
+});
+
+test("processRole: planners need their model on argv and wrappers do not count", () => {
+  assert.equal(processRole(["claude", "--dangerously-skip-permissions", "--model", "claude-opus-5-5"]), "claude");
+  assert.equal(processRole(["node", "/usr/local/bin/claude", "--model=claude-opus-5-5"]), "claude");
+  assert.equal(processRole(["/home/u/.kimi-code/bin/kimi", "-m", "cline/kimi-k3"]), "kimi");
+  assert.equal(processRole(["claude"]), null);
+  assert.equal(processRole(["claude", "--model", "claude-sonnet-5"]), null);
+  const child = ["--", "/usr/bin/claude", "--model", "claude-opus-5-5"];
+  assert.equal(processRole(["claude bg-pty-host", "--bg-pty-host", "/tmp/x.sock", ...child]), null);
+  assert.equal(processRole(["claude", "bg-pty-host", "--bg-pty-host", "/tmp/x.sock", ...child]), null);
+});
+
+test("nativeProcessGuard: a claude or kimi planner in the pin blocks other targets", () => {
+  const kimi = [{ handle: "term_k", cwd: "/w", role: "kimi" }];
+  assert.equal(nativeProcessGuard("term_k", "/w", "kimi", kimi), true);
+  assert.equal(nativeProcessGuard("term_k", "/w", "efficient", kimi), false);
+  const shared = [
+    { handle: "term_c", cwd: "/w", role: "efficient" },
+    { handle: "term_c", cwd: "/w", role: "claude" },
+  ];
+  assert.equal(nativeProcessGuard("term_c", "/w", "efficient", shared), false);
+  assert.equal(nativeProcessGuard("term_c", "/w", "flash", [
+    { handle: "term_c", cwd: "/w", role: "shell" },
+    { handle: "term_c", cwd: "/w", role: "kimi" },
+  ]), false);
+});
+
+test("listPlannerCmdlines: a bg-pty-host wrapper is not a second claude planner", () => {
+  const dir = mkdtempSync(join(tmpdir(), "spectre-planner-proc-"));
+  try {
+    const proc = join(dir, "proc");
+    const child = ["/usr/bin/claude", "--model", "claude-opus-5-5"];
+    fakeProcess(proc, 901, ["claude bg-pty-host", "--bg-pty-host", "/tmp/x.sock", "148", "55", "--", ...child],
+      "term_c", dir);
+    fakeProcess(proc, 902, child, "term_c", dir);
+    writeFileSync(join(proc, "902", "stat"), "902 (claude) S 901 0 0 0");
+    const lines = listPlannerCmdlines("claude", {}, proc);
+    assert.deepEqual(lines, [child.join(" ")]);
+    assert.equal(plannerPidVerdict(lines, "claude").ok, true);
+    assert.deepEqual(listPlannerCmdlines("kimi", {}, proc), []);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("listPlannerCmdlines: claude and kimi count only in the worktree, astra box-wide", () => {
+  const dir = mkdtempSync(join(tmpdir(), "spectre-planner-proc-"));
+  try {
+    const proc = join(dir, "proc");
+    const worktree = join(dir, "minecraft");
+    const elsewhere = join(dir, "operator");
+    const claude = ["/usr/bin/claude", "--model", "claude-opus-5-5"];
+    const astra = ["codex", "-m", "gpt-6-astra"];
+    fakeProcess(proc, 911, claude, "term_planner", worktree);
+    fakeProcess(proc, 912, claude, "term_operator", elsewhere);
+    fakeProcess(proc, 913, astra, "term_a", worktree);
+    fakeProcess(proc, 914, astra, "term_b", elsewhere);
+    assert.deepEqual(listPlannerCmdlines("claude", {}, proc, worktree), [claude.join(" ")]);
+    assert.deepEqual(plannerPidVerdict(listPlannerCmdlines("claude", {}, proc), "claude"),
+      { ok: false, evt: "dispatch_claude_busy", count: 2 });
+    assert.deepEqual(listPlannerCmdlines("kimi", {}, proc, worktree), []);
+    assert.deepEqual(plannerPidVerdict(listPlannerCmdlines("astra", {}, proc, worktree), "astra"),
+      { ok: false, evt: "dispatch_astra_busy", count: 2 });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("paneRefusal: flash wrapper prefix may run in a shell", () => {
+  const line = flashSendLine("x");
+  assert.equal(
+    paneRefusal("bash", "/home/person/Projects/minecraft-server-project", "/home/person/Projects/minecraft-server-project", {
+      allowFlashShell: true,
+      line,
+    }),
+    null,
+  );
+  assert.ok(
+    paneRefusal("bash", "/home/person/Projects/minecraft-server-project", "/home/person/Projects/minecraft-server-project"),
+  );
 });
 
 test("parseDispatchArgs: refusals never become a bare goal", () => {
@@ -949,7 +1468,19 @@ test("parseDispatchArgs: refusals never become a bare goal", () => {
 const BRIDGE_SCRIPT = join(dirname(fileURLToPath(import.meta.url)), "..", "scripts", "slack-bridge.mjs");
 const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 
+function fakeProcess(root, pid, argv, handle, cwd) {
+  const path = join(root, String(pid));
+  mkdirSync(path, { recursive: true });
+  writeFileSync(join(path, "cmdline"), argv.join("\0") + "\0");
+  writeFileSync(join(path, "environ"), `ORCA_TERMINAL_HANDLE=${handle}\0`);
+  writeFileSync(join(path, "stat"), `${pid} (test) S 1 0 0 0`);
+  symlinkSync(cwd, join(path, "cwd"));
+}
+
 function startStateServer(dir, ingestKind) {
+  const proc = join(dir, "identity-proc");
+  fakeProcess(proc, 991, ["qodercli", "-m", "Efficient"], "term_test", dir);
+  fakeProcess(proc, 992, ["qodercli", "-m", "Efficient"], "term_pin", dir);
   const sock = join(dir, "state.sock");
   const db = join(dir, "state.sqlite");
   const pyPath = join(dir, "seed.py");
@@ -964,7 +1495,7 @@ function startStateServer(dir, ingestKind) {
       "now = 1800000000.0",
       ingestKind === "parked"
         ? "store.ingest({\"event_id\":\"park-1\",\"worker\":\"native\",\"kind\":\"goal.parked\",\"source\":\"session_jsonl\",\"turn_id\":\"t1\",\"source_timestamp\":\"2027-01-15T08:00:00+00:00\",\"payload\":{\"park_reason\":\"goal_budget\"}}, now)"
-        : "store.snapshot(\"idle\", now, rebuild=True)",
+        : "for worker in ('idle', 'minecraft', 'faux'): store.snapshot(worker, now, rebuild=True)",
       "store.close()",
     ].join("\n"),
   );
@@ -985,7 +1516,7 @@ function startStateServer(dir, ingestKind) {
     Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50);
   }
   return {
-    env: { SPECTRE_WORKER_STATE_SOCK: sock },
+    env: { SPECTRE_WORKER_STATE_SOCK: sock, SPECTRE_PROC_ROOT: proc },
     db,
     stop() {
       child.kill("SIGTERM");
@@ -994,19 +1525,15 @@ function startStateServer(dir, ingestKind) {
 }
 
 function seedParked(db, worker, eventId, turnId) {
-  const pyPath = join(dirname(db), `seed-${eventId}.py`);
-  writeFileSync(
-    pyPath,
-    [
-      "import sys",
-      `sys.path.insert(0, ${JSON.stringify(join(REPO_ROOT, "scripts"))})`,
-      "from worker_state.store import Store",
-      `store = Store(${JSON.stringify(db)})`,
-      `store.ingest({"event_id":${JSON.stringify(eventId)},"worker":${JSON.stringify(worker)},"kind":"goal.parked","source":"session_jsonl","turn_id":${JSON.stringify(turnId)},"source_timestamp":"2027-01-15T08:00:01+00:00","payload":{"park_reason":"goal_budget"}}, 1800000001.0)`,
-      "store.close()",
-    ].join("\n"),
-  );
-  execFileSync("python3", [pyPath]);
+  const script = [
+    "import sys",
+    `sys.path.insert(0, ${JSON.stringify(join(REPO_ROOT, "scripts"))})`,
+    "from worker_state.client import StateClient",
+    `client = StateClient(${JSON.stringify(join(dirname(db), "state.sock"))})`,
+    `status, payload = client.evidence({"event_id":${JSON.stringify(eventId)},"worker":${JSON.stringify(worker)},"kind":"goal.parked","source":"session_jsonl","turn_id":${JSON.stringify(turnId)},"source_timestamp":"2027-01-15T08:00:01+00:00","payload":{"park_reason":"goal_budget"}})`,
+    "assert status == 200, payload",
+  ].join("\n");
+  execFileSync("python3", ["-c", script]);
 }
 
 function runBridge(args, env) {
@@ -1016,6 +1543,203 @@ function runBridge(args, env) {
   });
   return { code: proc.status, stdout: proc.stdout || "", stderr: proc.stderr || "" };
 }
+
+function writeFlashBits(dir) {
+  const wrapper = join(dir, "dsh-clinepass");
+  const key = join(dir, "cline_api_key");
+  const dsh = join(dir, "dsh");
+  const proc = join(dir, "proc");
+  const packets = join(dir, "packets");
+  mkdirSync(proc, { recursive: true });
+  fakeProcess(proc, 998, ["bash"], "term_flash", dir);
+  mkdirSync(packets, { recursive: true });
+  writeFileSync(wrapper, "#!/bin/sh\nexit 0\n");
+  chmodSync(wrapper, 0o755);
+  writeFileSync(key, "not-a-real-key\n");
+  chmodSync(key, 0o600);
+  writeFileSync(dsh, "#!/bin/sh\nexit 0\n");
+  chmodSync(dsh, 0o755);
+  return {
+    wrapper,
+    key,
+    dsh,
+    proc,
+    packets,
+    env: {
+      SPECTRE_DSH_WRAPPER: wrapper,
+      SPECTRE_DSH_KEY: key,
+      SPECTRE_DSH_BIN: dsh,
+      SPECTRE_PROC_ROOT: proc,
+      SPECTRE_PACKET_DIR: packets,
+    },
+  };
+}
+
+test("dispatch CLI: flash dry-run refuses missing wrapper and never types /goal", () => {
+  const dir = mkdtempSync(join(tmpdir(), "spectre-flash-dry-"));
+  const state = startStateServer(dir, "");
+  try {
+    const workers = join(dir, "workers.json");
+    writeFileSync(
+      workers,
+      JSON.stringify({
+        workers: {
+          minecraft: {
+            cwd: dir,
+            tmux: null,
+            terminal: "term_eff",
+            targets: { flash: { terminal: "term_flash" } },
+          },
+        },
+      }),
+    );
+    const missing = runBridge(
+      ["--dispatch", "goal", "minecraft", "fix the nether", "--target", "flash", "--dry-run", "--workers-file", workers],
+      { ...state.env, SPECTRE_PROC_ROOT: join(dir, "no-proc") },
+    );
+    assert.equal(missing.code, 1, missing.stdout);
+    const verdict = JSON.parse(missing.stdout.trim());
+    assert.equal(verdict.evt, "dispatch_flash_unavailable");
+    assert.ok(!String(verdict.line || "").includes("/goal"));
+  } finally {
+    state.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("dispatch CLI: flash claims first, writes packets/<dispatch_id>.txt, sends that line", () => {
+  const dir = mkdtempSync(join(tmpdir(), "spectre-flash-send-"));
+  const bin = join(dir, "bin");
+  const state = startStateServer(dir, "");
+  const bits = writeFlashBits(dir);
+  try {
+    mkdirSync(bin, { recursive: true });
+    const workers = join(dir, "workers.json");
+    writeFileSync(
+      workers,
+      JSON.stringify({
+        workers: {
+          minecraft: {
+            cwd: dir,
+            tmux: null,
+            terminal: "term_eff",
+            targets: { flash: { terminal: "term_flash" } },
+          },
+        },
+      }),
+    );
+    const sentLog = join(dir, "sent.log");
+    writeFileSync(
+      join(bin, "orca-ide"),
+      "#!/bin/sh\n" +
+        'if [ "$1" = "terminal" ] && [ "$2" = "list" ]; then\n' +
+        `  printf '%s' '{"ok":true,"result":{"terminals":[{"handle":"term_flash","worktreePath":"${dir}","connected":true,"writable":true},{"handle":"term_eff","worktreePath":"${dir}","connected":true,"writable":true}]}}'\n` +
+        "else\n" +
+        `  printf '%s\\n' "$*" >> "${sentLog}"\n` +
+        "  printf '%s' '{\"ok\":true}'\n" +
+        "fi\n",
+      { mode: 0o755 },
+    );
+    const env = { PATH: `${bin}:${process.env.PATH}`, ...state.env, ...bits.env };
+    const ok = runBridge(
+      ["--dispatch", "goal", "minecraft", "fix the nether", "--target", "flash", "--workers-file", workers],
+      env,
+    );
+    assert.equal(ok.code, 0, `${ok.stderr}${ok.stdout}`);
+    const verdict = JSON.parse(ok.stdout.trim());
+    assert.equal(verdict.evt, "dispatch_sent");
+    assert.equal(verdict.terminal, "term_flash");
+    assert.ok(verdict.dispatch_id, verdict);
+    assert.match(verdict.line, /^\/usr\/local\/bin\/dsh-clinepass --file /);
+    assert.ok(!verdict.line.includes("/goal"));
+    assert.ok(!verdict.line.includes("fix the nether"));
+    const packet = join(bits.packets, `${verdict.dispatch_id}.txt`);
+    assert.equal(readFileSync(packet, "utf8").trim(), "fix the nether");
+    const sent = readFileSync(sentLog, "utf8");
+    assert.match(sent, new RegExp(`--terminal term_flash`));
+    assert.match(sent, new RegExp(`${verdict.dispatch_id}\\.txt`));
+    assert.equal(sent.includes("/goal"), false);
+    const names = readdirSync(bits.packets).filter((n) => n.endsWith(".txt"));
+    assert.deepEqual(names, [`${verdict.dispatch_id}.txt`]);
+  } finally {
+    state.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("dispatch CLI: plan plus-burn refuses without terminal create", () => {
+  const dir = mkdtempSync(join(tmpdir(), "spectre-plan-"));
+  try {
+    const workers = join(dir, "workers.json");
+    writeFileSync(
+      workers,
+      JSON.stringify({ workers: { minecraft: { cwd: dir, tmux: null, terminal: "term_a" } } }),
+    );
+    const src = readFileSync(BRIDGE_SCRIPT, "utf8");
+    assert.equal(src.includes("astra-planner"), false);
+    assert.equal(src.includes("orca-ide terminal create"), false);
+    const plus = runBridge(
+      ["--dispatch", "plan", "minecraft", "next packet", "--dry-run", "--workers-file", workers],
+      { SPECTRE_ASTRA_CMDLINES: "codex -m gpt-6-astra -c model_provider=openai" },
+    );
+    assert.equal(plus.code, 1, plus.stdout);
+    const verdict = JSON.parse(plus.stdout.trim());
+    assert.equal(verdict.evt, "dispatch_astra_plus_burn");
+    assert.match(verdict.detail, /not creating a terminal/);
+    assert.equal(src.includes("orca-ide terminal create"), false);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("dispatch CLI: plan counts the pinned harness, not astra", () => {
+  const dir = mkdtempSync(join(tmpdir(), "spectre-plan-"));
+  try {
+    const workers = join(dir, "workers.json");
+    const plan = (planner) => {
+      writeFileSync(
+        workers,
+        JSON.stringify({ workers: { minecraft: { cwd: dir, tmux: null, terminal: "term_a", planner } } }),
+      );
+      return runBridge(
+        ["--dispatch", "plan", "minecraft", "next packet", "--dry-run", "--workers-file", workers],
+        { SPECTRE_ASTRA_CMDLINES: "codex -m gpt-6-astra" },
+      );
+    };
+    const kimi = plan({ terminal: "term_k", harness: "kimi" });
+    assert.equal(kimi.code, 1, kimi.stdout);
+    const busy = JSON.parse(kimi.stdout.trim());
+    assert.equal(busy.evt, "dispatch_kimi_busy");
+    assert.match(busy.detail, /not creating a terminal/);
+    const unknown = plan({ terminal: "term_x", harness: "gemini" });
+    assert.equal(unknown.code, 1, unknown.stdout);
+    assert.equal(JSON.parse(unknown.stdout.trim()).evt, "dispatch_planner_unknown");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("dispatch CLI: plan counts a claude planner in the worker's worktree only", () => {
+  const dir = mkdtempSync(join(tmpdir(), "spectre-plan-"));
+  try {
+    const workers = join(dir, "workers.json");
+    const proc = join(dir, "proc");
+    const worktree = join(dir, "minecraft");
+    const claude = ["/usr/bin/claude", "--model", "claude-opus-5-5"];
+    fakeProcess(proc, 921, claude, "term_c", worktree);
+    fakeProcess(proc, 922, claude, "term_operator", join(dir, "operator"));
+    writeFileSync(workers, JSON.stringify({ workers: { minecraft: {
+      cwd: worktree, tmux: null, terminal: "term_a", planner: { terminal: "term_c", harness: "claude" } } } }));
+    const out = runBridge(
+      ["--dispatch", "plan", "minecraft", "next packet", "--dry-run", "--workers-file", workers],
+      { SPECTRE_PROC_ROOT: proc, SPECTRE_WORKER_STATE_SOCK: join(dir, "missing.sock") },
+    );
+    assert.equal(out.code, 1, out.stdout);
+    assert.equal(JSON.parse(out.stdout.trim()).evt, "dispatch_probe_failed");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
 
 test("dispatch CLI: usage and unknown workers exit non-zero with a JSON verdict", () => {
   const usage = runBridge(["--dispatch"]);
