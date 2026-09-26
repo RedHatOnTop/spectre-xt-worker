@@ -605,8 +605,8 @@ directly, and serve dies with `FATAL … GPU process isn't usable. Goodbye.`
 `orca-ide_1.4.212_serve-<sha>_amd64.deb`, built from `~/Projects/orca-serve-fork`
 on fedora: a patch series on upstream v1.4.212 (env scrub, serve signal
 handlers that actually fire, synchronous readiness line, quit/exit
-breadcrumbs, daemon evidence logging, remote terminal stream drop logging). The
-fork README maps each patch to its
+breadcrumbs, daemon evidence logging, remote terminal stream drop and PTY
+resize logging). The fork README maps each patch to its
 incident. Build and install from fedora only (`make deb`, then
 `scripts/deploy-spectre.sh`), never on the box. Rollback (not exercised):
 `sudo dpkg -i ~/pkgs/orca/orca-ide_1.4.198_amd64.deb`, then restart the unit.
@@ -636,10 +636,19 @@ Read it in order: `remoteAckOverflow` (the client stopped ACKing: compare
 `elapsedMs`) or `remoteRecoverySnapshotFailed` → `remoteStreamUnverifiable`.
 `authoritativeSnapshotFallback` with `providerWaitMs` ≈ 8000 means the daemon
 did not answer and the viewer was repainted from a fallback mirror, the prime
-suspect for an old screen (a hypothesis until one incident shows it). `mainBackgroundSync` says when serve turned
-keep-tail thinning on or off for a session; `sessionIdSuffix` matches the
-daemon's own entries for that PTY. Resizing the pane makes the TUI redraw the
-whole screen (SIGWINCH), which should clear remnants until the root cause is known.
+suspect for an old screen (a hypothesis until one incident shows it).
+`mainBackgroundSync` says when serve turned keep-tail thinning on or off for a
+session (`caller:"spawn"` on, `caller:"remote-view"` off); `sessionIdSuffix`
+matches the daemon's own entries for that PTY. `ptyResize` (patch 9) logs
+every size change with `from`/`to`: `kind:"remote-desktop"` is a viewer's
+claim (its `owner` is `multiplex:<connection>:<stream>`, the same stream id
+as the `remote*` lines), `kind:"desktop"` the reclaim back to the host size
+when the last viewer leaves. Serve spawns CLI terminals at 120×40, so a
+remnant right after a claim or reclaim points at the resize, not at dropped
+output. Patch 9 keys the 30 s window per session for both of these, so each
+session's flip gets its own line. Resizing the pane makes the TUI redraw the
+whole screen (SIGWINCH), which should clear remnants until the root cause is
+known.
 
 Credits: Qoder Pro plan (expires 2026-10-02), Efficient tier. Verified
 2026-09-08 that an Efficient request leaves Plan Credits at 0/2000 (promo
