@@ -41,7 +41,7 @@ def pin_set(workers: dict, cwd: str) -> set[str]:
         *[target.get('terminal') for target in (entry.get('targets') or {}).values()]] if pin}
 
 
-def decide(proc, *, listen_ports, pins, flash_done_age, apply=False) -> str:
+def decide(proc, *, listen_ports, pins, owned, flash_done_age, apply=False) -> str:
     cmd, comm = str(proc.get('cmd', '')), str(proc.get('comm', ''))
     try:
         argv = proc.get('argv') or shlex.split(cmd)
@@ -56,6 +56,10 @@ def decide(proc, *, listen_ports, pins, flash_done_age, apply=False) -> str:
         if (flash_done_age is not None and flash_done_age >= FLASH_GRACE
                 and inventory.model(argv) == 'flash' and inventory.option(argv, '--profile') == 'headless'):
             return 'term'
+        return 'keep'
+    # Beyond its pins, only tabs the control plane recorded at create time are its
+    # to clean up. Every rule below also matches the operator's own processes.
+    if not proc.get('handle') or proc['handle'] not in owned:
         return 'keep'
     if 'dsh' in cmd and '--profile tui' in cmd:
         return 'keep'
@@ -83,6 +87,14 @@ def terminate(observed: dict) -> None:
         signal.pidfd_send_signal(fd, signal.SIGTERM)
     finally:
         os.close(fd)
+
+
+def lineage(pid: int, rows: dict) -> frozenset[int]:
+    current, chain = rows.get(pid), frozenset()
+    while current and current['pid'] not in chain:
+        chain = chain | {current['pid']}
+        current = rows.get(current['ppid'])
+    return chain
 
 
 def ancestor_protected(proc: dict, rows: dict, roots: set[int]) -> bool:
@@ -134,11 +146,13 @@ def hygiene_fields(proc, entry, snapshot, terminals, now):
         'unpinned_flash_done_age': flash_age(entry, snapshot, proc, now, unpinned=True) or 0}
 
 
-def observe(workers, processes, listen, previous, client, now, terminals=()):
-    roots = {os.getpid(), os.getppid()}
-    roots = roots | {pid for entry in workers.values() if entry.get('tmux')
-                     if (pid := pane_pid(entry['tmux'])) is not None}
+def observe(workers, processes, listen, previous, client, now, terminals=(), owned=frozenset()):
+    # The parent is only protected itself, not its subtree: under a user unit it
+    # is `systemd --user`, the ancestor of nearly every process.
+    roots = {os.getpid()} | {pid for entry in workers.values() if entry.get('tmux')
+                             if (pid := pane_pid(entry['tmux'])) is not None}
     by_pid = {row['pid']: row for row in processes}
+    own = lineage(os.getpid(), by_pid) | {os.getpid(), os.getppid()}
     listen = tree_listeners(processes, listen)
     snapshots = {name: client.snapshot(name) for name in workers}
     all_pins = {pin for entry in workers.values() for pin in pin_set(workers, entry['cwd'])}
@@ -157,9 +171,9 @@ def observe(workers, processes, listen, previous, client, now, terminals=()):
         unknown = snapshot.get('goal', {}).get('state') == 'UNKNOWN'
         enriched = {**proc, **hygiene_fields(proc, entry, snapshot, terminals, now),
                     'listen': listen.get(proc['pid'], set()), 'rss_limit': rss_limit,
-                    'protected': unknown or ancestor_protected(proc, by_pid, roots),
+                    'protected': unknown or proc['pid'] in own or ancestor_protected(proc, by_pid, roots),
                     'cpu_hot_twice': cpu >= cpu_limit and old.get('hot', False)}
-        action = decide(enriched, listen_ports=set(), pins=all_pins,
+        action = decide(enriched, listen_ports=set(), pins=all_pins, owned=owned,
                         flash_done_age=flash_age(entry, snapshot, proc, now))
         decisions = [*decisions, {**enriched, 'action': action}]
         samples = {**samples, key: {'at': now, 'ticks': proc['ticks'], 'hot': cpu >= cpu_limit}}
@@ -178,10 +192,11 @@ def summary(row):
             for key in ('pid', 'comm', 'handle', 'rss_mib', 'listen', 'action') if key in row}
 
 
-def reap_processes(args, workers, terminals, listen_text):
+def reap_processes(args, workers, terminals, listen_text, owned):
     with locked(args.state.with_suffix('.lock')):
         rows, state = observe(workers, inventory.scan(), inventory.listeners(listen_text),
-                              read_json(args.state), StateClient(timeout=2), time.time(), terminals)
+                              read_json(args.state), StateClient(timeout=2), time.time(), terminals,
+                              owned=owned)
         actions = []
         for row in rows:
             if args.apply and row['action'] == 'term':
@@ -207,15 +222,16 @@ def live(args):
     unowned = inventory.unattributed(proc.stdout, os.getuid())
     listed = run(['orca-ide', 'terminal', 'list', '--json'], timeout=8)
     if not listed['ok']:
-        raise ValueError('Orca inventory unavailable; refusing reap')
+        raise ValueError(f"Orca inventory unavailable ({listed.get('error') or 'no detail'}); refusing reap")
     listing = listed['parsed'].get('result', {})
     terminals = listing.get('terminals', [])
-    actions = [] if unowned else reap_processes(args, workers, terminals, proc.stdout)
     packet_dir = Path(os.environ.get('SPECTRE_PACKET_DIR',
                                      str(Path.home() / '.local/state/remote-agent/packets')))
     pinned = set()
     for entry in workers.values():
         pinned |= pin_set(workers, entry.get('cwd') or '')
+    owned = frozenset(tidy.records(packet_dir))
+    actions = [] if unowned else reap_processes(args, workers, terminals, proc.stdout, owned)
     tab_actions, records = tidy.sweep(terminals, pinned, packet_dir, time.time(), apply=args.apply,
                                       truncated=bool(listing.get('truncated')))
     killed = [row for row in actions if args.apply and row['action'] == 'term' and 'error' not in row]
@@ -240,7 +256,8 @@ def main(argv=None):
         if args.fixture:
             payload = read_json(args.fixture)
             rows = [{**row, 'action': decide(row, listen_ports=set(payload.get('listen_ports', [])),
-                pins=set(payload.get('pins', [])), flash_done_age=payload.get('flash_done_age'))}
+                pins=set(payload.get('pins', [])), owned=set(payload.get('owned', [])),
+                flash_done_age=payload.get('flash_done_age'))}
                 for row in payload.get('procs', [])]
             output = {'ok': True, 'dry_run': True, 'decisions': rows}
         else:

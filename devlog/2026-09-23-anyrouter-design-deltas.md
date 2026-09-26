@@ -668,3 +668,116 @@ Still open after this slice:
   kept. That is the intended failure direction.
 - The 24 idle minecraft shells remain open, and no creator other than the bridge
   (Astra, Kimi) writes tab records yet.
+
+## The reaper cleans up only recorded tabs — 2026-09-26
+
+This slice makes the reaper safe to run against the box as it is. It does not
+enable the timer or reinstall the binary.
+
+**Ownership gate.** `decide()` takes a required `owned` set, which `live()`
+builds from the tab records in `<packet_dir>/tabs/`. The order of the checks is:
+
+1. Allow-listed ports, `protected`, unknown listeners, `NEVER_KILL` and Astra
+   are kept, as before.
+2. A registry pin keeps everything except a headless Flash run that finished
+   more than `FLASH_GRACE` ago, as before.
+3. **New:** a process without an Orca handle, or whose handle has no tab record,
+   is kept.
+4. The generic rules (Minecraft names, listening port, RSS, CPU, duplicate,
+   untitled, unpinned finished Flash) now see only processes in recorded,
+   unpinned tabs, which are the bridge's job tabs.
+
+A process left behind by a tab whose record was retired loses its owner and is
+kept. So are tabs opened by Astra and Kimi, which do not write records yet.
+
+**Point protection for the parent.** `observe()` protected the subtrees of
+`getpid()` and `getppid()`. Under a user unit `getppid()` is `systemd --user`,
+so everything was protected. Now the reaper's own ancestor chain and
+`getppid()` are protected only as individual processes. The subtrees still
+protected are the reaper's own and the registered tmux panes'.
+
+**The Orca refusal names its cause.** It now reads
+`Orca inventory unavailable (<run() error>); refusing reap`.
+
+### Dry-runs on Spectre
+
+Two dry-runs of the working-tree script, without `--apply`, each with its own
+`--state` file:
+
+| Context | Result |
+| --- | --- |
+| ssh shell | `ok: true`, 102 decisions, 102 `keep` |
+| transient user unit (`NoNewPrivileges`, `Nice=10`, unit `PATH`) | `ok: true`, 100 decisions, 100 `keep` |
+
+The unit run no longer fails with `Orca inventory unavailable`. The earlier
+failure did not recur, so its cause is still unknown. If it recurs, the new
+message will name it.
+
+Keeping every process is expected when nothing is owned. The one tab record on
+the box (`term_e25e81fa…`, the `flash-packets` shell from the deploy) points at
+a tab that is no longer listed. Both runs report it as `tab_gone`, dry-run. The
+registry's Flash pin and the Astra planner pin (`term_08fdfa68…`) point at
+tabs that are also gone.
+
+A counterfactual run gave ownership to every observed handle (11 tabs) to check
+that the gate, and not over-protection, is what keeps the processes:
+
+| Context | `protected` | `term` with every handle owned |
+| --- | --- | --- |
+| ssh shell | 12 | 1: a `claude` at 279 MiB RSS |
+| user unit | 7 | 2: the same `claude` and this session's `claude` at 381 MiB |
+
+The unit no longer protects the whole user session. The rules that remain
+would still select an interactive Claude session by RSS alone, so a launcher
+that records a tab for a long-lived agent must pin it as well.
+
+### Gates in the Lightning Studio
+
+`verify.sh` ran through `spectre-offload` twice in one Studio session: once for
+`git archive HEAD` (`7dcf243`) and once for the same tree plus the three changed
+files. Both used Node 22.23.2 (under `$HOME/.node22`) and `/usr/bin/python3`
+3.12.3:
+
+| Gate | HEAD `7dcf243` | This slice |
+| --- | --- | --- |
+| `bash -n` | 32 ok | 32 ok |
+| shellcheck | SKIP, not installed | SKIP, not installed |
+| `py_compile` | ok | ok |
+| slack bridge, `node --test` | 77 pass | 77 pass |
+| devcodex, vendored | 69 pass, 8 fail | 69 pass, the same 8 fail |
+| unit tests | 512 run, 1 failure | 517 run, the same 1 failure |
+
+`verify.sh` exits 1 for both trees, for the same two reasons. Both come from
+the Studio, not from the code:
+
+- All 8 devcodex failures (`runShellCommand`, `runQualityGates`, the lifecycle
+  hooks, `runCompletionGate`) spawn `/bin/sh -lc`. The Studio's login profile
+  breaks dash: `/bin/sh -lc true` prints `/bin/sh: 31: Bad substitution` and
+  exits 2.
+- `test_session_name_falls_back_to_home` expects `codex-$USER`, but
+  `session_name` takes the basename of `$HOME`. In the Studio `$HOME` is
+  `/teamspace/studios/this_studio`, so the result is
+  `'codex-this_studio' != 'codex-person414213'`.
+
+The 5 new tests pass. No test that passes at HEAD fails with this slice.
+
+The first attempt used the Studio's defaults, and those are not a usable
+toolchain:
+
+- apt's Node 18.19.1 printed the bridge summary (`# pass 77`, `# fail 0`) and
+  then did not exit. It sat in `ep_poll` for more than 1000 s until the runner
+  was killed.
+- The login shell's `python3` has no `os.pidfd_open`, so
+  `test_live_child_signal_checks_identity` fails with an `AttributeError` in
+  `terminate()`. `/usr/bin/python3` has `os.pidfd_open`.
+
+Still open:
+
+- Reinstalling `/usr/local/bin/spectre-reaper` from this revision is a deploy
+  step for the operator. The timer stays disabled until then.
+- The stale Flash and planner pins, and the record of the gone `flash-packets`
+  tab, are left as they are. The next Flash dispatch provisions a new shell, and
+  an `--apply` sweep would retire the record.
+- Astra and Kimi do not write tab records yet. `terminal list` truncation,
+  exceptions that escape `main()`, and the tab sweep running outside the lock
+  are also still open.

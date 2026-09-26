@@ -21,14 +21,30 @@ spec.loader.exec_module(reaper)
 
 class ReaperTest(unittest.TestCase):
     def test_duplicate_and_untitled_require_observed_identity_and_grace(self):
-        args = {'listen_ports': set(), 'pins': set(), 'flash_done_age': None}
+        args = {'listen_ports': set(), 'pins': set(), 'owned': {'term_job'}, 'flash_done_age': None}
         self.assertEqual(reaper.decide({'cmd': 'qodercli -m Efficient', 'duplicate': True,
-                                       'age': 301}, **args), 'term')
+                                       'age': 301, 'handle': 'term_job'}, **args), 'term')
         self.assertEqual(reaper.decide({'cmd': 'qodercli -m Efficient', 'duplicate': True,
-                                       'age': 5}, **args), 'keep')
-        self.assertEqual(reaper.decide({'cmd': 'bash', 'untitled': True, 'age': 301}, **args), 'term')
+                                       'age': 5, 'handle': 'term_job'}, **args), 'keep')
+        self.assertEqual(reaper.decide({'cmd': 'bash', 'untitled': True, 'age': 301,
+                                       'handle': 'term_job'}, **args), 'term')
         self.assertEqual(reaper.decide({'cmd': 'dsh --profile headless task',
-                                       'unpinned_flash_done_age': 301}, **args), 'term')
+                                       'unpinned_flash_done_age': 301, 'handle': 'term_job'}, **args), 'term')
+
+    def test_processes_outside_recorded_tabs_are_never_selected(self):
+        # The classes the first box dry-run marked `term` in the operator's tabs.
+        args = {'listen_ports': set(), 'pins': set(), 'owned': {'term_job'}, 'flash_done_age': None}
+        rows = [{'cmd': 'java -jar server.jar nogui', 'listen': {25566}, 'rss_mib': 1400},
+                {'cmd': 'pasta --config-net', 'listen': {5432}},
+                {'cmd': 'node vite', 'listen': {5180}, 'rss_mib': 300},
+                {'cmd': 'qodercli -m Efficient', 'duplicate': True, 'age': 301},
+                {'cmd': 'bash', 'untitled': True, 'age': 301},
+                {'cmd': 'claude', 'rss_mib': 400, 'cpu_hot_twice': True}]
+        for row in rows:
+            for handle in (None, '', 'term_operator'):
+                with self.subTest(cmd=row['cmd'], handle=handle):
+                    self.assertEqual(reaper.decide({**row, 'handle': handle}, **args), 'keep')
+            self.assertEqual(reaper.decide({**row, 'handle': 'term_job'}, **args), 'term')
 
     def test_only_a_reported_default_title_marks_a_shell_untitled(self):
         proc = {'handle': 'term_a', 'start': 0, 'comm': 'bash'}
@@ -49,16 +65,39 @@ class ReaperTest(unittest.TestCase):
 
     def test_headless_command_in_pinned_shell_is_not_headless_process(self):
         self.assertEqual(reaper.decide({'cmd': 'bash -c "dsh --profile headless task"',
-            'handle': 'term_flash'}, listen_ports=set(), pins={'term_flash'}, flash_done_age=301), 'keep')
+            'handle': 'term_flash'}, listen_ports=set(), pins={'term_flash'}, owned=set(),
+            flash_done_age=301), 'keep')
 
     def test_no_listener_heavy_is_selected_but_astra_is_kept(self):
-        args = {'listen_ports': set(), 'pins': set(), 'flash_done_age': None}
-        self.assertEqual(reaper.decide({'cmd': 'java', 'rss_mib': 300}, **args), 'term')
-        self.assertEqual(reaper.decide({'cmd': 'codex -m gpt-6-astra', 'rss_mib': 300}, **args), 'keep')
+        args = {'listen_ports': set(), 'pins': set(), 'owned': {'term_job'}, 'flash_done_age': None}
+        self.assertEqual(reaper.decide({'cmd': 'java', 'rss_mib': 300, 'handle': 'term_job'}, **args), 'term')
+        self.assertEqual(reaper.decide({'cmd': 'codex -m gpt-6-astra', 'rss_mib': 300,
+                                        'handle': 'term_job'}, **args), 'keep')
 
     def test_allowlisted_listener_kept_before_named_rules(self):
-        self.assertEqual(reaper.decide({'cmd': 'java -jar paper.jar', 'listen': [9091]},
-            listen_ports={9091}, pins=set(), flash_done_age=None), 'keep')
+        self.assertEqual(reaper.decide({'cmd': 'java -jar paper.jar', 'listen': [9091], 'handle': 'term_job'},
+            listen_ports={9091}, pins=set(), owned={'term_job'}, flash_done_age=None), 'keep')
+
+    def test_the_reapers_parent_is_protected_but_not_its_subtree(self):
+        # Under a user unit the parent is `systemd --user`, which also parents the
+        # operator's whole session; a root there would exempt everything.
+        parent, me = 900001, os.getpid()
+
+        def row(pid, ppid, handle, rss_mib=300):
+            return {'pid': pid, 'ppid': ppid, 'start': 0, 'ticks': 0, 'comm': 'java', 'cwd': '/work/mc',
+                    'handle': handle, 'rss_mib': rss_mib, 'cmd': 'java -jar server.jar'}
+
+        class Client:
+            def snapshot(self, name):
+                return {}
+
+        processes = [row(parent, 1, 'term_job'), row(me, parent, 'term_job'),
+                     row(900002, parent, 'term_job'), row(900003, parent, 'term_operator'),
+                     row(900004, me, 'term_job')]
+        decisions, _ = reaper.observe({}, processes, {}, {}, Client(), 100.0, owned=frozenset({'term_job'}))
+        actions = {row['pid']: row['action'] for row in decisions}
+        self.assertEqual(actions, {parent: 'keep', me: 'keep', 900002: 'term', 900003: 'keep',
+                                   900004: 'keep'})
 
     def test_live_child_signal_checks_identity(self):
         child = subprocess.Popen(['sleep', '30'])
@@ -118,13 +157,31 @@ class LiveTest(unittest.TestCase):
             return reaper.live(self.args)
 
     def test_another_uids_unattributed_listener_does_not_block(self):
-        out = self.live(os.getuid() + 1, lambda *args: ([], {}))
+        out = self.live(os.getuid() + 1, lambda *args, **kwargs: ([], {}))
         self.assertTrue(out['ok'])
         self.assertNotIn('error', out)
         self.assertEqual([row['reason'] for row in out['tab_records']], ['tab_gone'])
 
+    def test_recorded_tabs_are_the_only_owned_handles(self):
+        seen = []
+
+        def observe(*args, owned, **kwargs):
+            seen.append(owned)
+            return [], {}
+
+        self.live(os.getuid() + 1, observe)
+        self.assertEqual(seen, [frozenset({'term_gone'})])
+
+    def test_orca_failure_names_its_cause(self):
+        with patch.object(reaper, 'run', return_value={'ok': False, 'error': 'orca-ide: exit 1'}), \
+                patch.object(reaper.subprocess, 'run',
+                             return_value=subprocess.CompletedProcess([], 0, '', '')):
+            with self.assertRaisesRegex(ValueError, r'^Orca inventory unavailable \(orca-ide: exit 1\); '
+                                                    r'refusing reap$'):
+                reaper.live(self.args)
+
     def test_own_unattributed_listener_refuses_processes_but_sweeps_tabs(self):
-        def refuse_observe(*args):
+        def refuse_observe(*args, **kwargs):
             raise AssertionError('observe ran despite an unattributed listener')
 
         out = self.live(os.getuid(), refuse_observe)
