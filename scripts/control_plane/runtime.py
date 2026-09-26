@@ -4,7 +4,7 @@ from __future__ import annotations
 from pathlib import Path
 import time
 
-from . import budget, packets, planning, quota, seat
+from . import budget, cline_free, packets, planning, quota, seat
 from .io import locked, read_json, write_json, run as run_command
 
 TICK_SECONDS = 45
@@ -69,6 +69,8 @@ def dry_action(worker, entry, snapshot, env, path, now):
     reason = pin_refusal(planner, owner)
     if not reason and owner == seat.OWNER_ASTRA:
         reason = codex_refusal(planner, read_json(provider_path(env)), read_json(path), snapshot, now)
+    elif not reason and owner == seat.OWNER_KIMI:
+        reason = kimi_refusal(now)
     reason = reason or (None if planner.get('terminal') else 'planner_terminal_missing')
     if reason:
         return {'worker': worker, 'action': 'escalate', 'reason': reason}
@@ -85,6 +87,12 @@ def codex_refusal(planner, provider, state, snapshot, now):
     if planner.get('provider') and planner['provider'] != provider.get('id'):
         return 'provider_restart_required'
     return None
+
+
+def kimi_refusal(now):
+    # While the relays are down the provider tick probes Kimi and records the free quota's
+    # first 429; a plan typed after it would only time out, and each timeout alerts anew.
+    return 'kimi_free_exhausted' if cline_free.status(cline_free.load(), now)['exhausted'] else None
 
 
 def provider_path(env):
@@ -165,6 +173,11 @@ def start_plan(worker, entry, snapshot, state, path, client, env, now, run):
             return state, action
     else:
         # Codex budgets and provider health do not describe another harness.
+        refusal = kimi_refusal(now) if owner == seat.OWNER_KIMI else None
+        if refusal:
+            ws = state.get('workers', {}).get(worker, {})
+            new_ws, action = escalation(worker, ws, refusal, run, env)
+            return worker_state(state, worker, new_ws), action
         ledger = seat.seats_for_owner(owner)[0]['provider']
     ws = state.get('workers', {}).get(worker, {})
     if not planner.get('terminal'):

@@ -1162,3 +1162,61 @@ The new test runs each case as a dry run and then as a live tick, and requires
 both to give the same reason. On the HEAD loop all five dry rows fail with
 `('plan', None)`. On the changed tree the handoff-runtime, control-plane and
 `spectre-loop` suites pass (64 tests).
+
+## A spent Kimi free quota escalates once instead of timing out — 2026-09-26
+
+This slice closes half of the P2 item "A Kimi seat whose free quota is gone is
+not detected either". A Kimi seat planned whatever the quota said. Once the
+free tier returned 429, each plan timed out after 300 s, was retried 300 s
+later, and posted its own `assignment_timeout:<rid>` alert.
+
+The quota evidence already existed. While the relays are down, the provider
+tick asks `kimi_candidate()`, which probes the proxy and records the first 429
+in `cline-free-usage.json`. `kimi.launch()` records a 429 from its own probe
+there too. A Kimi seat exists only while the relays are down, so the tick keeps
+probing while that seat plans. `start_plan()` now reads `cline_free.status()`
+for a Kimi seat after the pin check. When the window has a 429, it escalates
+`kimi_free_exhausted` without claiming or typing. The reason is stable, so the
+escalation posts once and later ticks `sit`, until the 24-hour window ends and
+planning resumes. The dry run reports the same verdict. The loop fixture now
+points `cline_free.DEFAULT_PATH` at its temporary directory, so no loop test
+reads the real usage file.
+
+Once a relay recovers, the provider tick stops probing Kimi, and the usage file
+stops changing while the Kimi seat still holds. The seat has no relay recovery
+either, which is still open. The planner's own 429s never reach the
+usage file, because the proxy's per-route attempt counters are keyed by a
+format outside this repository and are not read for Kimi.
+
+### Verification
+
+On Spectre, `spectre-loop --dry-run` ran with a scratch `HOME` (which moves the
+usage file), a scratch Kimi seat, a scratch registry that copies the live
+minecraft entry with a Kimi pin, and the fixture snapshot:
+
+| Usage file | Working tree | Installed (= `6f399e2`) |
+| --- | --- | --- |
+| absent | `plan` | `plan` |
+| 429 60 s ago, window opened 1 h ago | `escalate`, `kimi_free_exhausted` | `plan` |
+
+All four runs exited 0 with an empty stderr. The live usage file does not
+exist, so the live status is `ok`, not exhausted, with 0 calls. The omni-proxy
+is not running on the box (nothing listens on 8790), so a Kimi seat could not
+plan there today anyway.
+
+`verify.sh` ran through `spectre-offload` for `git archive 4c52367` and for
+the same tree plus the three changed files:
+
+| Gate | HEAD `4c52367` | This slice |
+| --- | --- | --- |
+| `bash -n` | 32 ok | 32 ok |
+| shellcheck | SKIP, not installed | SKIP, not installed |
+| `py_compile` | ok | ok |
+| slack bridge, `node --test` | 79 pass | 79 pass |
+| devcodex, vendored | 69 pass, 8 fail | 69 pass, the same 8 fail |
+| unit tests | 528 run, 1 failure | 529 run, the same 1 failure |
+
+On the HEAD loop the new test fails at its first assertion, the dry run
+(`('plan', None) != ('escalate', 'kimi_free_exhausted')`). On the changed tree
+the handoff-runtime, control-plane, Kimi and `spectre-loop` suites pass (86
+tests).

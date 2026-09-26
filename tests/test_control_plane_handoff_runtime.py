@@ -11,7 +11,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 from tests import test_control_plane as fixtures
-from control_plane import astra, cli, providers, seat
+from control_plane import astra, cli, cline_free, providers, seat
 from control_plane.io import locked, read_json, write_json
 
 
@@ -107,6 +107,29 @@ class HandoffRuntimeTest(unittest.TestCase):
         self.assertEqual(state['plans'][-1]['provider'], 'cline-free')
         self.assertEqual(state['workers']['minecraft']['planning']['timeout'], 300)
         self.assertEqual(self.client.snapshot('minecraft')['goal']['state'], 'ASSIGNING')
+        self.assertEqual(len([c for c in self.sent if '--dispatch' in c]), 1)
+
+    def test_spent_kimi_free_quota_escalates_once_without_typing(self):
+        fixtures.completed(self.store)
+        write_json(seat.seat_path(self.root), {**seat.default_state(), 'owner': 'kimi'})
+        self.entry = {**self.entry, 'planner': {'terminal': 'term_kimi', 'harness': 'kimi'}}
+        cline_free.record(None, fixtures.NOW - 3600, 200)
+        cline_free.record(None, fixtures.NOW - 60, 429)
+
+        dry = self.tick(dry=True)['actions'][0]
+        first = self.tick()['actions'][0]
+        second = self.tick(now=fixtures.NOW + 30)['actions'][0]
+
+        self.assertEqual((dry['action'], dry.get('reason')), ('escalate', 'kimi_free_exhausted'))
+        self.assertEqual((first['action'], first['reason']), ('escalate', 'kimi_free_exhausted'))
+        self.assertEqual((second['action'], second['reason']), ('sit', 'kimi_free_exhausted'))
+        self.assertFalse(any('--dispatch' in command for command in self.sent))
+        self.assertEqual(self.client.snapshot('minecraft')['goal']['state'], 'COMPLETED')
+
+        write_json(cline_free.DEFAULT_PATH, {
+            'window_start': fixtures.NOW - cline_free.WINDOW_SEC - 10,
+            'first_429_at': fixtures.NOW - cline_free.WINDOW_SEC})
+        self.assertEqual(self.tick(now=fixtures.NOW + 60)['actions'][0]['action'], 'plan')
         self.assertEqual(len([c for c in self.sent if '--dispatch' in c]), 1)
 
     def test_claude_seat_outlasts_one_anyrouter_edge_window(self):
