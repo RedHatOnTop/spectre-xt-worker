@@ -253,3 +253,61 @@ failure (`test_session_name_falls_back_to_home`). Against the HEAD script, the
 failure-path test fails
 (`Lists differ: [] != ['lightning studio stop --name box --teamspace team']`),
 and the other two pass.
+
+## The shared Studio: stop only what an offload started, with the last lease — 2026-09-27
+
+One Studio, `buildbox`, serves every session on this box. Until now every run
+stopped it at the end, and `8f91eb2` made a failed run stop it as well. On
+2026-09-27 that went wrong. A run from this session found `INFO - Studio
+buildbox is already running`, hit `We are still setting things up for you` on
+its first remote command, exited 6, and stopped the Studio. Another session
+had just started that Studio for its own offload (`lightning studio list`
+showed `Pending` minutes later), so this run most likely cut that offload off.
+Two changes follow.
+
+**Readiness is an exact echo.** A freshly started Studio accepts SSH before it
+is set up and answers commands with the setup message. The wait loop used
+`ssh … true`, which passed too early. It now waits until `ssh … 'echo
+spectre-ready'` prints exactly `spectre-ready`. Both of the day's rsync
+failures were this.
+
+**Leases, and a start marker.** Each run takes a lease before `studio start`.
+The lease is a file named by the run's pid in
+`~/.local/state/remote-agent/offload-leases`, or in `LIGHTNING_LEASE_DIR`.
+While taking it, the run reads the Studio's status. Unless the status is
+`Running` or `Pending`, it writes `.started`, meaning an offload lease started
+this Studio. At exit, from the trap or the normal path, the run drops its lease
+and every lease whose pid is gone. It stops the Studio only when no live lease
+remains and `.started` is present, and then it removes the marker. Otherwise
+it notes `leaving Studio <name> running for <n> other offload(s)` or `leaving
+Studio <name> running: it was already up when this offload began`. Taking,
+dropping and counting run under one `flock`. The status call is bounded by
+`timeout 60`, and `--studio-report` uses the same helper.
+
+This protects a run only from runs that use this script. Until
+`/usr/local/bin/spectre-offload` is reinstalled, other sessions neither take
+leases nor honour them. What the Lightning CLI does with a start that arrives
+during another run's stop has not been observed.
+
+### Verification
+
+This slice's Studio run used the working-tree `scripts/spectre-offload.sh`.
+The first attempt was the failure described above. On the second, the lease
+directory held only the run's pid (`355086`) and `.lock`, with no `.started`,
+because the Studio was already up for another session.
+
+At the end the run noted `leaving Studio buildbox running: it was already up
+when this offload began`, and the lease directory held only `.lock`. The other
+session's offload was still running, and the Studio was `Running`.
+
+`verify.sh` ran on `git archive 553e4ac` and on the same tree plus the changed
+script and test. Both trees gave the same gate results, apart from unit tests
+going from 546 to 550 run, with the same one known Studio failure. Against the
+HEAD script, the four new behaviours fail and the three earlier tests pass:
+
+- a dead lease gives `['13145'] != ['.lock']`;
+- a live other lease gives no `leaving … for 1 other offload(s)`;
+- a Studio found `Running` or `Pending` gives no `already up`;
+- the setup message is not waited out.
+
+All seven pass on the changed script.
