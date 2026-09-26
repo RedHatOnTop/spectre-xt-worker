@@ -98,13 +98,47 @@ One bug found and fixed during verification: the sample timestamp was built from
 `time.monotonic()`, so it read `1970-01-01`; `ts` is now wall-clock (`at` keeps
 the monotonic value used for CPU deltas). A test asserts it.
 
+## The offload path, verified the same day
+
+The account turned out to exist already (`person414213-q1op6`,
+teamspace `language-model`), but no Linux machine had a CLI, a key or a Studio —
+the older `~/Projects/*/lightning_offload/run_chunky.sh` workflow was a script
+pasted into the browser Studio, so nothing was automatable. What made it real:
+
+1. `lightning-sdk` in a venv on fedora (`~/.local/share/lightning-cli/venv`) +
+   `lightning login` (browser callback; the CLI's own `webbrowser.open` fails in
+   a plain shell — a `BROWSER` shim that records the URL and calls `xdg-open`
+   with the session's `WAYLAND_DISPLAY`/`XAUTHORITY`/`DBUS_SESSION_BUS_ADDRESS`
+   worked). Credentials land in `~/.lightning/credentials.json`; the SDK writes
+   it **0644**, so `chmod 600`.
+2. The same venv shape on the Spectre via `scripts/install-lightning-offload.sh`
+   (`/usr/local/lib/lightning-cli/venv`, `/usr/local/bin/lightning`), the
+   credential **file** copied over stdout-free (mode 600), and the non-secret
+   target in `~/.config/remote-agent/lightning.env`.
+3. `lightning studio create --name buildbox`, `studio start --machine CPU`,
+   `lightning ssh configure --name buildbox` → Host `buildbox`
+   (`s_…@ssh.lightning.ai`, `~/.ssh/lightning_rsa`).
+
+Ladder results (all on the box, in order): dry-run plan →
+`-- cat hello.txt` rc 0 (rsync had to be installed *inside* the Studio; the
+wrapper now does that once) → `./gradlew --version` (Gradle 9.4.0, JVM 21 from
+`--setup openjdk-21-jdk-headless`) → `./gradlew compileJava` failed honestly on
+the missing **JDK 25 toolchain** with exit 1 propagated → after a Temurin 25
+`--setup`, **BUILD SUCCESSFUL in 59 s** in the Studio → final run without
+`--keep` stopped the Studio (`studio list` → `Stopped`). Throughout, the box's
+guard logged 54–60 °C: the build ran off-box. Measured Studio: Ubuntu 24.04.5,
+4 vCPU, 15 GB RAM, 387 GB disk, `/teamspace/studios/this_studio`, no Java/rsync.
+
+Two shell traps worth remembering: `sh -lc '…'` inside the Studio dies with
+`Bad substitution` (dash + a non-POSIX login profile), and the Studio's ssh
+login shell is zsh. The wrapper runs commands in the default shell.
+
 ## Not verified, and what is left
 
-- **Lightning offload is UNVERIFIED**: no account existed. Only the refusal path
-  (exit 3 with no env file) and `--dry-run` were exercised. Signup needs a
-  non-virtual phone number; the free tier is one 4-vCPU Studio, 24/7, with a
-  4-hour session cap and a Free-undisable 10-minute idle sleep. The verification
-  ladder is in RUNBOOK §7.21.
+- **Lightning:** whether the free Studio actually accrues no credits (check the
+  billing UI), the 4-hour cap's behaviour against an in-flight build, and
+  `sandbox`/`job` billing. The full integration suite that cost the box 11 h has
+  not been run in the Studio, so its duration there is unknown.
 - **Battery/EC heat** is outside the guard's view: no charge-threshold node on
   this EC (100 % on AC) and no fan tachometer, so a mechanical fan fault or
   battery heat would look normal. Physical checks stay the operator's.
@@ -116,8 +150,10 @@ the monotonic value used for CPU deltas). A test asserts it.
 
 ## Operator follow-ups
 
-1. Create the Lightning account, then run the §7.21 ladder (dry-run → `sleep 5`
-   → `./gradlew --version` → a real suite) and replace the UNVERIFIED paragraph.
+1. Decide how far to push offloads: the wrapper is manual by design (kill +
+   notify, then a human or agent runs `spectre-offload`). Automating the handoff
+   from the guard's kill message is the next step if the current split proves
+   annoying.
 2. Check the BIOS for a battery-health/charge-limit setting; it is the only fix
    for the 100 %-on-AC heat the guard cannot see.
 3. Decide the speed/silence tradeoff: keep `powersave` (≈800 MHz, coolest) or

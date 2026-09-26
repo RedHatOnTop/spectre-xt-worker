@@ -52,10 +52,17 @@ STUDIO="${LIGHTNING_STUDIO:-}"
 MACHINE="${LIGHTNING_MACHINE:-CPU}"
 EXCLUDES="${LIGHTNING_EXCLUDES:-}"
 ARTIFACT_DIR="${LIGHTNING_ARTIFACT_DIR:-$HOME/.local/state/remote-agent/offload-artifacts}"
-[[ -n "${LIGHTNING_USER_ID:-}" && -n "${LIGHTNING_API_KEY:-}" ]] \
-  || die "Lightning credentials missing in ${ENV_FILE} (RUNBOOK 7.21)" 3
+# The SDK's own credential file is the preferred home for the secret; the env
+# file only has to carry the non-secret target (teamspace/studio).
+CRED_FILE="${LIGHTNING_CREDENTIAL_PATH:-$HOME/.lightning/credentials.json}"
+if [[ -z "${LIGHTNING_USER_ID:-}" || -z "${LIGHTNING_API_KEY:-}" ]]; then
+  [[ -f "${CRED_FILE}" ]] \
+    || die "no Lightning credentials: set LIGHTNING_USER_ID/LIGHTNING_API_KEY in ${ENV_FILE} or run 'lightning login' (${CRED_FILE}) — RUNBOOK 7.21" 3
+fi
 [[ -n "${TEAMSPACE}" && -n "${STUDIO}" ]] \
   || die "LIGHTNING_TEAMSPACE / LIGHTNING_STUDIO missing in ${ENV_FILE} (RUNBOOK 7.21)" 3
+LIGHTNING_BIN="${LIGHTNING_BIN:-$(command -v lightning || true)}"
+[[ -n "${LIGHTNING_BIN}" ]] || LIGHTNING_BIN=/usr/local/lib/lightning-cli/venv/bin/lightning
 
 WORKDIR="${LIGHTNING_WORKDIR:-offload/$(basename "${REPO}")}"
 REMOTE_DIR="~/${WORKDIR#\~/}"
@@ -63,16 +70,17 @@ exclude_args=()
 for pattern in ${EXCLUDES}; do exclude_args+=(--exclude "${pattern}"); done
 
 if ((DRY_RUN)); then
-  printf '{"ok":true,"dry_run":true,"studio":"%s","teamspace":"%s","machine":"%s","repo":"%s","remote":"%s","command":"%s"}\n' \
-    "${STUDIO}" "${TEAMSPACE}" "${MACHINE}" "${REPO}" "${REMOTE_DIR}" "$*"
+  printf '{"ok":true,"dry_run":true,"studio":"%s","teamspace":"%s","machine":"%s","repo":"%s","remote":"%s","credentials":"%s","command":"%s"}\n' \
+    "${STUDIO}" "${TEAMSPACE}" "${MACHINE}" "${REPO}" "${REMOTE_DIR}" \
+    "$([[ -f "${CRED_FILE}" ]] && echo file || echo env)" "$*"
   exit 0
 fi
 
-command -v lightning >/dev/null 2>&1 || die "lightning CLI not installed (pip install lightning-sdk)" 4
+[[ -x "${LIGHTNING_BIN}" ]] || die "lightning CLI not installed (RUNBOOK 7.21: scripts/install-lightning-offload.sh)" 4
 command -v rsync >/dev/null 2>&1 || die "rsync not installed" 4
 
 note "starting Studio ${STUDIO} (${MACHINE})"
-lightning studio start --name "${STUDIO}" --teamspace "${TEAMSPACE}" --machine "${MACHINE}" >&2 || true
+"${LIGHTNING_BIN}" studio start --name "${STUDIO}" --teamspace "${TEAMSPACE}" --machine "${MACHINE}" >&2 || true
 
 deadline=$((SECONDS + TIMEOUT))
 until ssh -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new \
@@ -81,18 +89,32 @@ until ssh -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-n
   sleep 5
 done
 
+# The Studio image ships without rsync; install it once (the Studio disk is
+# persistent, so this is a no-op on later runs).
+if ! ssh -o BatchMode=yes "${STUDIO}" 'command -v rsync >/dev/null 2>&1'; then
+  note "installing rsync in the Studio (one-time)"
+  ssh -o BatchMode=yes "${STUDIO}" \
+    'sudo apt-get update -qq && sudo apt-get install -y -qq rsync' >&2 \
+    || die "could not install rsync in ${STUDIO}" 6
+fi
+
 note "syncing ${REPO} -> ${STUDIO}:${REMOTE_DIR}"
 ssh "${STUDIO}" "mkdir -p ${REMOTE_DIR}"
-rsync -az --delete "${exclude_args[@]}" "${REPO}/" "${STUDIO}:${REMOTE_DIR}/"
+rsync -az --delete "${exclude_args[@]}" "${REPO}/" "${STUDIO}:${REMOTE_DIR}/" \
+  || die "rsync push to ${STUDIO} failed" 6
 
 if [[ -n "${SETUP_CMD}" ]]; then
   note "studio setup: ${SETUP_CMD}"
   ssh "${STUDIO}" "cd ${REMOTE_DIR} && ${SETUP_CMD}" >&2
 fi
 
+# Quote each argv word so `-- sh -lc 'a; b'` survives the remote shell.
+remote_cmd=""
+for arg in "$@"; do remote_cmd+="$(printf '%q' "$arg") "; done
+
 set +e
 note "running: $*"
-ssh -o BatchMode=yes "${STUDIO}" "cd ${REMOTE_DIR} && $*"
+ssh -o BatchMode=yes "${STUDIO}" "cd ${REMOTE_DIR} && ${remote_cmd}"
 rc=$?
 set -e
 
@@ -104,7 +126,7 @@ done
 
 if ((KEEP == 0)); then
   note "stopping Studio ${STUDIO}"
-  lightning studio stop --name "${STUDIO}" --teamspace "${TEAMSPACE}" >&2 || true
+  "${LIGHTNING_BIN}" studio stop --name "${STUDIO}" --teamspace "${TEAMSPACE}" >&2 || true
 fi
 
 printf '{"ok":%s,"exit":%s,"studio":"%s","remote":"%s","artifacts":"%s"}\n' \

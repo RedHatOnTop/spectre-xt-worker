@@ -411,6 +411,40 @@ else
   ok "goal-supervisor.timer disabled (installed off)"
 fi
 
+echo "== lightning offload for heavy builds (RUNBOOK 7.21) =="
+# Optional infrastructure: a broken offload path means builds simply do not run
+# here, which is safe, so these are WARNs — not FAILs.
+lg_bin=/usr/local/lib/lightning-cli/venv/bin/lightning
+if [[ -x "${lg_bin}" || -n "$(command -v lightning 2>/dev/null)" ]]; then
+  ok "lightning CLI installed"
+else
+  warn "lightning CLI missing — no heavy-build offload target (RUNBOOK 7.21)"
+fi
+lg_env="${TARGET_HOME}/.config/remote-agent/lightning.env"
+lg_creds="${TARGET_HOME}/.lightning/credentials.json"
+if [[ -f "${lg_creds}" ]]; then
+  lg_mode="$(stat -c %a "${lg_creds}" 2>/dev/null || echo '?')"
+  if [[ "${lg_mode}" == "600" ]]; then
+    ok "Lightning credentials present (0600)"
+  else
+    warn "Lightning credentials mode ${lg_mode} — chmod 600 ${lg_creds}"
+  fi
+elif grep -qs '^LIGHTNING_API_KEY=.' "${lg_env}" 2>/dev/null; then
+  ok "Lightning credentials in ${lg_env}"
+else
+  warn "no Lightning credentials (run 'lightning login' or fill ${lg_env})"
+fi
+if [[ -f "${lg_env}" ]] && grep -qs '^LIGHTNING_STUDIO=.' "${lg_env}"; then
+  lg_plan="$(RUN_AS_USER env HOME="${TARGET_HOME}" /usr/local/bin/spectre-offload --dry-run -- true 2>/dev/null || true)"
+  if printf '%s' "${lg_plan}" | grep -q '"ok":true'; then
+    ok "spectre-offload plans an offload ($(printf '%s' "${lg_plan}" | sed -n 's/.*"studio":"\([^"]*\)".*/\1/p'))"
+  else
+    warn "spectre-offload --dry-run produced no plan (RUNBOOK 7.21)"
+  fi
+else
+  warn "LIGHTNING_STUDIO not set in ${lg_env} — offload target unknown (RUNBOOK 7.21)"
+fi
+
 echo "== codex CLI + session handoff (RUNBOOK 7.11, 7.15) =="
 if command -v codex >/dev/null 2>&1; then
   codex_ver="$(codex --version 2>/dev/null || echo 'version unknown')"
