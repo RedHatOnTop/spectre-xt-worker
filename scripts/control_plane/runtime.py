@@ -56,13 +56,26 @@ def escalation(worker, ws, reason, run, env):
     return updated, {'worker': worker, 'action': 'escalate', 'reason': reason, 'io': out}
 
 
-def dry_action(worker, entry, snapshot, env):
+def dry_action(worker, entry, snapshot, env, path):
     policy = snapshot.get('policy', {})
-    if entry.get('planner') and not enabled(env, 'ASTRA_ENABLED'):
+    planner = entry.get('planner')
+    if planner and not enabled(env, 'ASTRA_ENABLED'):
         return {'worker': worker, 'action': 'skip', 'reason': 'planner_pin'}
-    if policy.get('grokbot_may_advance'):
-        return {'worker': worker, 'action': 'plan' if entry.get('planner') else 'goal'}
-    return {'worker': worker, 'action': 'skip', 'reason': snapshot.get('goal', {}).get('state')}
+    if not policy.get('grokbot_may_advance'):
+        return {'worker': worker, 'action': 'skip', 'reason': snapshot.get('goal', {}).get('state')}
+    if not planner:
+        return {'worker': worker, 'action': 'goal'}
+    owner = seat.load(seat.seat_path(seat_root(path, env), worker))['owner']
+    reason = pin_refusal(planner, owner) or (None if planner.get('terminal') else 'planner_terminal_missing')
+    if reason:
+        return {'worker': worker, 'action': 'escalate', 'reason': reason}
+    return {'worker': worker, 'action': 'plan'}
+
+
+def pin_refusal(planner: dict, owner: str) -> str | None:
+    if (planner.get('harness') or seat.OWNER_ASTRA) == owner:
+        return None
+    return 'planner_harness_mismatch' if owner == seat.OWNER_ASTRA else f'seat_owned_by_{owner}'
 
 
 def seat_root(path, env):
@@ -104,9 +117,6 @@ def planner_seat(worker, snapshot, state, path, env, provider, now, run):
 def codex_gate(worker, entry, snapshot, state, path, env, now, run):
     ws = state.get('workers', {}).get(worker, {})
     planner = entry.get('planner', {})
-    if (planner.get('harness') or seat.OWNER_ASTRA) != seat.OWNER_ASTRA:
-        new_ws, action = escalation(worker, ws, 'planner_harness_mismatch', run, env)
-        return worker_state(state, worker, new_ws), action, None
     provider_path = Path(env.get('SPECTRE_PROVIDER_STATE', Path.home() / '.local/state/remote-agent/codex-provider.json'))
     provider = read_json(provider_path)
     reason = budget.planner_refusal(state, provider, now, snapshot['goal']['state'] == 'FAILED')
@@ -126,17 +136,18 @@ def codex_gate(worker, entry, snapshot, state, path, env, now, run):
 def start_plan(worker, entry, snapshot, state, path, client, env, now, run):
     planner = entry.get('planner', {})
     owner = seat.load(seat.seat_path(seat_root(path, env), worker))['owner']
+    refusal = pin_refusal(planner, owner)
+    if refusal:
+        ws = state.get('workers', {}).get(worker, {})
+        new_ws, action = escalation(worker, ws, refusal, run, env)
+        return worker_state(state, worker, new_ws), action
     if owner == seat.OWNER_ASTRA:
         state, action, ledger = codex_gate(worker, entry, snapshot, state, path, env, now, run)
         if action:
             return state, action
-    elif planner.get('harness') == owner:
+    else:
         # Codex budgets and provider health do not describe another harness.
         ledger = seat.seats_for_owner(owner)[0]['provider']
-    else:
-        ws = state.get('workers', {}).get(worker, {})
-        new_ws, action = escalation(worker, ws, f'seat_owned_by_{owner}', run, env)
-        return worker_state(state, worker, new_ws), action
     ws = state.get('workers', {}).get(worker, {})
     if not planner.get('terminal'):
         new_ws, action = escalation(worker, ws, 'planner_terminal_missing', run, env)
@@ -354,7 +365,7 @@ def tick(workers, client, path, env, *, now=None, dry=False, run=run_command, lo
     now = time.time() if now is None else now
     if dry:
         return {'ok': True, 'dry_run': True, 'actions': [dry_action(name, entry,
-            client.snapshot(name), env) for name, entry in sorted(workers.items())]}
+            client.snapshot(name), env, path) for name, entry in sorted(workers.items())]}
     with locked(path.with_suffix('.lock')):
         # spectre-kimi commits the seat and rewrites the planner pin under this lock; a
         # registry read before it was taken can pair the new seat with the old pin.

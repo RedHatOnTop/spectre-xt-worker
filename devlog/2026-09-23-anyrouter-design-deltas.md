@@ -923,3 +923,68 @@ Still open:
   timer stays disabled.
 - `ASTRA_ENABLED` still gates planning for every seat, and `dry_action()` still
   reports `plan` without looking at the seat.
+
+## The dry run reports the seat verdict — 2026-09-26
+
+This slice closes half of the remaining P2 item about `ASTRA_ENABLED` and
+`dry_action()`.
+
+**`dry_action()` reads the seat.** It reported `plan` for any planner worker
+that may advance, whatever the seat. A Kimi seat behind the Astra pin looked
+ready in `spectre-loop --dry-run`, while the live tick escalated
+`seat_owned_by_kimi`. The seat check now lives in `pin_refusal(planner, owner)`,
+and both paths call it. `start_plan()` asks it before the codex gates, which
+is where `codex_gate()` used to test the harness, so the live order of refusals
+is unchanged. The dry run adds the terminal check that `start_plan()` makes
+after the gates, and reports `escalate` with the live reason. It reads the seat
+file only for a planner worker that may advance, and a corrupt seat file now
+fails the dry run the way it fails the live tick. It still does not model the
+codex gates: budget, provider health, the Kimi handoff request and the provider
+restart.
+
+**`ASTRA_ENABLED` stays the planner kill switch.** The RUNBOOK documents
+`ASTRA_ENABLED=0` as "skips it completely" and uses it for the verification
+dry run. Narrowing it to the codex seat would let a Kimi or Claude seat plan
+while the switch reads off. That change is the operator's call, so this slice
+leaves it alone.
+
+### Verification
+
+The dry runs used the working tree on Spectre, with `SPECTRE_LOOP=1`,
+`ASTRA_ENABLED=1` and a scratch `SPECTRE_LOOP_STATE`. They ran against the
+real registry and a fixture snapshot in which minecraft may advance. The live
+snapshot has minecraft `UNCONFIRMED`, so it never reaches the seat. The real
+minecraft pin carries a terminal and no harness, which means codex.
+
+| Seat root | Working tree | Installed (= `6f399e2`) |
+| --- | --- | --- |
+| real, no seat file (codex) | `plan` | — |
+| scratch, `owner: kimi` | `escalate`, `seat_owned_by_kimi` | `plan` |
+
+All runs exited 0 with an empty stderr. None created a seat, lock or state
+file. Against the live snapshot, `ASTRA_ENABLED=0` still gives minecraft
+`skip`/`planner_pin`, and `ASTRA_ENABLED=1` gives `skip`/`UNCONFIRMED`.
+
+`verify.sh` ran through `spectre-offload` for `git archive HEAD` (`eeb671f`)
+and for the same tree plus the two changed files:
+
+| Gate | HEAD `eeb671f` | This slice |
+| --- | --- | --- |
+| `bash -n` | 32 ok | 32 ok |
+| shellcheck | SKIP, not installed | SKIP, not installed |
+| `py_compile` | ok | ok |
+| slack bridge, `node --test` | 77 pass | 77 pass |
+| devcodex, vendored | 69 pass, 8 fail | 69 pass, the same 8 fail |
+| unit tests | 523 run, 1 failure | 524 run, the same 1 failure |
+
+The failures are the known Studio issues. The live seat table
+(`test_planner_pin_must_match_the_seat_owner`) and the Kimi and Claude seat
+tests pass unchanged, so moving the harness check out of `codex_gate()` kept
+the live verdicts. The new dry-run table ran against the HEAD loop in the same
+Studio session. Its four `escalate` rows fail there with `('plan', None)`, and
+its two `plan` rows pass.
+
+Still open:
+
+- `ASTRA_ENABLED` gates every seat, as above.
+- The dry run does not model the codex gates.

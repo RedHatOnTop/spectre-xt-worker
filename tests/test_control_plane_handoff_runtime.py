@@ -145,6 +145,27 @@ class HandoffRuntimeTest(unittest.TestCase):
                 self.assertFalse(any('--dispatch' in command for command in self.sent))
                 self.assertEqual(self.client.snapshot('minecraft')['goal']['state'], 'COMPLETED')
 
+    def test_dry_run_reports_the_seat_verdict(self):
+        fixtures.completed(self.store)
+        cases = (
+            ('codex', {'terminal': 'term_astra'}, 'plan', None),
+            ('kimi', {'terminal': 'term_kimi', 'harness': 'kimi'}, 'plan', None),
+            ('claude', {'terminal': 'term_kimi', 'harness': 'kimi'}, 'escalate', 'seat_owned_by_claude'),
+            ('codex', {'terminal': 'term_kimi', 'harness': 'kimi'}, 'escalate', 'planner_harness_mismatch'),
+            ('kimi', {'terminal': 'term_astra'}, 'escalate', 'seat_owned_by_kimi'),
+            ('kimi', {'terminal': None, 'harness': 'kimi'}, 'escalate', 'planner_terminal_missing'),
+        )
+        for owner, planner, action, reason in cases:
+            with self.subTest(owner=owner, planner=planner):
+                write_json(seat.seat_path(self.root), {**seat.default_state(), 'owner': owner})
+                self.entry = {**self.entry, 'planner': planner}
+
+                verdict = self.tick(dry=True)['actions'][0]
+
+                self.assertEqual((verdict['action'], verdict.get('reason')), (action, reason))
+                self.assertEqual(self.sent, [])
+                self.assertFalse(self.path.exists())
+
 
 class LoopRegistryTest(unittest.TestCase):
     setUp = fixtures.LoopRuntimeTest.setUp
