@@ -172,7 +172,7 @@ The unit's `UnsetEnvironment=` and `Restart=always` stay in place.
   bbc15fac-…::/home/person/wt/release-readiness-spectre` (the minecraft repo
   id again, not the cwd's repo), while `worktree ps` lists `00bbf03b-…` for
   that path. The test terminal was closed. AGENTS.md / RUNBOOK §7.8 guidance
-  stands. A resolver fix is a candidate patch 8.
+  stands. A resolver fix is a candidate patch 9.
 - Rollback package: `~/pkgs/orca/orca-ide_1.4.198_amd64.deb` on the box.
 - The fork does not touch GUI code paths; every patch is gated on serve mode
   or lives inside the daemon's own log path.
@@ -181,3 +181,72 @@ The unit's `UnsetEnvironment=` and `Restart=always` stay in place.
   (`/proc/<pid>/environ` handles, one list per tick max, §7.10), and the cost
   looks dominated by Electron-as-node startup, not daemon RPC. Revisit only
   if a post-deploy profile says otherwise.
+
+## Patch 8: remote terminal stream drops (evening)
+
+Symptom (operator report): a terminal viewed from the Orca ADE client sometimes
+streamed slowly, or broke and kept remnants of an older screen on top of the
+new one. Not keystroke echo lag.
+
+Code read of 1.4.212 (no incident evidence exists yet, so this is mechanism,
+not diagnosis). Output can be dropped at two hops, each followed by a
+snapshot meant to repair the viewer:
+
+- daemon → serve: sessions serve marks background get keep-tail thinning
+  (`daemon-stream-keep-tail-drop.ts`, 512K chars per session shrinking to 64K,
+  2M global); the kept tail may start mid-escape-sequence by design, and a
+  `dataGap` replaces the dropped bytes. Logged by patch 7 once the daemon
+  generation turns over.
+- serve → remote client: per-stream ACK queue over 256 KB drops its oldest
+  chunks and sends a recovery snapshot; if no snapshot can be made the stream
+  ends `unverifiable`. That snapshot waits up to 8 s for the daemon and then
+  falls back to whatever mirror is available, and upstream's own test
+  (`bounds a hung authoritative provider acquisition and reuses its fallback`)
+  shows the fallback is reused until the hung daemon call settles.
+
+A TUI (Claude Code, qodercli) repaints by moving the cursor and overwriting
+changed cells, so a dropped span or a lagging repair image leaves old cells
+on screen until the next full redraw. That is consistent with the report but
+unproven.
+
+Patch 8 (`e7617156a7`) logs the serve → client hop. Serve installs a main-
+process sink (patch 7's sink is daemon-only) that writes `[serve]
+stream-backlog <event> <json>` to the journal, one line per event per 30 s:
+`remoteAckOverflow`, `remotePendingOverflow`, `remoteRecoverySnapshot`
+(source, seq, elapsedMs), `remoteRecoverySnapshotFailed`,
+`remoteStreamUnverifiable`, `remoteSnapshotUnavailable`,
+`remoteInitialSnapshotTruncated`, `authoritativeSnapshotFallback`
+(providerWaitMs, source). Upstream's existing `mainBackgroundSync` entries
+land there too. How to read them: RUNBOOK §7.8.
+
+Verification:
+
+- fedora: `make test` 71/71 plus the runtime fragment 2/2; `make typecheck`
+  clean; oxlint and oxfmt clean on the changed files. Red check: with the
+  source hunks stashed, 3 of the 4 new tests fail (the "stays quiet" case
+  passes either way, as it should).
+- Pre-existing failures seen on the unpatched parent too, unrelated:
+  `configure-process.test.ts` (2 GPU-flag tests, host-dependent) and flaky
+  lineage / worktree-scan tests in `orca-runtime.test.ts` (a different set
+  each run), which is why `make test` filters the runtime entry to the fork's
+  fragment.
+- Package `orca-ide_1.4.212_serve-e7617156a7b5_amd64.deb`: all new event
+  names present in `app.asar`.
+- Spectre deploy 21:33 KST: clean stop (`SIGTERM received` → `before-quit` →
+  `exiting with code 0`), daemon pid 2796 preserved with 16 live sessions,
+  16/16 terminals listed after, `NRestarts=0`, web-index 200. A throwaway
+  terminal (created and closed) produced
+  `[serve] stream-backlog mainBackgroundSync {"sessionIdSuffix":"@@00b5e9ab","background":true,"caller":"spawn","known":false,"visible":false}`,
+  so the production sink is live.
+- Not seen live: the `remote*` and fallback events. Inducing an ACK overflow
+  needs a client that pairs over E2EE and speaks the binary multiplex
+  protocol; they are covered by unit tests only and will show up on the next
+  real overflow.
+
+Finding on the way: a CLI-created terminal starts with thinning **on**
+(`background:true`, caller `spawn`). A remote viewer is supposed to flip it
+off (`caller:"remote-view"`, `background:false`). When a stale screen next
+appears, first check whether that flip was logged for the session; if not,
+the daemon was thinning a stream someone was watching. Caveat: the rate limit
+is per event name, so a flip within 30 s of another sync shows only as a
+`suppressedSinceLastEmit` count.
