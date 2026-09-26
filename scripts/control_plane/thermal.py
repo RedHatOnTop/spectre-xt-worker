@@ -1,13 +1,18 @@
 """Thermal ceiling and compile-farm enforcement for the Spectre worker box.
 
-Two independent rules, both from AGENTS.md ("the Spectre is an agent runtime,
+Three independent rules, all from AGENTS.md ("the Spectre is an agent runtime,
 not a compile farm"):
 
 1. Build-class workloads never belong on this box. Any process whose argv is a
    compiler, build tool, JVM/Gradle daemon or project test runner is signalled
    and reported, at every temperature. Classification is argv-based on purpose:
    a `grep gradlew` or a packet file that merely mentions Gradle must not match.
-2. Package temperature is a ceiling, not a target. Samples are appended to a
+2. CPU/memory-intensive work that is not agent tooling belongs in the Lightning
+   Studio (`spectre-offload`, RUNBOOK 7.21). A process holding the RSS ceiling is
+   stopped at once; a process only over the CPU ceiling needs a consecutive-sample
+   streak, because one busy sample is normal for an agent. Build-class processes
+   are owned by rule 1, unless the operator allowlisted their family.
+3. Package temperature is a ceiling, not a target. Samples are appended to a
    JSONL log with the top CPU consumers so an audible-fan incident is
    diagnosable after the fact; at CRIT the guard stops the hottest process that
    is neither agent tooling nor core infrastructure.
@@ -29,6 +34,12 @@ import time
 WARN_C = 62.0
 CRIT_C = 68.0
 HOT_STREAK = 2
+# Intensive non-agent work: an RSS ceiling that fires on one sample, a CPU
+# ceiling measured per-process across all cores (see cpu_percent) that needs a
+# consecutive-sample streak.
+INTENSIVE_RSS_MIB = 1536
+INTENSIVE_CPU_PCT = 90.0
+INTENSIVE_STREAK = 3
 NOTIFY_COOLDOWN_S = 1800
 LOG_MAX_BYTES = 5 * 1024 * 1024
 SAMPLE_INTERVAL_S = 60
@@ -80,10 +91,16 @@ CORE_PROTECTED = (
     'spectre-worker-state-watchdog',
 )
 # The CRIT fallback must not kill the agent harness or its shells; only the
-# build rule may reach an agent's child processes.
+# build rule may reach an agent's child processes. `obscura` is the agent
+# browser (RUNBOOK 7.19): its CDP worker is agent tooling, not runaway work.
+# Interpreters are deliberately NOT listed: `protected()` also matches the first
+# two argv basenames, so `python3 /usr/local/bin/spectre-state` (and any
+# `node /usr/local/bin/spectre-slack-bridge`) stays protected while a generic
+# `python3 -c '…'` data crunch does not — which is exactly the work that must be
+# offloaded to the Studio (RUNBOOK 7.21).
 AGENT_PROTECTED = CORE_PROTECTED + (
     'dsh', 'deepseek-harness', 'codex', 'claude', 'qoder', 'mimo-clinepass',
-    'python3', 'python', 'node', 'electron',
+    'obscura',
 )
 
 
@@ -193,6 +210,56 @@ def build_workloads(procs: list[dict], allow: frozenset[str] = frozenset()) -> l
     return out
 
 
+def next_streaks(prev: dict, cpu: dict[int, float],
+                 threshold: float = INTENSIVE_CPU_PCT) -> dict[int, int]:
+    """Consecutive-sample CPU streak per pid.
+
+    A pid at or above `threshold` in this sample keeps its previous count and
+    increments it; every other pid — below threshold, or gone from `cpu` — is
+    dropped, so the count is consecutive by construction. `prev` is keyed by pid
+    (JSON round-trips make them strings, so both forms are accepted).
+    """
+    counts = {int(pid): int(value) for pid, value in (prev or {}).items()}
+    out: dict[int, int] = {}
+    for pid, pct in cpu.items():
+        key = int(pid)
+        if float(pct) >= threshold:
+            out[key] = counts.get(key, 0) + 1
+    return out
+
+
+def intensive_workloads(procs: list[dict], cpu: dict[int, float], streaks: dict[int, int],
+                        allow: frozenset[str] = frozenset()) -> list[dict]:
+    """Non-agent processes to offload to the Studio, hottest first.
+
+    Rule 2 of the module docstring: not agent tooling or core infrastructure, not
+    zombie, and not build-class (rule 1 owns those) unless the operator
+    allowlisted the family. An RSS ceiling fires on a single sample; the CPU
+    ceiling is per-process across all cores, so it needs INTENSIVE_STREAK
+    consecutive samples.
+    """
+    rows = []
+    for proc in procs:
+        if protected(proc, AGENT_PROTECTED) or str(proc.get('process_state') or '') == 'Z':
+            continue
+        family = classify([str(a) for a in (proc.get('argv') or [])])
+        if family and family not in allow:
+            continue
+        pid = int(proc['pid'])
+        rss_mib = float(proc.get('rss_mib') or 0)
+        cpu_pct = float(cpu.get(pid, 0.0))
+        if rss_mib >= INTENSIVE_RSS_MIB:
+            reason = 'intensive_workload:rss'
+        elif cpu_pct >= INTENSIVE_CPU_PCT and int(streaks.get(pid, 0)) >= INTENSIVE_STREAK:
+            reason = 'intensive_workload:cpu'
+        else:
+            continue
+        rows = [*rows, {**proc, 'family': None, 'reason': reason,
+                        'cpu_pct': round(cpu_pct, 1), 'rss_mib': round(rss_mib, 1)}]
+    rows.sort(key=lambda p: (p['cpu_pct'], p['rss_mib']), reverse=True)
+    return rows
+
+
 def cpu_percent(prev: dict, procs: list[dict], now: float,
                 uptime_s: float | None = None) -> dict[int, float]:
     """Per-pid CPU%% from tick deltas, falling back to a lifetime average.
@@ -200,6 +267,10 @@ def cpu_percent(prev: dict, procs: list[dict], now: float,
     `prev` maps str(pid) -> [ticks, starttime, monotonic]. A pid seen for the
     first time has no delta, so its lifetime average is used: that still catches
     a build started between two samples.
+
+    The value is a percentage of one core, so a multi-threaded process can
+    exceed 100 (it is capped at 100 * cpu_count). INTENSIVE_CPU_PCT is therefore
+    a per-process, all-cores threshold, not a share of the whole box.
     """
     out: dict[int, float] = {}
     hz = os.sysconf('SC_CLK_TCK') or 100

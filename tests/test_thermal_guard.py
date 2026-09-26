@@ -127,6 +127,70 @@ class AllowlistTest(unittest.TestCase):
             self.assertEqual(thermal.read_allow(Path(tmp) / 'missing'), frozenset())
 
 
+class IntensiveTest(unittest.TestCase):
+    """Rule 2: intensive non-agent work is offloaded, never agent tooling."""
+
+    def test_agent_tooling_is_never_selected(self):
+        rows = []
+        for index, argv in enumerate((['/usr/local/bin/dsh', '--profile', 'tui'],
+                                      ['codex', 'exec', 'x'], ['claude', '-p', 'x'],
+                                      ['qodercli', '--model', 'efficient'],
+                                      ['python3', '/usr/local/bin/spectre-state', 'health'],
+                                      ['node', '/usr/local/bin/spectre-slack-bridge'],
+                                      ['obscura', 'fetch', 'https://example.com']), start=1):
+            rows.append(proc(index, argv, rss_mib=3072))
+        cpu = {int(row['pid']): 400.0 for row in rows}
+        streaks = {int(row['pid']): 99 for row in rows}
+        self.assertEqual(thermal.intensive_workloads(rows, cpu, streaks), [])
+
+    def test_generic_python_and_node_hogs_are_selected(self):
+        """Interpreters are not blanket-protected: a data crunch must be offloaded."""
+        rows = [proc(1, ['python3', '-c', 'x=bytearray(2*1024**3)'], rss_mib=2048),
+                proc(2, ['node', 'server.js'], rss_mib=2048)]
+        out = thermal.intensive_workloads(rows, {1: 5.0, 2: 5.0}, {})
+        self.assertEqual([r['pid'] for r in out], [1, 2])
+        self.assertEqual({r['reason'] for r in out}, {'intensive_workload:rss'})
+
+    def test_build_class_process_is_owned_by_the_build_rule(self):
+        row = proc(1, ['cargo', 'build', '--release'], rss_mib=4096)
+        self.assertEqual(thermal.intensive_workloads([row], {1: 400.0}, {1: 9}), [])
+        self.assertEqual([b['family'] for b in thermal.build_workloads([row])], ['cargo'])
+        allowed = thermal.intensive_workloads([row], {1: 400.0}, {1: 9}, frozenset({'cargo'}))
+        self.assertEqual([r['pid'] for r in allowed], [1])
+
+    def test_rss_ceiling_fires_on_the_first_sample(self):
+        row = proc(1, ['ffmpeg', '-i', 'clip.mp4'], rss_mib=thermal.INTENSIVE_RSS_MIB)
+        rows = thermal.intensive_workloads([row], {1: 0.0}, {})
+        self.assertEqual([r['reason'] for r in rows], ['intensive_workload:rss'])
+        self.assertEqual(rows[0]['rss_mib'], float(thermal.INTENSIVE_RSS_MIB))
+        under = proc(2, ['ffmpeg'], rss_mib=thermal.INTENSIVE_RSS_MIB - 1)
+        self.assertEqual(thermal.intensive_workloads([under], {2: 0.0}, {}), [])
+
+    def test_cpu_ceiling_needs_a_consecutive_streak(self):
+        row = proc(1, ['ffmpeg', '-i', 'clip.mp4'])
+        cpu = {1: thermal.INTENSIVE_CPU_PCT}
+        self.assertEqual(thermal.intensive_workloads([row], cpu, {1: thermal.INTENSIVE_STREAK - 1}), [])
+        rows = thermal.intensive_workloads([row], cpu, {1: thermal.INTENSIVE_STREAK})
+        self.assertEqual([r['reason'] for r in rows], ['intensive_workload:cpu'])
+        self.assertEqual(rows[0]['cpu_pct'], thermal.INTENSIVE_CPU_PCT)
+
+    def test_next_streaks_increments_resets_and_drops(self):
+        cpu = {1: thermal.INTENSIVE_CPU_PCT, 2: thermal.INTENSIVE_CPU_PCT - 1}
+        self.assertEqual(thermal.next_streaks({1: 2, 2: 5, 3: 4}, cpu), {1: 3})
+        # A pid that is gone (absent from cpu) is dropped like one below threshold.
+        self.assertEqual(thermal.next_streaks({'9': 3}, {}), {})
+        self.assertEqual(thermal.next_streaks({}, cpu), {1: 1})
+
+    def test_zombies_are_skipped_and_rows_rank_by_cpu(self):
+        rows = [proc(1, ['ffmpeg'], rss_mib=1600),
+                proc(2, ['ffmpeg'], rss_mib=2000, process_state='Z')]
+        self.assertEqual([r['pid'] for r in thermal.intensive_workloads(rows, {1: 10.0, 2: 10.0}, {})], [1])
+        ranked = thermal.intensive_workloads([proc(3, ['ffmpeg'], rss_mib=1600),
+                                              proc(4, ['ffmpeg'], rss_mib=1600)],
+                                             {3: 10.0, 4: 80.0}, {})
+        self.assertEqual([r['pid'] for r in ranked], [4, 3])
+
+
 class SensorTest(unittest.TestCase):
     def test_coretemp_package_is_preferred(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -229,6 +293,76 @@ class GuardRunTest(unittest.TestCase):
                 proc(33, ['python3', '/usr/local/bin/spectre-state', 'health'], ticks=100)]
         return {'procs': rows, 'cpu': {11: 95.0, 22: 80.0, 33: 1.0}, 'temp_c': temp_c,
                 'policy': {'max_perf_pct': 55, 'no_turbo': 1}, 'ticks': {}}
+
+    def intensive_data(self):
+        rows = [proc(44, ['ffmpeg', '-i', 'clip.mp4'], rss_mib=2048),
+                proc(33, ['python3', '/usr/local/bin/spectre-state', 'health'], ticks=100)]
+        return {'procs': rows, 'cpu': {44: 12.5, 33: 1.0}, 'temp_c': 50.0,
+                'policy': {'max_perf_pct': 55, 'no_turbo': 1}, 'ticks': {}}
+
+    def test_intensive_workload_is_stopped_reported_and_ledgered(self):
+        kills = []
+
+        def fake_terminate(row):
+            kills.append(row)
+            return {'pid': row['pid'], 'ok': True, 'reason': row.get('reason'),
+                    'comm': row.get('comm'), 'family': row.get('family'),
+                    'cpu_pct': row.get('cpu_pct'), 'rss_mib': row.get('rss_mib')}
+
+        sent = []
+        with mock.patch.object(guard, 'collect', return_value=self.intensive_data()), \
+             mock.patch.object(guard, 'terminate', side_effect=fake_terminate), \
+             mock.patch.object(guard, 'notify', side_effect=lambda *a, **k: sent.append(a) or True):
+            state, code = guard.run_once(self.args, {'levels': ['ok'], 'notified': {}}, NOW + 5)
+
+        self.assertEqual([k['pid'] for k in kills], [44])
+        self.assertEqual(code, 1)
+        self.assertEqual(state['level'], 'ok')
+        self.assertEqual(sorted(state['notified']), ['intensive'])
+        messages = ' '.join(str(call) for call in sent)
+        self.assertIn('offload candidate stopped', messages)
+        self.assertIn('spectre-offload, RUNBOOK 7.21', messages)
+        self.assertIn('2048', messages)
+        samples = [json.loads(line) for line in (self.state_dir / 'thermal.jsonl').read_text().splitlines()]
+        self.assertEqual(samples[-1]['intensive_workloads'][0]['reason'], 'intensive_workload:rss')
+        ledger = [json.loads(line) for line in (self.state_dir / 'thermal-kills.jsonl').read_text().splitlines()]
+        self.assertEqual(ledger[-1]['actions'][0]['reason'], 'intensive_workload:rss')
+
+    def test_check_mode_signals_nothing_for_an_intensive_process(self):
+        self.args.apply = False
+        self.args.notify = False
+        sent = []
+        with mock.patch.object(guard, 'collect', return_value=self.intensive_data()), \
+             mock.patch.object(guard, 'terminate') as term, \
+             mock.patch.object(guard, 'notify', side_effect=lambda *a, **k: sent.append(a) or True):
+            state, code = guard.run_once(self.args, {'levels': ['ok'], 'notified': {}}, NOW + 6)
+        term.assert_not_called()
+        self.assertEqual(sent, [])
+        self.assertEqual(code, 1)
+        self.assertEqual(state['notified'], {})
+
+    def test_cpu_intensive_needs_three_consecutive_samples(self):
+        data = self.intensive_data()
+        data['procs'] = [proc(44, ['ffmpeg', '-i', 'clip.mp4'], rss_mib=10)]
+        data['cpu'] = {44: 95.0}
+        kills = []
+
+        def fake_terminate(row):
+            kills.append(row)
+            return {'pid': row['pid'], 'ok': True, 'reason': row.get('reason')}
+
+        with mock.patch.object(guard, 'collect', return_value=data), \
+             mock.patch.object(guard, 'terminate', side_effect=fake_terminate), \
+             mock.patch.object(guard, 'notify', return_value=True):
+            state, _ = guard.run_once(self.args, {'levels': ['ok'], 'notified': {}}, NOW + 7)
+            self.assertEqual((kills, state['cpu_streaks']), ([], {'44': 1}))
+            state, _ = guard.run_once(self.args, state, NOW + 8)
+            self.assertEqual((kills, state['cpu_streaks']), ([], {'44': 2}))
+            state, code = guard.run_once(self.args, state, NOW + 9)
+        self.assertEqual([k['pid'] for k in kills], [44])
+        self.assertEqual(kills[0]['reason'], 'intensive_workload:cpu')
+        self.assertEqual(state['cpu_streaks'], {'44': 3})
+        self.assertEqual(code, 1)
 
     def test_build_is_signalled_and_reported(self):
         kills = []

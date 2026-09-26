@@ -2,12 +2,12 @@
 """Thermal and compile-farm guard for the Spectre worker box.
 
 Runs as a user timer every 60 s. Samples package temperature plus the hottest
-processes into a JSONL log, stops build-class workloads (AGENTS.md: the box is
-an agent runtime, not a compile farm) and, at CRIT, the hottest non-agent
-process. Signals nothing unless `--apply` is given; `--check` prints one JSON
-object for verification gates.
+processes into a JSONL log, stops build-class workloads and CPU/memory-intensive
+non-agent work (AGENTS.md: the box is an agent runtime, not a compile farm) and,
+at CRIT, the hottest non-agent process. Signals nothing unless `--apply` is
+given; `--check` prints one JSON object for verification gates.
 
-Exit codes: 0 ok, 1 warn or a blocked build workload, 2 crit.
+Exit codes: 0 ok, 1 warn or a blocked build/intensive workload, 2 crit.
 """
 from __future__ import annotations
 
@@ -83,13 +83,18 @@ def notify(channel: str, text: str, *, recovery: bool = False, dry_run: bool = F
 
 def describe(row: dict) -> str:
     cmd = ' '.join(shlex.split(str(row.get('cmd') or '')))[:160]
-    return f"`{row.get('family') or 'hot'}` pid {row.get('pid')} ({row.get('comm')}) {cmd}"
+    detail = f"`{row.get('family') or 'hot'}` pid {row.get('pid')} ({row.get('comm')}) {cmd}"
+    if row.get('cpu_pct') is not None or row.get('rss_mib') is not None:
+        detail += f" [cpu {row.get('cpu_pct')}%, rss {row.get('rss_mib')} MiB]"
+    return detail
 
 
 def run_once(args, state: dict, now: float) -> tuple[dict, int]:
     data = collect(state, now)
     allow = thermal.read_allow(args.allow_file)
     builds = thermal.build_workloads(data['procs'], allow)
+    streaks = thermal.next_streaks(state.get('cpu_streaks') or {}, data['cpu'])
+    intensive = thermal.intensive_workloads(data['procs'], data['cpu'], streaks, allow)
     level = thermal.level_for(data['temp_c'], args.warn_c, args.crit_c)
     history = [*state.get('levels', [])[-5:], level]
     hot = thermal.escalated(history, 'crit', args.streak)
@@ -98,14 +103,17 @@ def run_once(args, state: dict, now: float) -> tuple[dict, int]:
     if args.apply:
         for row in builds:
             actions = [*actions, terminate(row)]
+        for row in intensive:
+            actions = [*actions, terminate(row)]
         if hot:
-            build_pids = {int(row['pid']) for row in builds}
+            owned = {int(row['pid']) for row in builds} | {int(row['pid']) for row in intensive}
             for row in thermal.crit_targets(data['procs'], data['cpu'], allow=allow):
-                if int(row['pid']) in build_pids:
+                if int(row['pid']) in owned:
                     continue
                 actions = [*actions, terminate({**row, 'reason': 'thermal_crit'})]
 
     killed_builds = [a for a in actions if a.get('ok') and str(a.get('reason', '')).startswith('build_workload')]
+    killed_intensive = [a for a in actions if a.get('ok') and str(a.get('reason', '')).startswith('intensive_workload')]
     killed_hot = [a for a in actions if a.get('ok') and a.get('reason') == 'thermal_crit']
     sent = state.get('notified') or {}
     notified = []
@@ -127,6 +135,12 @@ def run_once(args, state: dict, now: float) -> tuple[dict, int]:
              ', '.join(describe(a) for a in killed_builds) +
              '. The Spectre is an agent runtime, not a compile farm (AGENTS.md); '
              'offload heavy builds (RUNBOOK 7.21).')
+    if killed_intensive:
+        fire('intensive', 'fleet',
+             ':outbox_tray: spectre offload candidate stopped: ' +
+             ', '.join(describe(a) for a in killed_intensive) +
+             ' — this box is an agent runtime; run heavy work in the Studio '
+             '(spectre-offload, RUNBOOK 7.21)')
     if level == 'crit' and thermal.escalated(history, 'crit', args.streak):
         fire('crit', 'alerts',
              f":fire: spectre thermal CRIT {data['temp_c']:.0f}C (crit {args.crit_c:.0f}C, "
@@ -147,12 +161,16 @@ def run_once(args, state: dict, now: float) -> tuple[dict, int]:
         'build_workloads': [{'pid': b['pid'], 'comm': b.get('comm'), 'family': b.get('family'),
                              'cmd': ' '.join(shlex.split(str(b.get('cmd') or '')))[:200]}
                             for b in builds],
+        'intensive_workloads': [{'pid': i['pid'], 'comm': i.get('comm'), 'reason': i.get('reason'),
+                                 'cpu_pct': i.get('cpu_pct'), 'rss_mib': i.get('rss_mib'),
+                                 'cmd': ' '.join(shlex.split(str(i.get('cmd') or '')))[:200]}
+                                for i in intensive],
         'allow': sorted(allow), 'actions': actions, 'notified': notified,
         'apply': bool(args.apply),
     }
     thermal.append_jsonl(args.state_dir / 'thermal.jsonl', sample)
     thermal.rotate(args.state_dir / 'thermal.jsonl')
-    if killed_builds or killed_hot:
+    if killed_builds or killed_intensive or killed_hot:
         thermal.append_jsonl(args.state_dir / 'thermal-kills.jsonl',
                              {'ts': sample['ts'], 'temp_c': data['temp_c'], 'level': level,
                               'actions': [a for a in actions if a.get('ok')]})
@@ -161,8 +179,9 @@ def run_once(args, state: dict, now: float) -> tuple[dict, int]:
         'ticks': data['ticks'], 'levels': history[-10:], 'level': level,
         'notified': sent, 'last_sample': sample['ts'], 'last_temp_c': data['temp_c'],
         'last_actions': actions,
+        'cpu_streaks': {str(pid): count for pid, count in streaks.items()},
     }
-    code = 2 if level == 'crit' else (1 if (level == 'warn' or builds) else 0)
+    code = 2 if level == 'crit' else (1 if (level == 'warn' or builds or intensive) else 0)
     return next_state, code
 
 
