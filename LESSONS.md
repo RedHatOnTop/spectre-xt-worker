@@ -452,3 +452,61 @@ path — it is the address, not a statement about the machine — so it neither
 proves nor causes anything, but a resumed session that trusts its own history
 will write sender paths on the receiver. Say which paths are real in the first
 message after the move. (2026-09-26, same handoff.)
+
+## Orca wraps input to a `claude` terminal in bracketed paste, and `claude auth login` keeps the markers
+
+Pasting an OAuth `code#state` into `claude auth login --claudeai` with
+`orca-ide terminal send` failed twice with `Login failed: Request failed with
+status code 400`. Orca classifies a terminal whose foreground process is
+`claude` as `provider: claude` and wraps every send in `ESC[200~ … ESC[201~`;
+the login prompt is not the TUI's paste-aware input and submits the markers as
+part of the code. The same send into a shell terminal arrives clean.
+*Rule:* feed a code to `claude auth login` through a pty you control (write the
+bytes, then `\r`), not through `terminal send`. When a pasted value is
+"rejected", dump what the process actually received (`od -c`) before blaming
+the value. (2026-09-26, Spectre Max switch.)
+
+## `claude -p` inside `ssh host 'bash -s' <<EOF` eats the rest of the script
+
+`bash -s` reads the script from stdin, and `claude -p` also reads stdin, so the
+first `claude -p` swallowed every line after it: the command "succeeded" and
+the checks that followed never ran.
+*Rule:* give every `claude` in a stdin-fed script `</dev/null`.
+(2026-09-26, Spectre Max switch.)
+
+## A `--fork-session` preflight of a `/goal` session runs the goal
+
+Forking a session with `claude --resume <uuid> --fork-session -p "reply ok"` to
+check that its history is accepted by a new endpoint answered `ok` — and then
+the session's `/goal` Stop hook, which is session state and travels with the
+fork, drove about 25 more turns in the real repo cwd. It could not write only
+because `-p` without a bypass flag refuses writes.
+*Rule:* check a transcript for an active `/goal` before any `--resume -p`, never
+give a preflight `--dangerously-skip-permissions` or `bypassPermissions`, and run
+it under an isolated `CLAUDE_CONFIG_DIR` so the fork's transcript stays out of
+the live session list. (2026-09-26, Spectre Max switch.)
+
+## An agent cannot switch its own auth; ship the switch as an operator script
+
+Installing a credential and deleting `ANTHROPIC_BASE_URL`/`ANTHROPIC_AUTH_TOKEN`
+from `~/.claude/settings.json` through the shell is refused by the
+irreversible-guard hook with no override — its effect outlives any approval
+window, so a person has to run it.
+*Rule:* plan an auth or settings change as a reviewed script with its own
+backups from the start (`ssh spectre 'bash -s' < script`, run by the operator
+via `!`), and do everything around it — login, preflight, restart — in the
+agent's own lane. (2026-09-26, Spectre Max switch.)
+
+## `terminal send --enter` into a Claude TUI submits whatever was already typed
+
+To restart an idle Tier-0 session, `orca-ide terminal send --text "/exit"
+--enter` was sent into its prompt. A `2` typed earlier to answer a one-time
+dialog was still in the input box, so the TUI submitted `2/exit`. Tier-0 was
+waiting for the operator to pick among numbered options, read it as "do item
+2", and wrote a memory and ran `git fetch` before it was interrupted.
+*Rule:* do not type into a Claude TUI to stop it. `SIGTERM` the `claude` pid
+(it exits in seconds and prints its `--resume` line), then send the launch
+command into the tab's shell after a raw Ctrl+U. When text must go into a TUI,
+read the screen first, and clear the box with a raw `\x15` if it is not empty.
+If a stray input is submitted anyway, tell the session plainly that it was not
+from the operator. (2026-09-26, Spectre Max switch.)
