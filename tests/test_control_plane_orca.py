@@ -38,6 +38,9 @@ class FakeOrca:
                 return self.create
             return {'ok': True, 'parsed': {'result': {'terminal': {
                 'handle': 'term_new', 'worktreeId': self.bound_to, 'surface': 'background'}}}}
+        if argv[1:3] == ['terminal', 'send']:
+            # pre-close terminal reset (mouse/alt-screen modes off); best effort
+            return {'ok': True, 'parsed': {'ok': True}}
         if argv[1:3] == ['terminal', 'close']:
             return {'ok': True, 'parsed': {'ok': True}}
         raise AssertionError(argv)

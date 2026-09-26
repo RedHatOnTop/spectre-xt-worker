@@ -95,7 +95,28 @@ def retire(handle: str, packet_dir: Path) -> dict:
     return {'ok': True, 'handle': handle}
 
 
+# A full-screen TUI (DSH, qodercli, an editor) enables SGR mouse reporting and
+# normally turns it off on exit. A tab whose process was killed instead keeps
+# reporting, and every mouse movement over it is typed into the shell as
+# `ESC[<b;x;yM` (rendered as `35;96;1M…`). Closing such a tab is the moment the
+# pollution becomes permanent, so reset the modes first.
+TERM_RESET_LINE = ('printf "\\033[?1000l\\033[?1002l\\033[?1003l\\033[?1004l'
+                   '\\033[?1006l\\033[?1049l\\033[?25h"; stty sane 2>/dev/null; '
+                   'tput sgr0 2>/dev/null; clear')
+
+
+def reset(handle: str, run=run_command) -> dict:
+    """Best-effort: clear a terminal a killed TUI left in mouse/alt-screen mode."""
+    if not TAB_HANDLE.fullmatch(str(handle)):
+        return {'ok': False, 'handle': handle, 'error': 'bad_handle'}
+    run(['orca-ide', 'terminal', 'send', '--terminal', str(handle), '--interrupt'], timeout=15)
+    run(['orca-ide', 'terminal', 'send', '--terminal', str(handle), '--text',
+         TERM_RESET_LINE, '--enter'], timeout=15)
+    return {'ok': True, 'handle': handle}
+
+
 def close(handle: str, run=run_command) -> dict:
+    reset(handle, run)
     out = run(['orca-ide', 'terminal', 'close', '--terminal', str(handle), '--tab', '--json'],
               timeout=15)
     if not out.get('ok'):

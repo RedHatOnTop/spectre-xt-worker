@@ -125,8 +125,16 @@ class CloseTest(unittest.TestCase):
             return {'ok': True, 'parsed': {'ok': True}}
 
         self.assertTrue(tidy.close('term_x', run=fake_run)['ok'])
-        self.assertEqual(calls, [['orca-ide', 'terminal', 'close', '--terminal', 'term_x',
-                                  '--tab', '--json']])
+        self.assertEqual(calls, [
+            ['orca-ide', 'terminal', 'send', '--terminal', 'term_x', '--interrupt'],
+            ['orca-ide', 'terminal', 'send', '--terminal', 'term_x', '--text',
+             tidy.TERM_RESET_LINE, '--enter'],
+            ['orca-ide', 'terminal', 'close', '--terminal', 'term_x', '--tab', '--json'],
+        ])
+
+    def test_reset_rejects_a_bad_handle(self):
+        out = tidy.reset('not-a-handle', run=refuse_run)
+        self.assertEqual((out['ok'], out['error']), (False, 'bad_handle'))
 
     def test_close_failure_is_an_error(self):
         out = tidy.close('term_x', run=lambda argv, **kwargs: {'ok': False})
@@ -152,7 +160,8 @@ class SweepTest(TidyCase):
         calls = []
 
         def fake_run(argv, **kwargs):
-            calls.append(argv[4])
+            if argv[2] == 'close':          # ignore the pre-close terminal reset
+                calls.append(argv[4])
             return {'ok': True, 'parsed': {'ok': True}}
 
         closed, retired = tidy.sweep(self.terms, set(), self.packet_dir, NOW, apply=True,
