@@ -32,6 +32,7 @@ REPORT=0
 SETUP_CMD=""
 ARTIFACTS=()
 UPLOADED=0
+STARTED=0
 TIMEOUT="${LIGHTNING_SSH_TIMEOUT:-300}"
 # Build caches that live in the persistent (billed) Studio home.
 CACHE_DIRS='.gradle/caches .m2/repository .cache .npm .cargo/registry'
@@ -104,7 +105,15 @@ cleanup_remote() {
   remote "rm -rf ${REMOTE_DIR}" >/dev/null 2>&1 || true
   UPLOADED=0
 }
-trap 'cleanup_remote' EXIT HUP INT TERM
+# A `die` after the start (SSH wait, rsync install or push) must not leave the Studio
+# running; only a run that started it stops it, and only once.
+stop_studio() {
+  ((STARTED == 1 && KEEP == 0)) || return 0
+  STARTED=0
+  note "stopping Studio ${STUDIO}"
+  "${LIGHTNING_BIN}" studio stop --name "${STUDIO}" --teamspace "${TEAMSPACE}" >&2 || true
+}
+trap 'cleanup_remote; stop_studio' EXIT HUP INT TERM
 
 if ((REPORT == 1)); then
   status="$("${LIGHTNING_BIN}" studio list --teamspace "${TEAMSPACE}" --json 2>/dev/null \
@@ -127,6 +136,7 @@ if ((REPORT == 1)); then
 fi
 
 note "starting Studio ${STUDIO} (${MACHINE})"
+STARTED=1
 "${LIGHTNING_BIN}" studio start --name "${STUDIO}" --teamspace "${TEAMSPACE}" --machine "${MACHINE}" >&2 || true
 
 deadline=$((SECONDS + TIMEOUT))
@@ -201,10 +211,7 @@ fi
 home_used="$(remote 'du -sh "$HOME" 2>/dev/null | cut -f1' | tr -d '[:space:]' || true)"
 studio_used="$(remote 'df -h "$HOME" | awk "NR==2{print \$3}"' | tr -d '[:space:]' || true)"
 
-if ((KEEP == 0)); then
-  note "stopping Studio ${STUDIO}"
-  "${LIGHTNING_BIN}" studio stop --name "${STUDIO}" --teamspace "${TEAMSPACE}" >&2 || true
-fi
+stop_studio
 
 printf '{"ok":%s,"exit":%s,"studio":"%s","remote":"%s","remote_cleaned":"%s","uploaded_bytes":"%s","home_used":"%s","studio_used":"%s","pruned_bytes":%s,"artifacts":"%s"}\n' \
   "$([[ ${rc} -eq 0 ]] && echo true || echo false)" "${rc}" "${STUDIO}" "${REMOTE_DIR}" "${cleaned}" \

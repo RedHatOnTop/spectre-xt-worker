@@ -201,3 +201,55 @@ auto-vs-manual relaunch. Result goes into RUNBOOK §7.21.
    for the 100 %-on-AC heat the guard cannot see.
 3. Decide the speed/silence tradeoff: keep `powersave` (≈800 MHz, coolest) or
    switch the AC governor to `schedutil` with `CPU_MAX_PERF_ON_AC=55`.
+
+## A failure after the start stops the Studio too — 2026-09-27
+
+What happened: two offloads ran back to back. The second one's `studio start`
+got `INFO - Studio buildbox is already running`, and SSH answered. The rsync
+check then failed with `Error: We are still setting things up for you, please
+try again after the progress bar at the top of the Studio disappears.`, so the
+run ended with `could not install rsync in buildbox` (exit 6). The EXIT trap
+only removed the uploaded tree, and only the end of a normal run stopped the
+Studio. So every `die` after the start left the Studio running. The ones
+affected were the SSH wait, the rsync install and the rsync push. The Studio
+was found running two minutes later with `spectre-offload --studio-report`
+(`uptime_s: 130.57`). It was stopped by the next normal run.
+
+The fix: the run sets `STARTED=1` before `studio start`. `stop_studio()` stops
+the Studio only when this run started it and `--keep` was not given, and only
+once. It runs from the EXIT/HUP/INT/TERM trap after `cleanup_remote`, and at
+the normal place before the JSON verdict. `--studio-report` never starts the
+Studio, so it never stops one either.
+
+`tests/test_spectre_offload.py` runs the script against a fake `lightning`,
+`ssh` and `rsync` on `PATH`. A failed remote rsync install exits 6 and stops
+the Studio exactly once. A normal run stops it once. `--keep` and
+`--studio-report` stop nothing.
+
+The same investigation looked at why `home_used` climbed from 1.2G to 2.7G
+over the day's runs. A read-only report found none of it came from the
+control-plane runs, whose trees were all removed (`remote_cleaned: yes`). The
+growth is other sessions' data:
+
+- `~/.gradle`, 1.9G. Of that, `caches` is 1.6G: fabric-loom Minecraft jars and
+  the Gradle 9.4.0 and 9.6.1 API jars.
+- `~/.jdks`, 303M.
+- Trees left in `~/offload`: `tutorial-residuals` 244M,
+  `fmc-panorama-20260926T151219Z-269661` 53M, `rb-before` 23M,
+  `dashboard-runtime` 3.1M and two small ones.
+
+Nothing was deleted. `--prune-caches` would drop the Gradle caches at the cost
+of the next build's download, and the `~/offload` trees belong to whoever left
+them.
+
+The installed `/usr/local/bin/spectre-offload` is identical to the previous
+revision. Installing this one is the operator's step.
+
+Verified the same way as the control-plane slices. `verify.sh` ran through
+`spectre-offload` for `git archive 347f62e` and for the same tree plus the
+changed script and the new test. Both trees gave the same gate results, apart
+from unit tests going from 541 to 544 run, with the same one known Studio
+failure (`test_session_name_falls_back_to_home`). Against the HEAD script, the
+failure-path test fails
+(`Lists differ: [] != ['lightning studio stop --name box --teamspace team']`),
+and the other two pass.
