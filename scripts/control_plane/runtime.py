@@ -8,6 +8,8 @@ from . import budget, cline_free, packets, planning, quota, seat
 from .io import locked, read_json, write_json, run as run_command
 
 TICK_SECONDS = 45
+# A Claude handoff is operator-driven; one left pending this long was likely abandoned.
+CLAUDE_HANDOFF_STALE = 30 * 60
 
 
 def enabled(env: dict, key: str) -> bool:
@@ -65,8 +67,10 @@ def dry_action(worker, entry, snapshot, env, path, now):
         return {'worker': worker, 'action': 'skip', 'reason': snapshot.get('goal', {}).get('state')}
     if not planner:
         return {'worker': worker, 'action': 'goal'}
-    if read_json(path).get('workers', {}).get(worker, {}).get('claude_handoff'):
-        return {'worker': worker, 'action': 'skip', 'reason': 'claude_handoff_pending'}
+    reason = handoff_hold(read_json(path).get('workers', {}).get(worker, {}), now)
+    if reason:
+        return {'worker': worker, 'action': 'escalate' if reason == 'claude_handoff_stale' else 'skip',
+                'reason': reason}
     owner = seat.load(seat.seat_path(seat_root(path, env), worker))['owner']
     reason = pin_refusal(planner, owner)
     if not reason and owner == seat.OWNER_ASTRA:
@@ -77,6 +81,16 @@ def dry_action(worker, entry, snapshot, env, path, now):
     if reason:
         return {'worker': worker, 'action': 'escalate', 'reason': reason}
     return {'worker': worker, 'action': 'plan'}
+
+
+def handoff_hold(ws, now):
+    pending = ws.get('claude_handoff')
+    if not pending:
+        return None
+    launched = pending.get('launched_at') if isinstance(pending, dict) else None
+    if type(launched) not in {int, float} or now - launched > CLAUDE_HANDOFF_STALE:
+        return 'claude_handoff_stale'
+    return 'claude_handoff_pending'
 
 
 def codex_refusal(planner, provider, state, snapshot, now):
@@ -164,8 +178,13 @@ def codex_gate(worker, entry, snapshot, state, path, env, now, run):
 def start_plan(worker, entry, snapshot, state, path, client, env, now, run):
     # spectre-claude stops the old planner before it launches Claude; a plan requested
     # meanwhile would sit unanswered and block the confirm.
-    if state.get('workers', {}).get(worker, {}).get('claude_handoff'):
-        return state, {'worker': worker, 'action': 'skip', 'reason': 'claude_handoff_pending'}
+    ws = state.get('workers', {}).get(worker, {})
+    hold = handoff_hold(ws, now)
+    if hold == 'claude_handoff_stale':
+        new_ws, action = escalation(worker, ws, hold, run, env)
+        return worker_state(state, worker, new_ws), action
+    if hold:
+        return state, {'worker': worker, 'action': 'skip', 'reason': hold}
     planner = entry.get('planner', {})
     owner = seat.load(seat.seat_path(seat_root(path, env), worker))['owner']
     refusal = pin_refusal(planner, owner)

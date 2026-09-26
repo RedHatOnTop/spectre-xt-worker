@@ -20,7 +20,7 @@ from worker_state.qoder_jsonl import workers_path
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('action', choices=('launch', 'send-prompt', 'confirm', 'release'))
+    parser.add_argument('action', choices=('launch', 'send-prompt', 'confirm', 'cancel', 'release'))
     parser.add_argument('--workers-file', type=Path, default=workers_path())
     parser.add_argument('--provider-state', type=Path, default=Path(os.environ.get(
         'SPECTRE_PROVIDER_STATE', Path.home() / '.local/state/remote-agent/codex-provider.json')))
@@ -32,6 +32,7 @@ def main():
     parser.add_argument('--observed-input', action='store_true')
     parser.add_argument('--observed-ready', action='store_true')
     parser.add_argument('--observed-stopped', action='store_true')
+    parser.add_argument('--observed-closed', action='store_true')
     parser.add_argument('--dry-run', action='store_true')
     args = parser.parse_args()
     if args.action in {'send-prompt', 'confirm'} and not args.terminal:
@@ -49,6 +50,8 @@ def main():
         elif args.action == 'confirm':
             output = claude.confirm(*common, args.terminal,
                                     observed_ready=args.observed_ready)
+        elif args.action == 'cancel':
+            output = claude.cancel(args.loop_state, observed_closed=args.observed_closed)
         else:
             output = claude.release(args.workers_file, args.provider_state, args.loop_state,
                                     args.seat_root, observed_stopped=args.observed_stopped)

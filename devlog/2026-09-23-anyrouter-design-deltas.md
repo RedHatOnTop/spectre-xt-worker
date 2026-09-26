@@ -1396,3 +1396,56 @@ built its planner row from the previous fixture's worktree, so the launch it
 meant to block succeeded (`KeyError: 'error'`). The row is now built inside the
 case, and the rerun above is clean. The Claude, seat, handoff-runtime, Kimi and
 install suites pass on the changed tree (63 tests).
+
+## An abandoned Claude handoff is visible and can be cancelled — 2026-09-27
+
+The launcher slice left a gap. `claude_handoff` makes the loop skip minecraft
+planning, but nothing cleared it except `confirm`. An operator who gave up
+after `launch` would have stopped planning silently and for good. Two changes
+close it.
+
+- `spectre-claude cancel --observed-closed` drops the pending handoff. It
+  refuses with `claude_terminal_still_running` and the pids while a `claude`
+  process still runs in the pending tab. The seat and the planner pin never
+  moved before `confirm`, so nothing else needs undoing. It needs neither the
+  gate nor the handoff cap, so a capped day cannot trap a pending handoff.
+- `handoff_hold()` in the loop keeps skipping a pending handoff for 30 minutes
+  (`CLAUDE_HANDOFF_STALE`). After that, and also when `launched_at` is missing
+  or malformed, it escalates `claude_handoff_stale` once and then sits. The dry
+  run reports the same.
+
+Until RUNBOOK.md gets a section, this is the operator procedure. The minecraft
+Efficient worker has to be up first, because `launch` refuses without its pin.
+
+```sh
+export SPECTRE_CLAUDE_ENABLED=1
+spectre-claude launch --dry-run
+spectre-claude launch                       # prints term_<handle>; watch the claude-planner tab
+# clear any trust or bypass-permissions dialog in the tab, then:
+spectre-claude send-prompt --terminal term_<handle> --observed-input
+# read Claude's reply in the tab, then:
+spectre-claude confirm --terminal term_<handle> --observed-ready
+# to abandon before confirm: close the tab, then
+spectre-claude cancel --observed-closed
+# to hand the seat back later: stop Claude, refresh provider health, then
+spectre-claude release --observed-stopped   # next: spectre-astra
+```
+
+### Verification
+
+On Spectre the working-tree CLI refused `cancel` without the flag (`explicit
+observed-closed confirmation required`). With the flag and no pending handoff
+it gave `no_pending_claude_handoff`. Against a scratch loop state holding a
+handoff launched an hour earlier, `spectre-loop --dry-run` with the fixture
+snapshot reported `escalate` / `claude_handoff_stale` for minecraft. `cancel
+--observed-closed` then found no `claude` process for that tab in the live
+`/proc` and cleared it (`{"cancelled": "term_gone", "ok": true}`).
+
+`verify.sh` ran through `spectre-offload` for `git archive e0c81ba` and for
+the same tree plus the four changed files. Both trees gave the same gate
+results, apart from unit tests going from 544 to 546 run, with the same one
+known Studio failure. `spectre-claude` compiled. The two new tests error on the
+HEAD tree (`module 'control_plane.runtime' has no attribute
+'CLAUDE_HANDOFF_STALE'`, `module 'control_plane.claude' has no attribute
+'cancel'`). The Claude, handoff-runtime and control-plane suites pass on the
+changed tree (69 tests).

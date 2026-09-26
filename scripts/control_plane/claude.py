@@ -47,14 +47,7 @@ def context(workers_file: Path, loop_state: Path, seat_root: Path, client, now: 
     entry = workers.get('minecraft')
     if not entry or not entry.get('planner'):
         raise ValueError('minecraft planner worker missing')
-    state = read_json(loop_state)
-    loop_workers = state.get('workers', {})
-    ws = loop_workers.get('minecraft', {}) if isinstance(loop_workers, dict) else None
-    if not isinstance(ws, dict):
-        raise ValueError('loop worker state is invalid')
-    pending = ws.get('claude_handoff') or {}
-    if not isinstance(pending, dict):
-        raise ValueError('pending Claude handoff is invalid')
+    state, ws, pending = loop_worker(loop_state)
     snapshot = client.snapshot('minecraft')
     goal = snapshot.get('goal', {}).get('state')
     if goal in {'UNKNOWN', 'ASSIGNING'} or ws.get('planning'):
@@ -66,6 +59,18 @@ def context(workers_file: Path, loop_state: Path, seat_root: Path, client, now: 
         raise ValueError('handoff_day_cap')
     return {'entry': entry, 'state': state, 'ws': ws, 'pending': pending, 'seat': current,
             'snapshot': snapshot}
+
+
+def loop_worker(loop_state: Path) -> tuple[dict, dict, dict]:
+    state = read_json(loop_state)
+    loop_workers = state.get('workers', {})
+    ws = loop_workers.get('minecraft', {}) if isinstance(loop_workers, dict) else None
+    if not isinstance(ws, dict):
+        raise ValueError('loop worker state is invalid')
+    pending = ws.get('claude_handoff') or {}
+    if not isinstance(pending, dict):
+        raise ValueError('pending Claude handoff is invalid')
+    return state, ws, pending
 
 
 def remember(loop_state: Path, info: dict, pending: dict | None) -> None:
@@ -189,6 +194,24 @@ def confirm(workers_file: Path, loop_state: Path, seat_root: Path, client, handl
             return {'ok': False, 'error': 'loop_state_update_failed',
                     'seat_committed': True, 'terminal': handle}
         return {'ok': True, 'owner': seat.OWNER_CLAUDE, 'terminal': handle}
+
+
+def cancel(loop_state: Path, *, observed_closed=False, scan=inventory.scan) -> dict:
+    """Drop an abandoned handoff once its Claude process is gone; the seat never moved."""
+    if not observed_closed:
+        raise ValueError('explicit observed-closed confirmation required')
+    with locked(loop_state.with_suffix('.lock')):
+        state, ws, pending = loop_worker(loop_state)
+        if not pending:
+            return {'ok': False, 'error': 'no_pending_claude_handoff'}
+        handle = pending.get('terminal')
+        running = [row['pid'] for row in scan()
+                   if handle and row.get('handle') == handle and row.get('model') == 'claude']
+        if running:
+            return {'ok': False, 'error': 'claude_terminal_still_running', 'terminal': handle,
+                    'pids': running}
+        remember(loop_state, {'state': state, 'ws': ws}, None)
+        return {'ok': True, 'cancelled': handle}
 
 
 def release(workers_file: Path, provider_state: Path, loop_state: Path, seat_root: Path,

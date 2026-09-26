@@ -167,7 +167,8 @@ class ClaudeHandoffTest(unittest.TestCase):
         self.assertEqual(sum(call[0][2] == 'create' for call in self.calls), 1)
 
     def test_loop_does_not_plan_while_the_handoff_is_pending(self):
-        write_json(self.loop, {'workers': {'minecraft': {'claude_handoff': {'terminal': 'term_claude'}}}})
+        write_json(self.loop, {'workers': {'minecraft': {'claude_handoff': {
+            'terminal': 'term_claude', 'launched_at': fixtures.NOW - 60}}}})
         state = read_json(self.loop)
         snapshot = {'goal': {'state': 'COMPLETED'}, 'policy': {'grokbot_may_advance': True}}
         entry = read_json(self.workers)['workers']['minecraft']
@@ -179,6 +180,48 @@ class ClaudeHandoffTest(unittest.TestCase):
                                  self.loop, fixtures.NOW)
         self.assertEqual(dry['reason'], 'claude_handoff_pending')
         self.assertEqual(self.calls, [])
+
+    def test_an_abandoned_handoff_escalates_once(self):
+        write_json(self.loop, {'workers': {'minecraft': {'claude_handoff': {
+            'terminal': 'term_claude',
+            'launched_at': fixtures.NOW - runtime.CLAUDE_HANDOFF_STALE - 1}}}})
+        snapshot = {'goal': {'state': 'COMPLETED'}, 'policy': {'grokbot_may_advance': True}}
+        entry = read_json(self.workers)['workers']['minecraft']
+        sent = []
+
+        def notify(argv, **_kwargs):
+            sent.append(argv)
+            return {'ok': True}
+
+        state, first = runtime.start_plan('minecraft', entry, snapshot, read_json(self.loop),
+                                          self.loop, self.client, {}, fixtures.NOW, notify)
+        _, second = runtime.start_plan('minecraft', entry, snapshot, state, self.loop,
+                                       self.client, {}, fixtures.NOW + 30, notify)
+        dry = runtime.dry_action('minecraft', entry, snapshot, {'ASTRA_ENABLED': '1'},
+                                 self.loop, fixtures.NOW)
+        self.assertEqual((first['action'], first['reason']), ('escalate', 'claude_handoff_stale'))
+        self.assertEqual((second['action'], second['reason']), ('sit', 'claude_handoff_stale'))
+        self.assertEqual((dry['action'], dry['reason']), ('escalate', 'claude_handoff_stale'))
+        self.assertEqual(len(sent), 1)
+        self.assertFalse(any('--dispatch' in argv for argv in sent))
+
+    def test_cancel_drops_an_abandoned_handoff_once_claude_is_gone(self):
+        with self.assertRaisesRegex(ValueError, 'observed-closed'):
+            claude.cancel(self.loop)
+        self.assertEqual(claude.cancel(self.loop, observed_closed=True, scan=lambda: [])['error'],
+                         'no_pending_claude_handoff')
+        self.step('launch')
+        self.running()
+        still = claude.cancel(self.loop, observed_closed=True, scan=lambda: self.processes)
+        self.assertEqual((still['error'], still['pids']), ('claude_terminal_still_running', [12]))
+        self.assertEqual(self.pending()['terminal'], 'term_claude')
+        self.processes = self.processes[:1]
+        self.assertEqual(claude.cancel(self.loop, observed_closed=True, scan=lambda: self.processes),
+                         {'ok': True, 'cancelled': 'term_claude'})
+        self.assertIsNone(self.pending())
+        self.assertEqual(seat.load(seat.seat_path(self.root))['owner'], 'codex')
+        self.assertEqual(read_json(self.workers)['workers']['minecraft']['planner'],
+                         {'terminal': 'term_astra'})
 
     def test_release_returns_a_stopped_claude_seat_to_codex(self):
         self.step('launch')
