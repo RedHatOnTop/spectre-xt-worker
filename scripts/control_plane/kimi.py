@@ -76,7 +76,7 @@ def probe(endpoint: str, key: str, timeout: float = 15) -> dict:
 
 
 def context(workers_file: Path, provider_state: Path, loop_state: Path,
-            seat_root: Path, client, now: float, env: dict) -> dict:
+            seat_root: Path, client, now: float, env: dict, resume: str | None = None) -> dict:
     if not seat_root.is_absolute():
         raise ValueError('SPECTRE_SEAT_ROOT must be absolute')
     if not runtime.enabled(env, 'SPECTRE_KIMI_ENABLED'):
@@ -88,34 +88,42 @@ def context(workers_file: Path, provider_state: Path, loop_state: Path,
     entry = workers.get('minecraft')
     if not entry or not entry.get('planner'):
         raise ValueError('minecraft planner worker missing')
-    health = read_json(provider_state)
-    checked_at = health.get('checked_at')
-    if (not health.get('ok') or health.get('id') != 'kimi_free'
-            or type(checked_at) not in {int, float} or now - checked_at > 600
-            or checked_at > now + 30):
-        raise ValueError('fresh kimi_free provider selection required')
+    current = seat.load(seat.seat_path(seat_root))
+    # A confirm that committed the seat and then failed to write the pin or the loop
+    # state is finished by confirming the same terminal again, whatever the provider
+    # selection and the goal did in the meantime.
+    resumed = (resume is not None and current['owner'] == seat.OWNER_KIMI
+               and current.get('terminal') == resume)
+    if not resumed:
+        health = read_json(provider_state)
+        checked_at = health.get('checked_at')
+        if (not health.get('ok') or health.get('id') != 'kimi_free'
+                or type(checked_at) not in {int, float} or now - checked_at > 600
+                or checked_at > now + 30):
+            raise ValueError('fresh kimi_free provider selection required')
     state = read_json(loop_state)
     loop_workers = state.get('workers')
     if not isinstance(loop_workers, dict) or not isinstance(loop_workers.get('minecraft'), dict):
         raise ValueError('loop worker state is invalid')
     pending = loop_workers['minecraft'].get('handoff')
-    snapshot = client.snapshot('minecraft')
     if (not isinstance(pending, dict) or pending.get('to') != seat.OWNER_KIMI
-            or snapshot.get('goal', {}).get('state') not in {'COMPLETED', 'FAILED'}
-            or snapshot.get('policy', {}).get('continuity_recovery_allowed')
-            or pending.get('origin') != planning.identity(snapshot)
             or pending.get('brief') != str(seat.brief_path(seat_root))):
         raise ValueError('current authoritative Kimi handoff required')
-    current = seat.load(seat.seat_path(seat_root))
-    if current['owner'] != seat.OWNER_ASTRA:
-        raise ValueError(f"seat_owned_by_{current['owner']}")
-    if not seat.can_handoff(current, now)[0]:
-        raise ValueError('handoff_day_cap')
+    if not resumed:
+        snapshot = client.snapshot('minecraft')
+        if (snapshot.get('goal', {}).get('state') not in {'COMPLETED', 'FAILED'}
+                or snapshot.get('policy', {}).get('continuity_recovery_allowed')
+                or pending.get('origin') != planning.identity(snapshot)):
+            raise ValueError('current authoritative Kimi handoff required')
+        if current['owner'] != seat.OWNER_ASTRA:
+            raise ValueError(f"seat_owned_by_{current['owner']}")
+        if not seat.can_handoff(current, now)[0]:
+            raise ValueError('handoff_day_cap')
     brief = seat.brief_path(seat_root)
     if brief.is_symlink() or not brief.is_file() or not brief.read_text().strip():
         raise ValueError('nonempty handoff brief required')
     return {'entry': entry, 'state': state, 'pending': pending, 'seat': current,
-            'brief': brief}
+            'brief': brief, 'resumed': resumed}
 
 
 def set_planner(workers_file: Path, planner: dict) -> None:
@@ -239,20 +247,22 @@ def confirm(workers_file: Path, provider_state: Path, loop_state: Path,
     if not HANDLE_PATTERN.fullmatch(handle):
         raise ValueError('invalid terminal handle')
     with locked(loop_state.with_suffix('.lock')):
-        info = context(workers_file, provider_state, loop_state, seat_root, client, now, env)
+        info = context(workers_file, provider_state, loop_state, seat_root, client, now, env,
+                       resume=handle)
         if (info['pending'].get('terminal') != handle
                 or not info['pending'].get('prompt_sent_at')):
             raise ValueError('prompted Kimi terminal required')
         if not live_terminal(orca_terminals(run), scan(), info['entry']['cwd'], handle, 'kimi'):
             return {'ok': False, 'error': 'kimi_terminal_unconfirmed'}
-        updated = seat.transition(info['seat'], now, to=seat.OWNER_KIMI,
-                                  brief=str(info['brief']))
-        if not updated['ok']:
-            return updated
-        committed = seat.commit_if_current(seat.seat_path(seat_root), info['seat'],
-                                           {**updated['seat'], 'terminal': handle})
-        if not committed['ok']:
-            return committed
+        if not info['resumed']:
+            updated = seat.transition(info['seat'], now, to=seat.OWNER_KIMI,
+                                      brief=str(info['brief']))
+            if not updated['ok']:
+                return updated
+            committed = seat.commit_if_current(seat.seat_path(seat_root), info['seat'],
+                                               {**updated['seat'], 'terminal': handle})
+            if not committed['ok']:
+                return committed
         try:
             set_planner(workers_file, {'terminal': handle, 'harness': seat.OWNER_KIMI,
                                        'model': UPSTREAM_MODEL, 'provider': providers.KIMI_FREE})
@@ -266,7 +276,8 @@ def confirm(workers_file: Path, provider_state: Path, loop_state: Path,
         except OSError:
             return {'ok': False, 'error': 'loop_state_update_failed',
                     'seat_committed': True, 'terminal': handle}
-        return {'ok': True, 'owner': seat.OWNER_KIMI, 'terminal': handle}
+        return {'ok': True, 'owner': seat.OWNER_KIMI, 'terminal': handle,
+                **({'resumed': True} if info['resumed'] else {})}
 
 
 def release(workers_file: Path, provider_state: Path, loop_state: Path,

@@ -346,6 +346,37 @@ class KimiHandoffTest(unittest.TestCase):
                                     'seat_committed': True})
         self.assertEqual(seat.load(seat.seat_path(self.root))['owner'], 'codex')
 
+    def test_a_confirm_that_fails_after_the_seat_commit_is_finished_by_confirming_again(self):
+        failures = (('control_plane.kimi.set_planner', 'registry_update_failed'),
+                    ('control_plane.kimi.runtime.worker_state', 'loop_state_update_failed'))
+        for target, error in failures:
+            with self.subTest(error=error):
+                self.tearDown()
+                self.setUp()
+                self.prompted()
+                confirm = dict(observed_ready=True, env={'SPECTRE_KIMI_ENABLED': '1'},
+                               run=self.fake_run, scan=lambda: self.processes)
+                with patch(target, side_effect=OSError):
+                    failed = kimi.confirm(self.workers, self.provider, self.loop, self.root,
+                                          self.client, 'term_kimi', now=fixtures.NOW + 2, **confirm)
+                self.assertEqual((failed['error'], failed['seat_committed']), (error, True))
+                # The provider moved on and the Kimi selection went stale meanwhile.
+                write_json(self.provider, {'ok': True, 'id': 'anyrouter', 'checked_at': fixtures.NOW + 3})
+
+                again = kimi.confirm(self.workers, self.provider, self.loop, self.root,
+                                     self.client, 'term_kimi', now=fixtures.NOW + 900, **confirm)
+
+                self.assertEqual(again, {'ok': True, 'owner': 'kimi', 'terminal': 'term_kimi',
+                                         'resumed': True})
+                self.assertEqual(read_json(self.workers)['workers']['minecraft']['planner']['harness'],
+                                 'kimi')
+                self.assertIsNone(read_json(self.loop)['workers']['minecraft']['handoff'])
+                self.assertEqual(seat.load(seat.seat_path(self.root))['handoff_count'], 1)
+        with self.assertRaisesRegex(ValueError, 'fresh kimi_free provider selection required'):
+            kimi.send_prompt(self.workers, self.provider, self.loop, self.root, self.client,
+                             'term_kimi', now=fixtures.NOW + 901, env={'SPECTRE_KIMI_ENABLED': '1'},
+                             run=self.fake_run, scan=lambda: self.processes)
+
     def test_running_claude_planner_blocks_kimi_launch_and_release(self):
         claude = {'model': 'claude', 'cwd': str(self.cwd), 'handle': 'term_claude'}
         self.processes = [*self.processes, claude]

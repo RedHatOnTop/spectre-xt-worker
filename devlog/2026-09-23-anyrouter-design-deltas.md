@@ -1503,3 +1503,25 @@ new tests fail:
 The Claude, handoff-runtime, offload and control-plane suites pass on the
 change (79 tests). The run itself ended with `leaving Studio buildbox running:
 it was already up when this offload began`.
+
+### `kimi.confirm()` resumes too — 2026-09-27
+
+The Kimi gap left open above is closed the same way. The recovery the Kimi
+slice designed was `release`, which gives the seat back to codex. That path
+stays. A retried `confirm` for the terminal the seat was committed with now
+finishes the handoff instead. `context(resume=handle)` loads the seat first.
+When the seat is already Kimi with that terminal, it skips the checks that
+only guard a new handoff: the fresh `kimi_free` selection, the goal state and
+origin, the codex owner and the daily cap. It keeps the registry, the pending
+`handoff` addressed to Kimi with the brief path, and the brief itself. The new
+test fails each of the two writes after the seat commit. It then moves the
+provider to `anyrouter`, lets the Kimi selection go stale (retry at +900 s),
+and expects `"resumed": true`, the Kimi pin, a cleared handoff and one counted
+handoff. `send-prompt` still refuses once the seat is Kimi.
+
+Verification: `verify.sh` ran through the working-tree offload on `git archive
+84616c1` and on the same tree plus the two changed files. Both trees gave the
+same gate results, apart from unit tests going from 553 to 554 run, with the
+same one known Studio failure. On HEAD the new test's retried confirm raises
+`ValueError: fresh kimi_free provider selection required` in both cases. The
+Kimi, handoff-runtime and Claude suites pass on the change (54 tests).
