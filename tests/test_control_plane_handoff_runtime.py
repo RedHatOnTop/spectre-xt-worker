@@ -1,7 +1,7 @@
 """Runtime handoff requests must not masquerade as a running Kimi seat."""
 from __future__ import annotations
 
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 import io
 import json
 import os
@@ -12,7 +12,7 @@ from unittest.mock import Mock, patch
 
 from tests import test_control_plane as fixtures
 from control_plane import astra, cli, providers, seat
-from control_plane.io import read_json, write_json
+from control_plane.io import locked, read_json, write_json
 
 
 class HandoffRuntimeTest(unittest.TestCase):
@@ -144,6 +144,76 @@ class HandoffRuntimeTest(unittest.TestCase):
                 self.assertEqual(result['actions'][0]['reason'], reason)
                 self.assertFalse(any('--dispatch' in command for command in self.sent))
                 self.assertEqual(self.client.snapshot('minecraft')['goal']['state'], 'COMPLETED')
+
+
+class LoopRegistryTest(unittest.TestCase):
+    setUp = fixtures.LoopRuntimeTest.setUp
+    tearDown = fixtures.LoopRuntimeTest.tearDown
+    run_command = fixtures.LoopRuntimeTest.run_command
+    tick = fixtures.LoopRuntimeTest.tick
+
+    def test_tick_plans_with_the_pin_read_under_the_loop_lock(self):
+        fixtures.completed(self.store)
+        write_json(seat.seat_path(self.root), {**seat.default_state(), 'owner': 'kimi'})
+        write_json(self.root / 'provider.json', {'ok': False, 'id': 'openai', 'checked_at': 0})
+        confirmed = {**self.entry, 'planner': {'terminal': 'term_kimi', 'harness': 'kimi'}}
+
+        def load():
+            with self.assertRaises(BlockingIOError), locked(self.path.with_suffix('.lock')):
+                pass
+            return {'minecraft': confirmed}
+
+        result = self.tick(load=load)
+
+        self.assertEqual(result['actions'][0]['action'], 'plan')
+        self.assertEqual(len([c for c in self.sent if '--dispatch' in c]), 1)
+
+    def test_registry_read_under_the_loop_lock_is_validated(self):
+        fixtures.completed(self.store)
+        cases = (({}, 'worker registry is empty or unreadable'),
+                 ({'flash': self.entry}, 'planner is legal only on minecraft'))
+        for loaded, message in cases:
+            with self.subTest(loaded=loaded):
+                with self.assertRaisesRegex(ValueError, message):
+                    self.tick(load=lambda: loaded)
+                self.assertEqual(self.sent, [])
+
+    def test_loop_main_hands_the_tick_a_registry_reader(self):
+        workers_file = self.root / 'workers.json'
+        write_json(workers_file, {'workers': {'minecraft': self.entry}})
+        confirmed = {**self.entry, 'planner': {'terminal': 'term_kimi', 'harness': 'kimi'}}
+        seen = []
+
+        def tick(workers, client, path, env, *, dry, load):
+            write_json(workers_file, {'workers': {'minecraft': confirmed}})
+            seen.append((workers, load()))
+            return {'ok': True, 'dry_run': dry, 'actions': []}
+
+        with (patch.dict(os.environ, {'SPECTRE_LOOP': '1', 'SPECTRE_LOOP_STATE': str(self.path)}),
+              patch.object(cli.runtime, 'tick', side_effect=tick),
+              redirect_stdout(io.StringIO())):
+            self.assertEqual(cli.loop_main(['--workers-file', str(workers_file)]), 0)
+
+        self.assertEqual(seen, [({'minecraft': self.entry}, {'minecraft': confirmed})])
+
+    def test_loop_main_prints_a_verdict_when_the_tick_crashes(self):
+        fixtures.completed(self.store)
+        workers_file = self.root / 'workers.json'
+        write_json(workers_file, {'workers': {'minecraft': self.entry}})
+        write_json(self.path, {'workers': []})
+
+        with (patch.dict(os.environ, {**self.env, 'SPECTRE_LOOP_STATE': str(self.path)}),
+              patch.object(cli, 'StateClient', return_value=self.client),
+              redirect_stdout(io.StringIO()) as stdout,
+              redirect_stderr(io.StringIO()) as stderr):
+            code = cli.loop_main(['--workers-file', str(workers_file)])
+
+        self.assertEqual(code, 1)
+        self.assertEqual(json.loads(stdout.getvalue()),
+                         {'ok': False, 'error': "AttributeError: 'list' object has no attribute 'get'"})
+        self.assertIn('Traceback', stderr.getvalue())
+        with locked(self.path.with_suffix('.lock')):
+            pass
 
 
 class AstraKimiGuardTest(unittest.TestCase):

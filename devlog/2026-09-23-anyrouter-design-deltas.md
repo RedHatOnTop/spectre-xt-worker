@@ -851,3 +851,75 @@ Still open:
   without naming the lock.
 - Astra and Kimi do not write tab records yet. A launcher that records a
   long-lived agent tab must pin it too, or the RSS rule selects it.
+
+## The loop reads the registry under its own lock — 2026-09-26
+
+This slice closes the `cli.loop_main()` registry race listed under P2 and gives
+the loop the same always-a-verdict exit as the reaper.
+
+**The tick reads the registry after it takes the loop lock.** `spectre-kimi
+confirm` and `release` hold `spectre-loop.lock` while they commit the seat and
+rewrite the minecraft planner pin. `loop_main()` read `workers.json` before
+`runtime.tick()` took that lock. A tick that read the registry just before a
+`confirm` and took the lock just after it therefore paired the new Kimi seat
+with the Astra pin it had read earlier and escalated `seat_owned_by_kimi`. The
+same window around a `release` escalated `planner_harness_mismatch`. (A tick
+that finds the lock held does not wait; it exits 1 with `[Errno 11]`.) Now
+`tick()` takes a `load` callable.
+When one is given, it reads the registry again after taking the lock, refuses
+an empty one, and validates it before `live_tick()` sees it. `loop_main()`
+passes one that re-reads `--workers-file`. The first read stays, because it
+validates the registry early and is all that `--dry-run` uses. A dry run takes
+no lock.
+
+The Astra launcher and `native-worker-pin-sync` write the registry under the
+registry lock only. Neither can pair a pin with a different seat. The launcher
+sets the codex planner pin after `release()` has already moved the seat to
+codex, and pin sync does not touch `planner`. A tick that reads just before
+either of them acts on the registry as it was a moment earlier.
+
+**`loop_main()` always prints a verdict.** An exception outside `OSError`,
+`ValueError` and `RuntimeError` used to escape as a bare traceback, with
+nothing on stdout. Now it is reported as `{"ok": false, "error": "<Type>:
+<message>"}` with exit 1, and the traceback goes to stderr. The test case is a
+loop state whose `workers` field is a list. `read_json()` accepts it because
+the top level is an object, and `progress()` fails with `AttributeError:
+'list' object has no attribute 'get'`. The loop lock is released afterwards.
+
+### Verification
+
+A dry run of the working-tree `scripts/spectre-loop.py --dry-run` on Spectre,
+with `SPECTRE_LOOP=1` and a scratch `SPECTRE_LOOP_STATE`, exited 0 with five
+decisions (`goal` for `pugc`, `skip` for the other four) and an empty stderr. It
+wrote neither a lock nor a state file. The live path was not run on Spectre,
+because a live tick dispatches to real terminals. `spectre-loop.timer` is
+disabled, and the installed `runtime.py` and `cli.py` are identical to HEAD.
+
+`verify.sh` ran through `spectre-offload` for `git archive HEAD` (`6f399e2`)
+and for the same tree plus the four changed files, with the toolchain of the
+previous slices (Node 22.23.2, `/usr/bin/python3` 3.12.3):
+
+| Gate | HEAD `6f399e2` | This slice |
+| --- | --- | --- |
+| `bash -n` | 32 ok | 32 ok |
+| shellcheck | SKIP, not installed | SKIP, not installed |
+| `py_compile` | ok | ok |
+| slack bridge, `node --test` | 77 pass | 77 pass |
+| devcodex, vendored | 69 pass, 8 fail | 69 pass, the same 8 fail |
+| unit tests | 519 run, 1 failure | 523 run, the same 1 failure |
+
+The failures are the two Studio issues recorded for the earlier slices. The
+same run copied the two changed test files onto the HEAD tree and ran the four
+new tests there. All four fail. Three fail only because HEAD has no `load`
+parameter (`TypeError: tick() got an unexpected keyword argument 'load'`, and
+the fake tick in the `loop_main()` test is called without one). The catch-all
+test errors with the escaped `AttributeError: 'list' object has no attribute
+'get'`. The stale pairing itself is already covered at HEAD: the seat case table
+turns a Kimi seat with the Astra pin into `seat_owned_by_kimi`.
+
+Still open:
+
+- Reinstalling the control plane is the operator's deploy step, and the loop
+  timer stays disabled.
+- `ASTRA_ENABLED` still gates planning for every seat, and `dry_action()` still
+  reports `plan` without looking at the seat.

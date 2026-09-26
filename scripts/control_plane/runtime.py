@@ -347,7 +347,7 @@ def progress(worker, entry, snapshot, state, path, client, env, now, run):
     return state, notice_action or {'worker': worker, 'action': 'skip'}
 
 
-def tick(workers, client, path, env, *, now=None, dry=False, run=run_command):
+def tick(workers, client, path, env, *, now=None, dry=False, run=run_command, load=None):
     if not enabled(env, 'SPECTRE_LOOP'):
         return {'ok': True, 'disabled': True, 'dry_run': dry}
     validate_workers(workers)
@@ -356,6 +356,13 @@ def tick(workers, client, path, env, *, now=None, dry=False, run=run_command):
         return {'ok': True, 'dry_run': True, 'actions': [dry_action(name, entry,
             client.snapshot(name), env) for name, entry in sorted(workers.items())]}
     with locked(path.with_suffix('.lock')):
+        # spectre-kimi commits the seat and rewrites the planner pin under this lock; a
+        # registry read before it was taken can pair the new seat with the old pin.
+        if load is not None:
+            workers = load()
+            if not workers:
+                raise ValueError('worker registry is empty or unreadable')
+            validate_workers(workers)
         return live_tick(workers, client, path, env, now, run)
 
 

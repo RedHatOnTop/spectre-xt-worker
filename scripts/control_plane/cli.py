@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import time
+import traceback
 
 from . import cline_free, providers, runtime
 from .io import read_json, run, write_json
@@ -40,9 +41,14 @@ def loop_main(argv=None):
         if not workers and runtime.enabled(env, 'SPECTRE_LOOP'):
             raise ValueError('worker registry is empty or unreadable')
         path = Path(env.get('SPECTRE_LOOP_STATE', Path.home() / '.local/state/remote-agent/spectre-loop.json'))
-        output = runtime.tick(workers, client, path, env, dry=args.dry_run)
+        output = runtime.tick(workers, client, path, env, dry=args.dry_run,
+                              load=lambda: load_workers(args.workers_file))
     except (OSError, ValueError, RuntimeError) as exc:
         output = {'ok': False, 'error': str(exc)}
+    except Exception as exc:
+        # A timer run must still leave one JSON verdict on stdout; the journal keeps the trace.
+        traceback.print_exc()
+        output = {'ok': False, 'error': f'{type(exc).__name__}: {exc}'}
     print(json.dumps(output, sort_keys=True))
     return 0 if output['ok'] else 1
 

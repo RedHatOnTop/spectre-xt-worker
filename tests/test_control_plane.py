@@ -106,10 +106,10 @@ class LoopRuntimeTest(unittest.TestCase):
         self.sent.append(argv)
         return {'ok': True, 'parsed': {'ok': True, 'evt': 'dispatch_sent'}}
 
-    def tick(self, workers=None, now=NOW, dry=False):
+    def tick(self, workers=None, now=NOW, dry=False, load=None):
         self.client.now = now
         return runtime.tick(workers or {'minecraft': self.entry}, self.client,
-            self.path, self.env, now=now, dry=dry, run=self.run_command)
+            self.path, self.env, now=now, dry=dry, run=self.run_command, load=load)
 
     def test_plan_once_then_stable_packets_then_single_dispatch(self):
         completed(self.store)
