@@ -1115,3 +1115,50 @@ Both new bridge tests fail against the HEAD bridge. The CLI test, which
 dispatches a Claude-seat plan with one Claude in the worktree and one
 elsewhere, gets `dispatch_claude_busy` instead of reaching the state probe
 (`dispatch_probe_failed`, since the socket is a missing scratch path).
+
+## The dry run reports the codex gates — 2026-09-26
+
+The seat slice above left the dry run blind to the codex gates. For a codex
+seat, `dry_action()` now reads the provider state and the loop state and
+reports the first refusal the live gate would escalate, using
+`codex_refusal()`: the budget refusal (`provider_health_stale`,
+`provider_cooldown`, `plus_normal_cap`, `plus_critical_cap`), then
+`kimi_handoff_required`, then `provider_restart_required`. The live
+`codex_gate()` keeps its own sequence, because it prepares the Kimi handoff
+brief between the budget and restart checks. Where that preparation fails, the
+live tick escalates the preparation error (for example `handoff_day_cap`) and
+the dry run still says `kimi_handoff_required`. `provider_path()` now holds the
+provider-state default that both paths read. Both files are only read, so the
+dry run still takes no lock and writes nothing.
+
+### Verification
+
+On Spectre, the working-tree and installed `spectre-loop --dry-run` ran against
+the real registry, the live seat root (codex) and a copy of the live provider
+state, with the fixture snapshot from the seat slice. The live provider state
+names `openai` and was checked 29183 s earlier. There is no live loop state
+file, so the loop state read as empty.
+
+| | Working tree | Installed (= `6f399e2`) |
+| --- | --- | --- |
+| minecraft | `escalate`, `provider_health_stale` | `plan` |
+
+A live tick would escalate `provider_health_stale` there. Both runs exited 0
+with an empty stderr.
+
+`verify.sh` ran through `spectre-offload` for `git archive 969251d` and for
+the same tree plus the two changed files:
+
+| Gate | HEAD `969251d` | This slice |
+| --- | --- | --- |
+| `bash -n` | 32 ok | 32 ok |
+| shellcheck | SKIP, not installed | SKIP, not installed |
+| `py_compile` | ok | ok |
+| slack bridge, `node --test` | 79 pass | 79 pass |
+| devcodex, vendored | 69 pass, 8 fail | 69 pass, the same 8 fail |
+| unit tests | 527 run, 1 failure | 528 run, the same 1 failure |
+
+The new test runs each case as a dry run and then as a live tick, and requires
+both to give the same reason. On the HEAD loop all five dry rows fail with
+`('plan', None)`. On the changed tree the handoff-runtime, control-plane and
+`spectre-loop` suites pass (64 tests).

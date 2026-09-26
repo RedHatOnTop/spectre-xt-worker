@@ -167,6 +167,32 @@ class HandoffRuntimeTest(unittest.TestCase):
                 self.assertFalse(self.path.exists())
 
 
+    def test_dry_run_reports_the_codex_gate_the_live_tick_escalates(self):
+        fixtures.completed(self.store)
+        fresh = {'ok': True, 'id': 'anyrouter', 'checked_at': fixtures.NOW}
+        plus_plans = {'plans': [{'at': fixtures.NOW - 60 * n, 'provider': 'openai', 'critical': False}
+                                for n in (1, 2, 3)]}
+        cases = (
+            ({**fresh, 'ok': False}, {}, {}, 'provider_health_stale'),
+            ({**fresh, 'cooldown_until': fixtures.NOW + 60}, {}, {}, 'provider_cooldown'),
+            ({**fresh, 'id': 'openai'}, plus_plans, {}, 'plus_normal_cap'),
+            (fresh, {}, {'provider': 'agentrouter'}, 'provider_restart_required'),
+            ({**fresh, 'id': 'kimi_free'}, {}, {}, 'kimi_handoff_required'),
+        )
+        for provider, loop_state, pin, reason in cases:
+            with self.subTest(reason=reason):
+                write_json(self.root / 'provider.json', provider)
+                write_json(self.path, loop_state)
+                self.entry = {**self.entry, 'planner': {'terminal': 'term_astra', **pin}}
+
+                dry = self.tick(dry=True)['actions'][0]
+                live = self.tick()['actions'][0]
+
+                self.assertEqual((dry['action'], dry.get('reason')), ('escalate', reason))
+                self.assertEqual(live.get('reason'), reason)
+                self.assertFalse(any('--dispatch' in command for command in self.sent))
+
+
 class LoopRegistryTest(unittest.TestCase):
     setUp = fixtures.LoopRuntimeTest.setUp
     tearDown = fixtures.LoopRuntimeTest.tearDown

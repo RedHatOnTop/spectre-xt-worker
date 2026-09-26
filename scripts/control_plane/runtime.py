@@ -56,7 +56,7 @@ def escalation(worker, ws, reason, run, env):
     return updated, {'worker': worker, 'action': 'escalate', 'reason': reason, 'io': out}
 
 
-def dry_action(worker, entry, snapshot, env, path):
+def dry_action(worker, entry, snapshot, env, path, now):
     policy = snapshot.get('policy', {})
     planner = entry.get('planner')
     if planner and not enabled(env, 'ASTRA_ENABLED'):
@@ -66,10 +66,29 @@ def dry_action(worker, entry, snapshot, env, path):
     if not planner:
         return {'worker': worker, 'action': 'goal'}
     owner = seat.load(seat.seat_path(seat_root(path, env), worker))['owner']
-    reason = pin_refusal(planner, owner) or (None if planner.get('terminal') else 'planner_terminal_missing')
+    reason = pin_refusal(planner, owner)
+    if not reason and owner == seat.OWNER_ASTRA:
+        reason = codex_refusal(planner, read_json(provider_path(env)), read_json(path), snapshot, now)
+    reason = reason or (None if planner.get('terminal') else 'planner_terminal_missing')
     if reason:
         return {'worker': worker, 'action': 'escalate', 'reason': reason}
     return {'worker': worker, 'action': 'plan'}
+
+
+def codex_refusal(planner, provider, state, snapshot, now):
+    # codex_gate() also writes the Kimi handoff brief; a dry run only names the verdict.
+    reason = budget.planner_refusal(state, provider, now, snapshot['goal']['state'] == 'FAILED')
+    if reason:
+        return reason
+    if provider.get('id') == 'kimi_free':
+        return 'kimi_handoff_required'
+    if planner.get('provider') and planner['provider'] != provider.get('id'):
+        return 'provider_restart_required'
+    return None
+
+
+def provider_path(env):
+    return Path(env.get('SPECTRE_PROVIDER_STATE', Path.home() / '.local/state/remote-agent/codex-provider.json'))
 
 
 def pin_refusal(planner: dict, owner: str) -> str | None:
@@ -117,8 +136,7 @@ def planner_seat(worker, snapshot, state, path, env, provider, now, run):
 def codex_gate(worker, entry, snapshot, state, path, env, now, run):
     ws = state.get('workers', {}).get(worker, {})
     planner = entry.get('planner', {})
-    provider_path = Path(env.get('SPECTRE_PROVIDER_STATE', Path.home() / '.local/state/remote-agent/codex-provider.json'))
-    provider = read_json(provider_path)
+    provider = read_json(provider_path(env))
     reason = budget.planner_refusal(state, provider, now, snapshot['goal']['state'] == 'FAILED')
     if reason:
         new_ws, action = escalation(worker, ws, reason, run, env)
@@ -365,7 +383,7 @@ def tick(workers, client, path, env, *, now=None, dry=False, run=run_command, lo
     now = time.time() if now is None else now
     if dry:
         return {'ok': True, 'dry_run': True, 'actions': [dry_action(name, entry,
-            client.snapshot(name), env, path) for name, entry in sorted(workers.items())]}
+            client.snapshot(name), env, path, now) for name, entry in sorted(workers.items())]}
     with locked(path.with_suffix('.lock')):
         # spectre-kimi commits the seat and rewrites the planner pin under this lock; a
         # registry read before it was taken can pair the new seat with the old pin.
