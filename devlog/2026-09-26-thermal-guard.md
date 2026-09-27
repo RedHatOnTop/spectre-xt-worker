@@ -338,3 +338,15 @@ new tests fail:
 The Claude, handoff-runtime, offload and control-plane suites pass on the
 change (79 tests). The run itself ended with `leaving Studio buildbox running:
 it was already up when this offload began`.
+
+### Installed — 2026-09-27
+
+With the operator's approval, the wrapper from `61652f9` is installed as
+`/usr/local/bin/spectre-offload`. The install was `sudo install` to a temporary
+name followed by `mv -f`, so a run of the old file that was still going kept
+reading its own inode. `install-lightning-offload.sh` does not install the
+wrapper. It sets up only the Lightning CLI venv and the env template, and it
+was not run. The installed file is byte-identical to the repository, and
+`spectre-offload --dry-run` answers as before. From here, every run on the box
+takes a lease. A run of the old file that was already in flight at install
+time still stops the Studio when it ends.
