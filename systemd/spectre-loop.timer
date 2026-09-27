@@ -1,0 +1,12 @@
+[Unit]
+Description=Spectre occupancy loop every 30s
+
+[Timer]
+OnBootSec=120s
+OnUnitActiveSec=30s
+AccuracySec=5s
+Persistent=true
+Unit=spectre-loop.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,48 @@
+#!/usr/bin/env python3
+"""Exec the Go-only proxy with keys loaded from private on-box files."""
+from __future__ import annotations
+
+import os
+from pathlib import Path
+import sys
+
+
+def private_file(path: Path) -> None:
+    if (not path.is_absolute() or path.is_symlink() or not path.is_file()
+            or path.stat().st_mode & 0o077):
+        raise ValueError('private regular file required')
+
+
+def private_value(path: Path) -> str:
+    private_file(path)
+    value = path.read_text(encoding='utf-8').strip()
+    if not value or '\n' in value or '\x00' in value:
+        raise ValueError('private file value invalid')
+    return value
+
+
+def main() -> int:
+    home = Path.home()
+    binary = Path(os.environ.get('SPECTRE_OMNI_BIN', '/usr/local/bin/omni-proxy'))
+    config = Path(os.environ.get('SPECTRE_OMNI_CONFIG',
+                                 str(home / '.config/omni-proxy/config.json')))
+    client = Path(os.environ.get('SPECTRE_OMNI_CLIENT_KEY',
+                                 str(home / '.config/omni-proxy/client_key')))
+    paid = Path(os.environ.get('SPECTRE_DSH_KEY',
+                               str(home / '.config/fullmoon-agent-control/cline_api_key')))
+    try:
+        if not binary.is_file() or binary.is_symlink() or not os.access(binary, os.X_OK):
+            raise ValueError('Go proxy binary missing')
+        private_file(config)
+        client_value = private_value(client)
+        paid_value = private_value(paid)
+        os.execve(str(binary), [str(binary), 'serve', '-config', str(config)],
+                  {**os.environ, 'OMNI_CLIENT_KEY': client_value,
+                   'CLINE_PASS_API_KEY': paid_value})
+    except (OSError, ValueError):
+        print('spectre-omni-proxy: invalid binary, config, or private key', file=sys.stderr)
+        return 2
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

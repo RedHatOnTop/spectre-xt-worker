@@ -559,7 +559,8 @@ github.com already accepts it (`ssh -T git@github.com`).
 
 The box's worker is no longer the ZCode desktop. It is:
 
-- **Control plane**: Orca ADE (`orca-ide` 1.4.198 deb) running headless
+- **Control plane**: Orca ADE (`orca-ide` 1.4.212 serve-fork deb since
+  2026-09-26, see "Serve fork" below) running headless
   `orca serve --port 6768 --pairing-address 100.119.252.88 --json` as the
   systemd user unit `orca-serve.service` (linger on). Any tailnet client
   pairs via the URL printed at startup, or through the embedded web client
@@ -583,7 +584,10 @@ Gotcha that cost an hour: user units inherit lightdm/XFCE session
 variables (`DESKTOP_SESSION`, `XDG_CURRENT_DESKTOP`, `XDG_SESSION_TYPE`)
 from the user manager; any of them makes Electron `serve` attach to the
 dead desktop session and hang forever at ~0 CPU. The unit carries an
-`UnsetEnvironment=` list for exactly those — keep it when editing.
+`UnsetEnvironment=` list for exactly those — keep it when editing. The
+user manager still carries 11 such vars (re-checked 2026-09-26 with
+`systemctl --user show-environment`); the serve fork scrubs them as well and
+logs `[serve] headless env guard: …` when it has to, but the unit list stays.
 
 Restart durability (2026-09-12): the unit runs `Restart=always` +
 `RestartSec=3`, not `on-failure`. `orca serve` can end with status 0 (a
@@ -591,6 +595,60 @@ clean self-exit) which `on-failure` ignores — on 2026-09-12 that left the
 unit dead for 8 h after a 05:02 exit 0. The only exit that must stay down
 is 3 (singleton conflict, `RestartPreventExitStatus=3`). The box copy and
 `systemd/orca-serve.service` must stay identical.
+
+`KillMode=mixed` is load-bearing too (verified 2026-09-26): under the default
+`control-group` mode systemd SIGTERMs Chromium's zygote and GPU children
+directly, and serve dies with `FATAL … GPU process isn't usable. Goodbye.`
+(`Orca serve exited via SIGILL.`) instead of quitting.
+
+**Serve fork (since 2026-09-26).** The box runs
+`orca-ide_1.4.212_serve-<sha>_amd64.deb`, built from `~/Projects/orca-serve-fork`
+on fedora: a patch series on upstream v1.4.212 (env scrub, serve signal
+handlers that actually fire, synchronous readiness line, quit/exit
+breadcrumbs, daemon evidence logging, remote terminal stream drop and PTY
+resize logging). The fork README maps each patch to its
+incident. Build and install from fedora only (`make deb`, then
+`scripts/deploy-spectre.sh`), never on the box. Rollback (not exercised):
+`sudo dpkg -i ~/pkgs/orca/orca-ide_1.4.198_amd64.deb`, then restart the unit.
+The Electron main moves into `app-orca-<pid>.scope` a few seconds after
+start, so its readiness and `[serve]` lines only show up with
+
+```sh
+journalctl --user -u orca-serve.service -u 'app-orca-*.scope'
+```
+
+A healthy restart logs `[serve] SIGTERM received; quitting` → `before-quit` →
+`exiting with code 0`, then `[daemon] Preserving daemon …` on the way back
+up: the terminal daemon keeps its pid and its sessions.
+
+**A remote terminal that lagged and then kept a stale screen** (old frame
+remnants over the new one). Patch 8 logs the runtime→client hop in the same
+journal query, one line per event per 30 s with a suppressed count:
+
+```sh
+journalctl --user -u orca-serve.service -u 'app-orca-*.scope' --since '<incident>' \
+  | grep 'stream-backlog'
+grep stream-backlog ~/.config/orca/logs/daemon.log   # daemon hop, patch 7
+```
+
+Read it in order: `remoteAckOverflow` (the client stopped ACKing: compare
+`windowBytes` / `inFlightBytes`) → `remoteRecoverySnapshot` (its `source` and
+`elapsedMs`) or `remoteRecoverySnapshotFailed` → `remoteStreamUnverifiable`.
+`authoritativeSnapshotFallback` with `providerWaitMs` ≈ 8000 means the daemon
+did not answer and the viewer was repainted from a fallback mirror, the prime
+suspect for an old screen (a hypothesis until one incident shows it).
+`mainBackgroundSync` says when serve turned keep-tail thinning on or off for a
+session (`caller:"spawn"` on, `caller:"remote-view"` off); `sessionIdSuffix`
+matches the daemon's own entries for that PTY. `ptyResize` (patch 9) logs
+every size change with `from`/`to`: `kind:"remote-desktop"` is a viewer's
+claim (its `owner` is `multiplex:<connection>:<stream>`, the same stream id
+as the `remote*` lines), `kind:"desktop"` the reclaim back to the host size
+when the last viewer leaves. Serve spawns CLI terminals at 120×40, so a
+remnant right after a claim or reclaim points at the resize, not at dropped
+output. Patch 9 keys the 30 s window per session for both of these, so each
+session's flip gets its own line. Resizing the pane makes the TUI redraw the
+whole screen (SIGWINCH), which should clear remnants until the root cause is
+known.
 
 Credits: Qoder Pro plan (expires 2026-10-02), Efficient tier. Verified
 2026-09-08 that an Efficient request leaves Plan Credits at 0/2000 (promo
@@ -2082,7 +2140,7 @@ stopped /goal unit
   watcher's 120 s tick, so a park is classified before the review reads it).
 - `#lobby`/`#fleet` identity `grok` (`:crystal_ball:`) in
   `config/slack-agents.json` — one Slack app, nine identities now; the notify
-  self-test reports `OK (4 channels, 9 agents)`.
+  self-test reports `OK (4 channels, 10 agents)`.
 - A failed review logs a bounded, single-line, token-redacted tail of the CLI's
   stderr (`one_line_log`) to `/work/logs/goal-supervisor.log`. Without it a
   rejected argument is invisible — how the tool-name abort below was found.
@@ -2157,7 +2215,9 @@ grok --version   # expect 1.0.x; re-probe the flags after every upgrade
 /usr/local/bin/spectre-goal-supervisor --dry-run          # positions + planned actions
 /usr/local/bin/spectre-slack-bridge --dispatch resume <a tmux worker> --dry-run
 #   expect dispatch_dry_run in /work/logs/slack-bridge.log, nothing typed
-systemctl --user enable --now goal-supervisor.timer
+# Do not enable. Occupancy handoff is spectre-loop; this timer stays installed-off
+# even if grok reappears (bootstrap will not enable it; doctor flags it if on).
+# systemctl --user enable --now goal-supervisor.timer
 journalctl --user -u goal-supervisor.service -n 20
 cat /work/logs/goal-supervisor.log   # one line per scan: actions, acted, spend_today
 ```
@@ -2316,6 +2376,11 @@ What it is:
 - `spectre-state serve` — user unit `spectre-worker-state.service`. Unix
   socket `$XDG_RUNTIME_DIR/spectre-worker-state.sock`, SQLite WAL at
   `~/.local/state/remote-agent/worker-state.sqlite`.
+- `spectre-worker-state-watchdog.timer` probes that socket every minute. Two
+  consecutive failures trigger one service restart; at most three restarts
+  are attempted in a rolling hour. It reports recovery/failure in `#fleet`
+  and never dispatches to a worker. A process can be `active` with an
+  unreachable socket, so systemd `Restart=always` alone is insufficient.
 - JSON API: `GET /v1/workers/{worker}/snapshot`, `POST /v1/evidence`,
   `POST /v1/actions/claim`, `POST /v1/actions/{id}/result`,
   `POST /v1/reconcile`, `GET /v1/health`.
@@ -2371,7 +2436,9 @@ from this repo, not the older flat tree under
 
 **Retired with the cutover** (disabled 2026-09-19; unit files kept in
 `~/.config/systemd/user/legacy-backup-20260919T213903/` and
-`…T214033/`, scripts untouched in the deploy tree):
+`…T214033/`, scripts untouched in the deploy tree). `bootstrap.sh`
+`disable --now`s this list on every run, including deploy-tree timers
+that reappeared on the box after 2026-09-19:
 
 - `qoder-continuity.timer` — idle-budget failover; it resumed off wall-clock
   age alone and was still firing `resume` at workers the resolver sees as
@@ -2382,7 +2449,14 @@ from this repo, not the older flat tree under
   forbids TUI-only lifecycle transitions.
 - `grokbot-goal-event.timer` + `.path` — classified `UpdateGoal`/
   `goal_complete` from session jsonl and published independently. That is the
-  §21 guard violation; the replacement is the §7.16 supervisor, still off.
+  §21 guard violation. Occupancy handoff is spectre-loop (control plane),
+  not a grok CLI reviewer.
+- `local-listener-reaper.timer`, `qoder-idle-reaper.timer`,
+  `native-worker-pin-sync.timer` — deploy-tree units; the repo reaper/pin-sync
+  replace them. Disable until those land.
+
+`goal-supervisor.timer` stays **installed-off** even if `grok` reappears.
+Do not enable it from bootstrap.
 
 The `worker_state/legacy.py` classifier is the one remaining raw-event reader
 and it is shadow-only; `tests/test_worker_state_guard.py` fails CI if any
@@ -2406,7 +2480,83 @@ systemctl --user enable --now spectre-worker-state.service \
   qoder-goal-watch.timer spectre-continuity.timer
 ```
 
-`bootstrap.sh` installs these units and disables the four legacy timers above.
+`bootstrap.sh` installs these units and disables the retired classifiers
+above. It never enables `goal-supervisor.timer`.
+
+**Socket recovery migration (2026-09-23, verified on Spectre).** The running
+resolver was `active` but `spectre-state health` returned
+`{"detail": "[Errno 111] Connection refused", "error": "unavailable"}`.
+The old `UnixHTTPServer.server_bind` unlinked any existing socket pathname,
+including a live listener's, and `server_close` could unlink a replacement.
+The current source refuses a second live bind and removes only its own socket.
+The box still runs the low-overhead `spectre-state-fast.py` entrypoint against
+an older installed `worker_state` package. Installing only the current
+`server.py` failed with `ImportError: cannot import name 'dsh_jsonl' from
+'worker_state'`; it was rolled back immediately and health recovered. A
+socket-only backport against that exact installed package was then installed
+after stopping the old service. The live duplicate-bind probe was refused and
+`spectre-state health` still passed. The older package must be replaced as a
+whole when the control-plane migration reaches it; do not mix individual new
+modules with it.
+
+A shadow run of the unmodified 1.2.0 package against a consistent clone of
+the live journal returned `FAILED/unconfirmed_timeout` and
+`can_dispatch_goal=true` for Minecraft and qoder, but used 97.9% of one CPU
+over 20 seconds. The active low-overhead entrypoint avoids that poll cost,
+yet its cached-snapshot monkeypatch bypasses 1.2.0's read-time timeout
+effects. Do not combine the two unchanged. More importantly, an unconfirmed
+write is ambiguous delivery, not proof the worker did nothing: allowing a new
+goal after only 240 seconds could duplicate the first. Require authoritative
+acceptance or a verified terminal/process replacement before clearing it.
+
+The watchdog was separately installed and enabled after six staged on-box
+tests and a healthy socket probe. A controlled test stopped the resolver,
+observed the expected health failure, ran two watchdog checks, and verified a
+new resolver PID, `{"action": "recovered"}`, and a healthy API. Its own timer
+is active; the goal loop, provider-health timer, Go proxy service, and legacy
+Grokbot timer remain off. Check with:
+
+```bash
+systemctl --user is-active spectre-worker-state-watchdog.timer
+spectre-state health
+spectre-state get minecraft
+journalctl --user -u spectre-worker-state-watchdog.service -n 20 --no-pager
+```
+
+**Full resolver migration (2026-09-23, verified on Spectre).** Resolver 1.2.1
+retains `UNCONFIRMED` after a missing acceptance record, never converts an
+ambiguous terminal write into permission for a new goal, and raises
+`idle_slo_violated` for alerting. Passive poller evidence is inserted as one
+batch per worker. Process-tree discovery reads the kernel's per-thread
+`children` files instead of rescanning all of `/proc` at every tree node.
+Against a clone of the live journal, repeated full polls fell from
+3.6–4.2 seconds to 0.59–0.60 seconds; the first replay still took about
+12 seconds. On-box staged `bash verify.sh` passed bridge 64, Devcodex 77,
+and Python 427 tests; `shellcheck` was unavailable. The migration stopped
+the watchdog, park watcher, continuity timer, bridge, and old resolver;
+swapped the complete package and service entrypoint; verified a published
+1.2.1 snapshot; then restarted the consumers and watchdog. The previous
+package remains at
+`/usr/local/lib/spectre-worker-state/worker_state.pre-v121`, and the prior
+unit and binary backups are in `/tmp` for this session only. The live API
+returned healthy with seven workers. Minecraft and qoder were both
+`UNCONFIRMED`, `can_dispatch_goal=false`; bridge dry-run refused a Minecraft
+goal with `worker is UNCONFIRMED (policy.can_dispatch_goal=false)`.
+Watcher and continuity dry-runs completed without action. This migration
+restores reliable state authority, not autonomous goal progression.
+
+`sudo spectre-doctor` ran after cutover: 67 checks passed and one failed,
+`FAIL  codex third-party provider block present`. Its installed version does
+not yet include the new watchdog check; `systemctl --user is-active
+spectre-worker-state-watchdog.timer` was checked directly and returned
+`active`. The doctor failure is separate from the resolver API cutover but
+blocks a claim that the whole agent stack is ready.
+
+To roll back this migration, disable and stop the watchdog timer, restore the
+backed-up socket server from `/tmp/spectre-worker-state-server.pre-autonomy.py`
+only if it is still the intended baseline, and restart the resolver. The
+backup is temporary; compare checksums before restoring. Do not reset the
+SQLite journal or force an `UNCONFIRMED` worker to IDLE.
 
 Checks (run on Spectre 2026-09-19 21:40 KST; each is read-only):
 
@@ -2433,7 +2583,7 @@ left (`worker_state/legacy.py` is shadow-only). Still unverified: survival
 across a box reboot, and the first real `spectre-continuity` resume when a
 genuine stall appears — no stall has occurred since the cutover.
 
-**Known limitation — read latency (measured 2026-09-19 22:30 KST).** Every
+**Historical limitation — read latency (measured 2026-09-19 22:30 KST).** Every
 snapshot request rebuilds from the journal inside `BEGIN IMMEDIATE`
 (`Store.snapshot`), so a read takes the write lock and clashes with the 2 s
 poller. On the box at load ~40 (unrelated stress tests + minecraft JVMs):
@@ -2443,7 +2593,477 @@ surfaces as `state api unavailable: timed out` → UNKNOWN → fail-closed (no
 dispatch, no resume, no continuity). That is the designed failure direction,
 but it means Slack `/goal` can be refused while the box is loaded. A cheaper
 read path (serve the cached row and apply `now`-dependent effects at read time,
-or drop the write from GET) is not implemented.
+or drop the write from GET) was not implemented at that measurement. The local
+1.2.1 implementation below replaces this path; its on-box latency is unverified.
+
+---
+
+## 7.18 Control plane (continued 2026-09-22)
+
+**Status:** implemented and tested locally; not deployed or verified on Spectre.
+SSH is blocked by the Tailscale check-mode approval (§7). No model calls,
+service restarts, timer enablement, or real worker input were performed during
+this continuation. The local integration tests use the real UDS daemon and
+bridge with fake Orca I/O, not a live planner or Slack connection.
+
+### Runtime contract
+
+- `spectre-state` remains the only occupancy authority; `spectre-slack-bridge
+  --dispatch` remains the only terminal writer. Resolver 1.2.1 copies published
+  snapshots without the SQLite writer lock. Missing or older-resolver caches
+  return UNKNOWN until the poller republishes them. SQLite schema stays v1.
+- `spectre-loop` persists private atomic intent before claiming or typing.
+  Assignment IDs bind the advance, ASSIGNING state, planner pin, result file,
+  and once-only `.sent` reservation. A crash with uncertain delivery never
+  blindly retypes a packet. Inspect the authority and terminal before recovery;
+  do not delete the loop state or `.sent` markers to force a retry.
+- Minecraft alone has a planner. `ASTRA_ENABLED=0` skips it completely, rather
+  than reading `next_goal.json` into Efficient. One planner turn yields 1–4
+  schema-valid packets, stable across two polls; only one packet is dispatched
+  per tick. FAILED or `requires_astra_review` discards the remaining batch and
+  requests a new plan after authoritative completion. Assignment timeout is
+  300 seconds, followed by a 300-second retry backoff and a Slack escalation.
+- Flash uses the pinned persistent shell and `dsh-clinepass --file <packet>`;
+  it never receives `/goal`. Progress remains visible in Orca. The wrapper
+  publishes a private atomic `.exit`, including wall timeout 124 at six hours,
+  and terminates the process group on timeout or interruption.
+- Efficient accepts mechanical packets only. Missing Flash permits fallback
+  only for mechanical work. Other packets are escalated and retained at the
+  back of the same batch — never assigned to Efficient. Queued mechanical work
+  still runs ahead of that retry. Missing/invalid/blocked
+  `next_goal.json` on other workers escalates once per completion; failed Slack
+  notifications are retried and do not block the rest of the batch. Goal text
+  must be a string of at most 600 chars.
+  Efficient lines exceeding 4,000 chars including acceptance and the protocol
+  clause are refused intact, never truncated.
+- Storm limits reserve conservatively before I/O: 60-second worker spacing,
+  96 worker dispatches/day, 256 globally/day, and no consecutive identical goal
+  fingerprint. Plus permits three normal and one failed-work wake per five
+  hours. API relays are not charged against that Plus wake cap.
+- PARKED states escalate once without consuming an advance or typing. In
+  particular `plan_gate` is operator-only, and `goal_budget` remains resumable
+  through the bridge, not a false completion. This deliberately resolves the
+  original plan's conflict between `grokbot_may_advance` on PARKED and the
+  assignment API's COMPLETED/FAILED-only ownership check.
+
+### Install without enabling automation
+
+Run from the updated checkout **on Spectre**, not the daily driver:
+
+```bash
+bash verify.sh
+sudo bash scripts/install-control-plane.sh
+systemctl --user daemon-reload
+```
+
+The targeted installer installs the Python packages, bridge helpers, executable
+wrappers, prompt/schema, and units. It does not restart services, overwrite the
+worker registry, enable timers, change feature flags, or contact a model. For an
+isolated packaging check on any host, set `DESTDIR` and an absolute
+`PERSON_HOME`; `tests/test_control_plane_install.py` executes the installed CLIs
+without source-tree imports.
+
+Use **one writable registry** at
+`~/.config/remote-agent/qoder-workers.json` for every consumer. Seed it from the
+box's current live registry, not blindly from the repository template. Preserve
+all existing workers, cwd values, tmux sessions, and terminal pins. Add the
+Minecraft `planner` and `targets` metadata from `config/qoder-workers.json`,
+keeping `terminal` and `targets.efficient.terminal` equal to the observed
+Efficient pin; planner/Flash handles remain null until actually observed.
+`QODER_WORKERS_FILE` overrides this location. Remove or align any older explicit
+`--workers-file` override in service drop-ins so the daemon, bridge, loop,
+launcher, and pin sync all read the same registry.
+
+After backing up the registry and reviewing the install, restart only the
+state daemon and bridge. Terminal agents are not part of this reload:
+
+```bash
+systemctl --user restart spectre-worker-state.service slack-bridge.service
+spectre-state health
+spectre-state get minecraft
+spectre-pin-sync                         # inspection only; ambiguity is an error
+spectre-pin-sync --apply                 # updates only observed unambiguous pins
+SPECTRE_LOOP=1 ASTRA_ENABLED=0 spectre-loop --dry-run
+spectre-reaper                          # dry-run; inspect every proposed target
+```
+
+The reaper reads `/proc`, process-owned `ss -ltnpH`, one Orca inventory, and SSOT
+snapshots. Unknown occupancy, incomplete listener ownership, or an unavailable
+inventory prevents unsafe reaping. Pin shells, Astra, control-plane listeners
+(6768/7676/9222/9091), control daemons, and foreign DSH TUI sessions are protected.
+Descendant listeners protect their ancestors. Unpinned duplicate CLIs and
+untitled shells require a 300-second age; heavy processes, Minecraft clients,
+and review servers are also candidates. A completed/failed Flash headless
+process is eligible after 300 seconds, never its pin's shell. Thresholds may be
+overridden with positive `SPECTRE_REAPER_RSS_MIB` (default 256) and
+`SPECTRE_REAPER_CPU_PERCENT` (default 5, two samples). `--apply` sends identity-
+checked pidfd SIGTERM and posts a fleet audit; it deliberately does not escalate
+to SIGKILL. Keep it dry-run for at least one reviewed week before considering
+`--apply`. Do not run fixture inputs with `--apply`.
+
+### Planner and Flash setup (operator action, after the gates)
+
+Top-level provider rank (locked 2026-09-22):
+**agentrouter → anyrouter → kimi_free (cline-free/kimi-k3) → ChatGPT Plus**.
+Agentrouter wins when alive (faster). Anyrouter is a slow-TTFT fallback that is
+often down but has generous balance; 402 is upstream refill/crowding, not a dead
+account. Kimi free (24h window from first call, unpublished ceiling — track via
+`control_plane/cline_free.py`) outranks Plus. Plus is last resort (astra xhigh
+burns the 5h window in under 30 minutes). Side-project top-level stays ChatGPT
+via the Devcodex connector plus Grokbot — kimi seat is minecraft-only.
+Seat ownership lives in `control_plane/seat.py` (`toplevel/<worker>/seat.json`
++ `brief.md`); warm handoff is capped at 2/day and is brief-based, never a
+cross-harness resume. Registry workers carry `class: toplevel|side`. Free-tier
+burn policy is `control_plane/quota.py` (free first for implement/mechanical
+only; review/blocker stay paid). With `SPECTRE_FREE_PACKETS_ENABLED=1`, an
+eligible Minecraft packet is sent to the Flash Orca pin with `--tier free`.
+The wrapper uses an isolated DSH profile through the loopback Go proxy; the
+proxy tries `cline-free/deepseek-v4.1-flash` and falls back on 429 to
+`cline-pass/deepseek-v4.1-flash`. The on-box configuration also falls back on
+free OAuth 401/403; Kimi has no paid fallback, so its probe cannot mistake a
+paid answer for a free seat. The bridge rejects a missing proxy/profile
+before claiming a packet, and the loop requeues a refused free packet on its
+original paid target without consuming the dispatch reservation. A 429 observed
+in `/omni/health` is copied to the private 24h packet tracker; subsequent
+packets use the paid target until that window expires. Kimi and packet quota
+trackers are separate because the published limit semantics are not known.
+
+`SPECTRE_KIMI_ENABLED` defaults off. Leave it off until Kimi Code and
+omni-proxy are installed and checked on Spectre; the usage tracker is not an
+omni-proxy or Kimi readiness probe by itself. When both relays fail, provider
+health makes a bounded one-token Kimi call through the Go proxy and requires
+the free provider response with no fallback. A 429 records the 24h Kimi limit
+and selects Plus. With it on, a selected `kimi_free`
+provider prepares a handoff brief and escalates `kimi_handoff_required`;
+the loop does not claim an assignment, launch Kimi, or change `seat.json`.
+The operator must fill the brief with the actual goal and open decisions;
+the generated brief contains only authoritative IDs and state. A committed
+Kimi seat blocks both
+the Astra launcher and planner dispatch. A recovered Astra relay cancels an
+uncommitted request. Malformed seat state fails closed rather than reverting
+to Codex ownership. If the loop or provider state path is overridden, set the
+same absolute `SPECTRE_SEAT_ROOT` for both processes.
+
+After the Go-only omni-proxy and real Cline credentials are installed and a
+real model call succeeds, the operator handoff is deliberately three steps:
+
+```bash
+spectre-kimi launch --dry-run
+spectre-kimi launch
+# Inspect the new kimi-standby terminal in Orca and verify the Kimi prompt.
+spectre-kimi send-prompt --terminal term_<handle>
+# Inspect the model's response in Orca before committing ownership.
+spectre-kimi confirm --terminal term_<handle> --observed-ready
+# When Astra is selected again, update the brief, stop Kimi, and inspect Orca.
+spectre-kimi release --observed-stopped
+spectre-astra --dry-run
+```
+
+`launch` requires a current loop handoff, fresh `kimi_free` selection, no
+other top-level process in the worktree, a uniquely identified Efficient pin,
+and a private Kimi Code config targeting the loopback omni-proxy `/v1`
+endpoint. It probes `cline-free/kimi-k3` through the Go proxy and rejects a
+fallback before creating an Orca terminal. `send-prompt` verifies that the
+terminal is live and owned by the Kimi process before typing. Only explicit
+`confirm` records the Kimi seat, with a compare-and-swap against the prior
+seat state. A timed-out terminal creation or send is not retried blindly;
+inspect Orca first. `release` requires a fresh Astra selection and no running
+top-level process before returning ownership to Codex; it does not start Astra.
+`spectre-kimi` is not yet installed on Spectre. A launch probe that receives
+429 invalidates the selection and records exhaustion so the next provider
+health tick can select Plus without creating a terminal.
+
+The Go core is the only proxy component for the box. Build it on Fedora with
+`CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o omni-proxy ./cmd/omni-proxy`
+in the separate `omni-proxy` repository, then install that single executable
+as `/usr/local/bin/omni-proxy` on Spectre. After an approved transfer of a
+current mode-600 Cline OAuth `providers.json` to
+`~/.config/omni-proxy/cline-providers.json`, run:
+
+```bash
+spectre-omni-configure --credentials-file "$HOME/.config/omni-proxy/cline-providers.json"
+systemctl --user daemon-reload
+systemctl --user start spectre-omni-proxy.service
+curl -fsS http://127.0.0.1:8790/omni/health
+spectre-codex-provider-health
+```
+
+`spectre-omni-configure` writes mode-600 Go, DSH-free, and Kimi Code configs;
+it never prints keys. The systemd service reads the client and ClinePass keys
+from mode-600 files and starts only the Go binary. A refresh can rotate the
+OAuth refresh token: keep the active credential file and the Fedora source in
+sync, and do not copy a stale snapshot over a refreshed one. Leave
+`SPECTRE_KIMI_ENABLED`, `SPECTRE_FREE_PACKETS_ENABLED`, the loop, and the
+omni-proxy service disabled until the real Kimi and free/paid calls succeed.
+
+On 2026-09-23, a temporary static Go omni-proxy binary on Spectre passed
+synthetic OpenAI routing/fallback/stream/quota/outage/recovery checks and a
+synthetic Cline adapter check. The 80-request direct and fallback batches had
+zero failures (p95 50.2 ms and 74.3 ms respectively); the Cline adapter
+preserved the 429 body and `Retry-After` header. This does not prove real
+Cline OAuth or real Kimi inference. An isolated Kimi Code CLI call through the
+Go proxy and fake Cline upstream exited 0 with an `OK` reply and the exact
+`cline-free/kimi-k3` upstream model after the provider-prefix fix. A second
+bounded run of the rebuilt binary completed 200 direct, fallback, stream, and
+Cline requests with zero failures. No permanent omni-proxy installation or
+service was made.
+
+A later 2026-09-23 Spectre run used the new Go attempt counters and generated
+free DSH profile against a synthetic Cline upstream: 20 direct Kimi requests,
+101 free DeepSeek 429s with 101 paid fallbacks (including one real DSH headless
+packet), and a DSH exit sidecar of 0. The Go process RSS was 16,180 KiB.
+`/omni/health` reported model-specific rate limits. The first fake SSE omitted
+`finish_reason` and DSH correctly refused it; the corrected SSE passed. This
+still does not verify real OAuth or model output. The temporary binary and
+upstream were removed, port 8790 was closed, and the service remained inactive.
+Another temporary Spectre run started with expired synthetic Cline OAuth
+credentials: 20 concurrent Kimi calls returned `OK`, exactly one refresh
+occurred, and the rotated access and refresh tokens were persisted in the
+private mode-600 fixture. This does not prove the real account can refresh.
+
+In `~/.codex/modes/providers.json`, both `anyrouter` and `agentrouter` need a
+`base_url` (HTTPS, or plain http only on `127.0.0.1`/`::1` for the local SSE
+shim, never with credentials in the URL), `wire_api` (`responses` or `chat`),
+and an explicitly configured cheap non-Astra `probe_model` supported by that
+relay. Keys remain in private mode-600 `~/.codex/modes/keys/<id>` files; never
+print or paste them. Each probe asks for the smallest output the wire accepts
+(one token on `chat`, 16 on `responses`, whose API rejects anything lower),
+without redirects, `/models`, or `codex-mode probe-payload`. A relay that cannot
+be probed, or whose answer shows a fault no retry can fix (`bad_route`,
+`not_offered`, `needs_beta`, `retired`, `unauthorized`, any other 4xx as
+`rejected`, a 200 that is not a completion as `invalid_response`), raises an
+alert and the chain moves on to the next candidate; configuration never parks
+the chain. Only `no_serving_channel`, `upstream_quota` and `unreachable` stay
+silent. Selecting Plus always raises `plus_fallback`. Alerts go to the lobby as
+`provider: <alerts>` once per changed alert set; a failed post retries on the
+next run.
+
+```bash
+spectre-codex-provider-health             # real, bounded relay requests
+spectre-astra --dry-run                  # refuses if any Astra already runs
+spectre-astra                            # creates one visible Orca planner
+orca-ide terminal list --json
+```
+
+The launcher selects the provider via `codex-mode` before atomically recording
+`active-provider`, then creates an Orca-managed terminal in the Minecraft
+worktree and records its real handle. It refuses existing Astra processes and
+requires the Efficient pin to be identified before creating a second terminal.
+Plan dispatch also refuses explicit `model_provider=openai` overrides or an
+Astra process count other than one. No loop tick creates another terminal.
+Provider health never hot-switches a running planner: `provider_restart_required`
+requires operator shutdown and relaunch. After an observed Plus rate limit,
+`spectre-codex-provider-health --plus-rate-limited` records the five-hour cooldown.
+
+Flash and Mimo work surfaces are **auto-provisioned visible Orca terminals**.
+`SPECTRE_PACKET_SURFACE=pin` (default) creates a long-lived `flash-packets` /
+`mimo-packets` bash tab in the worker's worktree on first use (`orca-ide
+terminal create --worktree path:<cwd> --title … --command bash --focus`), then
+types the wrapper line and `terminal switch`es to that tab so the harness
+output is on screen. `SPECTRE_PACKET_SURFACE=job` instead creates one tab per
+packet (`--title "flash <dispatch_id>"` `--command "…/dsh-clinepass --file …"`)
+so each job is its own visible session. Never a bare tmux session.
+
+**Auto-close unused tabs** (dry-run by default, same posture as the reaper):
+`spectre-reaper` also runs `control_plane/tidy.select`. It closes
+`orca-ide terminal close --tab` for (a) job tabs titled `flash <id>` /
+`mimo <id>` whose `packets/<id>.exit` is older than 300 s, and (b) orphan
+`flash-packets` / `mimo-packets` shells whose handle is **not** in the worker
+registry. Registry pins, Astra, Efficient, and any other title are never
+selected. Inspect `orca_tabs` in the reaper JSON before `--apply`.
+
+Create the persistent Flash shell **in Orca** by hand only if auto-provision is
+disabled, using the registry's actual cwd:
+
+```bash
+orca-ide terminal create --worktree path:<minecraft-cwd> --title flash-packets --command bash
+spectre-pin-sync --flash-terminal <observed-term-handle> --apply
+```
+
+Binding checks that the handle is a live writable idle shell in that worktree.
+Do not invent a handle, create a bare tmux session, or start an invisible agent.
+Verify the wrapper is executable, DSH is installed, and the ClinePass key exists
+with mode 600. `spectre-slack-bridge --dispatch goal minecraft 'bounded check'
+--target flash --dry-run` checks readiness without typing or writing a packet.
+
+### On-box completion gate (staged code gate passed; live gate not yet run)
+
+On 2026-09-23, a staged copy ran `SPECTRE_MOTD_DONE=1
+SLACK_AGENTS_FILE=<staged-tree>/config/slack-agents.json bash verify.sh` on
+Spectre: bridge 64 tests, Devcodex 77 tests, Python 404 tests, and
+`verify: all gates passed`. `shellcheck` was skipped because it is not
+installed. The two environment variables suppress the host login banner in
+nested shell tests and select this tree's agent registry instead of the older
+installed one. No service or feature flag was enabled. The live verification
+below remains open.
+
+1. Run `bash verify.sh`, `sudo spectre-doctor`, state health/snapshots, pin-sync
+   inspection, loop dry-run, and reaper dry-run. Record actual output. Confirm
+   all new timers and the legacy supervisor/classifiers remain disabled.
+2. Confirm the real Orca planner/Flash/Efficient pins and provider health. In a
+   supervised bounded task, enable `SPECTRE_LOOP=1 ASTRA_ENABLED=1` for one-shot
+   ticks only. Observe COMPLETED → ASSIGNING, one planner prompt, stable result
+   file → one implementer packet → authoritative completion. No second prompt
+   for the same request, no `/goal` in Flash, no planner process replacement.
+3. Inspect failed/missing result handling, Slack escalation delivery, process
+   exit evidence, and GET latency under load. Check the next mechanical packet
+   runs only after the first completed. Do not use fabricated completion events
+   against a live worker to force this gate.
+4. Only after those gates should an operator enable `spectre-loop.timer` and
+   `codex-provider-health.timer` with matching service feature flags. Pin sync
+   and reaper units remain dry-run by default. No enablement is part of the
+   local implementation or targeted installer.
+
+---
+
+## 7.19 Claude Code session handoff (since 2026-09-26)
+
+§7.15 moves a **Codex** session between the two machines. Claude Code has no
+equivalent helper, but a Claude session is three plain artifacts, so the same
+move is a file copy plus one Orca terminal. This was first done for the
+11-hour `/goal control plane` session (fedora → spectre) on 2026-09-26; the
+procedure below is that run, not a proposal.
+
+### What actually has to move
+
+A Claude Code session is **not** the transcript alone. Four things travel, and
+the transcript is keyed to the working directory it was recorded in:
+
+| artifact | path | why |
+| --- | --- | --- |
+| transcript | `~/.claude/projects/<slug>/<uuid>.jsonl` | the conversation; `<slug>` is the cwd with `/` → `-` (leading `/` included), so the **same** session lands under `<box-slug>` on the other side |
+| file-history | `~/.claude/file-history/<uuid>/` | the per-session backup blobs (`<hash>@vN`) that `Edit`/`Write` diff against |
+| task output | `/tmp/claude-1000/<slug>/<uuid>/` | background-task stdout the transcript references by path |
+| workspace trust | `~/.claude.json` → `projects["<cwd>"].hasTrustDialogAccepted` | without it the box opens the "Do you trust this folder?" dialog and the resume **stalls there** (see below) |
+
+The transcript's own `cwd` field stays at the old path — that is the address,
+not a claim about the machine. Everything a session does *after* the resume
+uses the box's real cwd.
+
+### The trust dialog is the one real trap
+
+The box had no `projects` entry for the new path, so `claude --resume <uuid>`
+stopped at:
+
+```
+Quick safety check: Is this a project you created or one you trust?
+ ❯ No, exit
+```
+
+`--permission-mode bypassPermissions` does **not** skip it — it is a
+workspace-trust gate, not a permission gate, and nothing in the terminal
+advances it. There is no non-interactive flag for it either, so seed the entry
+before the terminal is created (same shape as an existing trusted project):
+
+```bash
+env -u PYTHONHOME -u PYTHONPATH python3 - <<'PY'
+import json, os, tempfile
+p = os.path.expanduser('~/.claude.json')
+d = json.load(open(p))
+d.setdefault('projects', {})['/home/person/Projects/remote-agent'] = {
+    'allowedTools': [], 'mcpContextUris': [], 'mcpServers': {},
+    'enabledMcpjsonServers': [], 'disabledMcpjsonServers': [],
+    'hasTrustDialogAccepted': True,
+    'hasClaudeMdExternalIncludesApproved': False,
+    'hasClaudeMdExternalIncludesWarningShown': False,
+}
+fd, tmp = tempfile.mkstemp(dir=os.path.dirname(p))
+with os.fdopen(fd, 'w') as f: json.dump(d, f)
+os.chmod(tmp, 0o600); os.replace(tmp, p)
+PY
+```
+
+`~/.claude.json` is mode 600 and holds relay keys, so a merge that preserves
+the other projects is mandatory — never rewrite the file from scratch.
+
+### Procedure (fedora → spectre)
+
+```bash
+SID=<session-uuid>
+FED_SLUG=-home-person-Projects-distribution-project-remote-agent
+BOX_SLUG=-home-person-Projects-remote-agent
+SSH='ssh spectre'
+
+# 0. the receiving side must have the repo at its own path, on the same commit,
+#    and the same working tree — the session resumes mid-edit otherwise.
+#    /home/person/Projects/distribution-project exists on the box but the repo
+#    lives at /home/person/Projects/remote-agent (2026-09-26 deploy).
+git -C ~/Projects/distribution-project/remote-agent rev-parse HEAD
+$SSH 'git -C /home/person/Projects/remote-agent rev-parse HEAD'   # must match
+rsync -a --exclude '/.git/' --exclude '/zcode-remote-app/' --exclude '/.mimocode/' \
+  --exclude node_modules/ --exclude __pycache__/ --exclude '*.pyc' \
+  --exclude references/ \
+  ~/Projects/distribution-project/remote-agent/ \
+  spectre:/home/person/Projects/remote-agent/
+
+# 1. stop the sender first: a live sender keeps appending to the transcript
+#    while it is copied, and the two copies then diverge from the copy point.
+#    SIGTERM is enough and the TUI exits at once.
+kill <fedora-claude-pid>          # pid is in ~/.claude/sessions/<pid>.json
+
+# 2. the three artifacts, then the trust seed (above)
+$SSH "mkdir -p ~/.claude/projects/$BOX_SLUG"
+rsync -a ~/.claude/projects/$FED_SLUG/$SID.jsonl   spectre:~/.claude/projects/$BOX_SLUG/$SID.jsonl
+rsync -a ~/.claude/file-history/$SID/              spectre:~/.claude/file-history/$SID/
+rsync -a /tmp/claude-1000/$FED_SLUG/$SID/          spectre:/tmp/claude-1000/$FED_SLUG/$SID/
+rsync -a /tmp/claude-1000/$FED_SLUG/$SID/          spectre:/tmp/claude-1000/$BOX_SLUG/$SID/
+
+# 3. Orca must know the repo, or the terminal is not renderable (AGENTS.md rule)
+$SSH 'orca-ide repo add --path /home/person/Projects/remote-agent --json'
+$SSH 'cd /home/person/Projects/remote-agent && orca-ide worktree current --json'   # check the full id
+
+# 4. bring it up as an Orca terminal, from inside the worktree with the active selector
+$SSH 'cd /home/person/Projects/remote-agent && orca-ide terminal create --worktree active \
+  --title "Claude Code (control plane handoff)" \
+  --command "claude --permission-mode bypassPermissions --resume '"$SID"'" --json'
+```
+
+Then wait for the TUI, and tell the resumed session **where it now is** — the
+transcript's last line is still the old cwd, and a session that starts writing
+paths from it writes them on the wrong machine:
+
+```bash
+$SSH 'orca-ide terminal wait --terminal <handle> --for tui-idle --timeout-ms 90000 --json'
+$SSH 'orca-ide terminal send --terminal <handle> --text "스펙터로 이관 완료. ... cwd가 ... 에서 /home/person/Projects/remote-agent 로 바뀌었다." --enter --json'
+```
+
+### What survives and what does not
+
+- The `/goal` Stop hook **re-arms from the transcript itself**: the resumed
+  terminal's statusline reads `◎ /goal active` again, with no re-issue of
+  `/goal`. The condition is re-derived from the recorded command, not from
+  local state.
+- `--permission-mode bypassPermissions` must be passed explicitly. The
+  box's `settings.json` sets `permissions.defaultMode: bypassPermissions`
+  (§7.2), but the CLI does not apply it to a resume that passes the flag
+  differently; passing it makes terminal and settings agree.
+- The session's own `sessionId` is preserved, so the box's transcript is
+  `<uuid>.jsonl` with the identical content (verify by `sha256sum`).
+- **The sender's terminal stays open as a dead tab.** Killing the CLI leaves
+  the Orca tab at a shell prompt; close it (`orca-ide terminal close
+  --terminal <handle>`) so the worktree does not look like it still holds a
+  live worker — and so nothing else pins to it (§7.10).
+- A session that resumes from a **copied** transcript is a fork point from
+  that instant. Do not let both copies run: the sender is stopped as part of
+  the handoff, not left "just in case".
+
+### Verify
+
+```bash
+# sender is gone, receiver has the identical transcript
+sha256sum ~/.claude/projects/-home-person-Projects-distribution-project-remote-agent/<uuid>.jsonl
+ssh spectre 'sha256sum ~/.claude/projects/-home-person-Projects-remote-agent/<uuid>.jsonl'
+#   identical
+
+# the receiver is a real, verified worktree (not a path: binding)
+ssh spectre 'orca-ide worktree ps' | grep -A1 remote-agent      # live:1, pty:yes, registered path
+
+# the resumed session is up, in the right cwd, with the goal re-armed
+ssh spectre 'orca-ide terminal read --terminal <handle> --limit 60 --json'
+#   banner: ~/Projects/remote-agent · ⎇ feat/spectre-control-plane-pr1 · ◎ /goal active
+ssh spectre 'ls ~/.claude/projects/-home-person-Projects-remote-agent/<uuid>.jsonl'
+jq -r '.projects["/home/person/Projects/remote-agent"].hasTrustDialogAccepted' ~/.claude.json  # (box) true
+```
 
 ---
 
@@ -2646,7 +3266,7 @@ stat -c %y ~/.local/state/remote-agent/heartbeat  # < 2 min old
 # slack agent community (optional, RUNBOOK 7.10)
 systemctl --user is-active slack-bridge.service   # active
 stat -c '%a %n' ~/.config/remote-agent/slack.env  # 600
-spectre-slack-notify --self-test                  # OK (4 channels, 9 agents)
+spectre-slack-notify --self-test                  # OK (4 channels, 10 agents)
 test -x ~/.local/bin/qoder-efficient              # executor present (cost-gated wrapper)
 test -f /usr/local/share/remote-agent/slack-executor-settings.json  # executor profile
 # and the full probe list from 7.10 (write/secret/subagent) after every qodercli upgrade
@@ -2672,8 +3292,17 @@ spectre-goal-supervisor --dry-run                  # positions + planned actions
 spectre-goal-supervisor --worker qoder --dry-run   # expect gate reviewable for a parked worker
 spectre-slack-bridge --dispatch resume qoder --dry-run   # dispatch_dry_run, nothing typed
 cat /work/logs/goal-supervisor.log | tail -5       # scan lines + any grok failure detail
-systemctl --user is-enabled goal-supervisor.timer  # enabled only once grok + profile exist
+systemctl --user is-enabled goal-supervisor.timer  # not enabled (installed off)
 grep -c '^Environment=SPECTRE_GOAL_SUPERVISOR=1' ~/.config/systemd/user/goal-supervisor.service
+
+# Claude Code session handoff (RUNBOOK 7.19)
+orca-ide repo list | grep remote-agent                # repo registered, else the tab is unrenderable
+orca-ide worktree current --json | jq -r .result.worktree.id   # run from the worktree dir
+orca-ide worktree ps | grep -A1 remote-agent          # live:1 pty:yes at the registered path
+orca-ide terminal read --terminal <handle> --limit 60 --json   # banner cwd + branch + ◎ /goal active
+jq -r '.projects["/home/person/Projects/remote-agent"].hasTrustDialogAccepted' ~/.claude.json
+#   true, or the resume stalls on the trust dialog (bypassPermissions does not skip it)
+ls ~/.claude/file-history/<uuid>/ | head             # backup blobs travelled with the transcript
 ```
 
 Until those commands have been run on the Spectre, this box is a plan,

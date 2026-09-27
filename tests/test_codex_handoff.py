@@ -139,7 +139,8 @@ class HintTest(unittest.TestCase):
 
     def test_session_name_falls_back_to_home(self) -> None:
         proc = sh("session_name ''")
-        self.assertEqual(proc.stdout.strip(), "codex-person")
+        user = os.environ.get("USER") or os.environ.get("LOGNAME") or "person"
+        self.assertEqual(proc.stdout.strip(), f"codex-{user}")
 
     def test_resume_cmd_sources_env_and_resumes(self) -> None:
         proc = sh("resume_cmd 01a05b9a-3d5a-7871-9024-548202502b70")
@@ -493,7 +494,8 @@ class SimulatedPushTest(unittest.TestCase):
             calls = trace.read_text(encoding="utf-8")
             self.assertIn(f"install -d -m 0700 '{remote_home}/.codex/sessions/2026/09/15'", calls)
             self.assertIn(f"scp:-q -o StrictHostKeyChecking=accept-new {rollout}", calls)
-            self.assertIn(f"person@spectre:{remote_home}/.codex/sessions/{rel}.incoming", calls)
+            user = os.environ.get("USER") or os.environ.get("LOGNAME") or "person"
+            self.assertIn(f"{user}@spectre:{remote_home}/.codex/sessions/{rel}.incoming", calls)
             self.assertIn(f"mv -f '{remote_home}/.codex/sessions/{rel}.incoming'", calls)
             record = json.loads(
                 (root / "state" / "spectre-codex-handoff" / "handoff.jsonl")

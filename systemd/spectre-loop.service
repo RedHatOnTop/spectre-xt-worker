@@ -1,0 +1,15 @@
+[Unit]
+Description=Spectre occupancy loop (Efficient next_goal; Astra when enabled)
+Documentation=file:///opt/spectre-xt-worker/RUNBOOK.md
+
+[Service]
+Type=oneshot
+# Installed-off. SPECTRE_LOOP=1 is the kill switch; do not set until store tests pass.
+# Environment=SPECTRE_LOOP=1
+ExecStart=/usr/local/bin/spectre-loop
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+Environment=HOME=%h
+UnsetEnvironment=DESKTOP_SESSION XDG_CURRENT_DESKTOP XDG_SESSION_TYPE DISPLAY
+NoNewPrivileges=true
+TimeoutStartSec=60
+Nice=10

@@ -1,0 +1,16 @@
+[Unit]
+Description=Spectre Go-only omni-proxy core
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/spectre-omni-proxy
+Environment=HOME=%h
+Restart=on-failure
+RestartSec=5
+UMask=0077
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target

@@ -11,6 +11,8 @@ def policy_for(
     stalled: bool,
     waiting: bool,
     completion_open: bool,
+    target: str = "efficient",
+    idle_slo: bool = False,
 ) -> dict[str, bool]:
     """Occupancy + park_reason. Transport/pane targeting stays in the bridge."""
     policy = dict(FAIL_CLOSED_POLICY)
@@ -19,11 +21,12 @@ def policy_for(
     if goal_state == "PARKED" and park_reason == "goal_budget":
         policy["can_resume"] = True
         policy["grokbot_may_advance"] = True
-    if goal_state == "COMPLETED" and completion_open:
+    if goal_state in {"COMPLETED", "FAILED"} and completion_open:
         policy["grokbot_may_advance"] = True
     if goal_state in {
         "INJECTED",
         "UNCONFIRMED",
+        "ASSIGNING",
         "ACCEPTED",
         "RUNNING",
         "WAITING",
@@ -34,11 +37,14 @@ def policy_for(
         policy["continuity_recovery_allowed"] = True
     if waiting or goal_state == "WAITING":
         policy["continuity_recovery_allowed"] = False
+    if str(target or "efficient") == "flash":
+        policy["continuity_recovery_allowed"] = False
     if goal_state == "PARKED" and park_reason == "plan_gate":
         policy["can_dispatch_goal"] = False
         policy["can_resume"] = False
         policy["grokbot_may_advance"] = False
         policy["continuity_recovery_allowed"] = False
+    policy["idle_slo_violated"] = bool(idle_slo)
     return policy
 
 
@@ -65,6 +71,13 @@ def fail_closed_snapshot(worker: str, error: str, server_time: str) -> dict:
             "current_operation": None,
             "stalled": False,
             "stall_reason": None,
+            "target": "efficient",
+            "in_flight": None,
+            "wait_kind": None,
+            "last_progress_at": None,
+            "process_alive": False,
+            "cpu_delta": 0,
+            "last_process_at": None,
         },
         "policy": dict(FAIL_CLOSED_POLICY),
         "evidence": {"kind": None, "source": None, "journal_seq": 0},

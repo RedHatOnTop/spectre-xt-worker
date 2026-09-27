@@ -1,23 +1,52 @@
 {
   "workers": {
     "qoder": {
+      "class": "side",
       "cwd": "/home/person/Projects/orca-rust",
       "tmux": "qoder"
     },
     "pugc": {
+      "class": "side",
       "cwd": "/home/person/Projects/distribution-project/pugc-ade",
       "tmux": "pugc"
     },
     "zzbrush": {
+      "class": "side",
       "cwd": "/home/person/Projects/zzbrush",
       "tmux": null
     },
     "minecraft": {
+      "class": "toplevel",
       "cwd": "/home/person/Projects/minecraft-server-project",
       "tmux": null,
-      "terminal": "term_8e21fb5c-7632-4601-a60f-07d804858886"
+      "terminal": "term_8e21fb5c-7632-4601-a60f-07d804858886",
+      "model": "Efficient",
+      "planner": {
+        "terminal": null,
+        "model": "gpt-6-astra"
+      },
+      "targets": {
+        "efficient": {
+          "terminal": "term_8e21fb5c-7632-4601-a60f-07d804858886",
+          "model": "Efficient"
+        },
+        "flash": {
+          "terminal": null,
+          "model": "cline-pass/deepseek-v4.1-flash",
+          "harness": "dsh-clinepass",
+          "wrapper": "/usr/local/bin/dsh-clinepass",
+          "profile": "headless"
+        },
+        "mimo": {
+          "terminal": null,
+          "model": "mimo-v2.6-pro",
+          "harness": "mimo-clinepass",
+          "wrapper": "/usr/local/bin/mimo-clinepass"
+        }
+      }
     },
     "korea-metro-twin": {
+      "class": "side",
       "cwd": "/work/korea-metro-twin",
       "tmux": null
     }

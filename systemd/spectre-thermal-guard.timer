@@ -1,0 +1,12 @@
+[Unit]
+Description=Sample Spectre temperature and block compile-farm workloads every 60s
+
+[Timer]
+OnBootSec=60s
+OnUnitActiveSec=60s
+AccuracySec=5s
+Persistent=true
+Unit=spectre-thermal-guard.service
+
+[Install]
+WantedBy=timers.target

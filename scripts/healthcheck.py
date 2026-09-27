@@ -39,6 +39,7 @@ DEFAULT_TEMP_FAIL_C = 85.0
 DEFAULT_DISK_FAIL_PCT = 90
 DEFAULT_MEM_FLOOR_MB = 800
 DEFAULT_SWAP_FAIL_PCT = 90
+DEFAULT_SWAP_USED_GIB = 4.0
 DEFAULT_RENOTIFY_MIN = 30
 DEFAULT_BRIDGE_URL = "http://127.0.0.1:8787/mcp"
 DEFAULT_ORCA_URL = "http://127.0.0.1:6768/web-index.html"
@@ -60,6 +61,7 @@ class Config:
     disk_fail_pct: int
     mem_floor_mb: int
     swap_fail_pct: int
+    swap_used_gib: float
     renotify_min: int
     require_proxy: bool
     require_zcode: bool
@@ -101,6 +103,7 @@ def config_from_env(environ: dict[str, str]) -> Config:
         disk_fail_pct=int(get("DISK_FAIL_PCT", DEFAULT_DISK_FAIL_PCT)),
         mem_floor_mb=int(get("MEM_FLOOR_MB", DEFAULT_MEM_FLOOR_MB)),
         swap_fail_pct=int(get("SWAP_FAIL_PCT", DEFAULT_SWAP_FAIL_PCT)),
+        swap_used_gib=float(get("SWAP_USED_GIB", DEFAULT_SWAP_USED_GIB)),
         renotify_min=int(get("RENOTIFY_MIN", DEFAULT_RENOTIFY_MIN)),
         require_proxy=_flag(environ, "REQUIRE_PROXY", default=True),
         require_zcode=_flag(environ, "REQUIRE_ZCODE", default=True),
@@ -270,7 +273,40 @@ def parse_meminfo(meminfo: str) -> dict[str, int]:
     return values
 
 
-def probe_memory(floor_mb: int, swap_limit_pct: int, meminfo_text: str = "") -> str | None:
+def load_fail_threshold(nproc: int) -> float:
+    """1-minute load alert floor: max(8, 2 * nproc). Alert only; never fail-closes dispatch."""
+    cpus = max(1, int(nproc or 1))
+    return float(max(8, 2 * cpus))
+
+
+def parse_loadavg(text: str) -> float | None:
+    parts = (text or "").split()
+    if not parts:
+        return None
+    try:
+        return float(parts[0])
+    except ValueError:
+        return None
+
+
+def probe_load(loadavg_text: str = "", nproc: int | None = None) -> str | None:
+    text = loadavg_text or _read_file("/proc/loadavg")
+    load1 = parse_loadavg(text)
+    if load1 is None:
+        return None
+    cpus = int(nproc) if nproc is not None else (os.cpu_count() or 1)
+    limit = load_fail_threshold(cpus)
+    if load1 >= limit:
+        return f"load1={load1:.2f}>={limit:.0f}"
+    return None
+
+
+def probe_memory(
+    floor_mb: int,
+    swap_limit_pct: int,
+    meminfo_text: str = "",
+    swap_used_gib: float = DEFAULT_SWAP_USED_GIB,
+) -> str | None:
     text = meminfo_text or _read_file("/proc/meminfo")
     if not text:
         return None
@@ -286,9 +322,13 @@ def probe_memory(floor_mb: int, swap_limit_pct: int, meminfo_text: str = "") -> 
     if avail_mb < floor_mb:
         reasons.append(f"mem_avail={avail_mb}M")
     if swap_total_kb > 0:
-        used_pct = round(100 * (swap_total_kb - swap_free_kb) / swap_total_kb)
+        used_kb = max(0, swap_total_kb - swap_free_kb)
+        used_pct = round(100 * used_kb / swap_total_kb)
         if used_pct >= swap_limit_pct:
             reasons.append(f"swap={used_pct}%")
+        used_gib = used_kb / (1024 * 1024)
+        if used_gib >= float(swap_used_gib):
+            reasons.append(f"swap_used={used_gib:.1f}G")
     return ",".join(reasons) or None
 
 
@@ -363,7 +403,8 @@ def collect_failures(cfg: Config) -> list[str]:
     probes.extend(
         (
             probe_temp(cfg.temp_fail_c),
-            probe_memory(cfg.mem_floor_mb, cfg.swap_fail_pct),
+            probe_memory(cfg.mem_floor_mb, cfg.swap_fail_pct, swap_used_gib=cfg.swap_used_gib),
+            probe_load(),
             probe_tmux(),
             probe_ac(),
             probe_tailscale(),
