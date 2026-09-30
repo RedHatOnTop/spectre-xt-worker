@@ -194,6 +194,8 @@ if [[ -n "${PERSON_HOME}" ]]; then
     "${REPO_DIR}/systemd/slack-bridge.service" \
     "${REPO_DIR}/systemd/slack-brief.service" \
     "${REPO_DIR}/systemd/slack-brief.timer" \
+    "${REPO_DIR}/systemd/slack-receipt-sync.service" \
+    "${REPO_DIR}/systemd/slack-receipt-sync.timer" \
     "${REPO_DIR}/systemd/devspace.service" \
     "${REPO_DIR}/systemd/goal-supervisor.service" \
     "${REPO_DIR}/systemd/goal-supervisor.timer" \
@@ -226,7 +228,7 @@ if [[ -n "${PERSON_HOME}" ]]; then
   # Slack community units: only once slack.env was written (RUNBOOK 7.10 C).
   if [[ -f "${PERSON_HOME}/.config/remote-agent/slack.env" ]]; then
     sudo -u "${PERSON_USER}" XDG_RUNTIME_DIR="/run/user/${USER_UID}" \
-      systemctl --user enable slack-bridge.service slack-brief.timer 2>/dev/null || true
+      systemctl --user enable slack-bridge.service slack-brief.timer slack-receipt-sync.timer 2>/dev/null || true
   fi
   # devspace connector unit: enable only once the binary is actually
   # installed (RUNBOOK 7.14) — a unit that cannot exec is boot noise.
@@ -262,6 +264,7 @@ install -m 0644 "${REPO_DIR}/scripts/codex_rollout.py" \
 install -d -m 0755 /usr/local/share/remote-agent
 install -m 0755 "${REPO_DIR}/scripts/slack-notify.py" /usr/local/bin/spectre-slack-notify
 install -m 0755 "${REPO_DIR}/scripts/slack-brief.py" /usr/local/bin/spectre-slack-brief
+install -m 0755 "${REPO_DIR}/scripts/slack-receipt.py" /usr/local/bin/spectre-slack-receipt
 install -m 0755 "${REPO_DIR}/scripts/slack-bridge.mjs" /usr/local/bin/spectre-slack-bridge
 install -m 0755 "${REPO_DIR}/scripts/worker-state-client.mjs" /usr/local/bin/worker-state-client.mjs
 install -m 0644 "${REPO_DIR}/config/slack-agents.json" /usr/local/share/remote-agent/slack-agents.json
