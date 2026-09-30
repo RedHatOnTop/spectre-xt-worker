@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import importlib.util
+import subprocess
 import sys
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -64,7 +66,7 @@ class RenderTest(unittest.TestCase):
         brief = slack_brief.render_brief(NOW, {"bits": [], "since": 0}, {}, "")
         self.assertIn("*health*: green (no active failures)", brief)
         self.assertIn("*24h log*: quiet", brief)
-        self.assertIn('reply "qoder: ..."', brief)
+        self.assertNotIn("qoder", brief)
 
     def test_failing_state_shows_duration(self) -> None:
         health = {"bits": ["proxy_down", "ac_offline"], "since": NOW - 7500}
@@ -83,10 +85,46 @@ class RenderTest(unittest.TestCase):
         self.assertLessEqual(len(body.strip().splitlines()), slack_brief.STATUS_LINES_MAX)
         self.assertIn("row 39", body)  # most recent lines survive the clip
 
+    def test_pending_pull_requests_lead_the_brief(self) -> None:
+        pending = ["• repo#7 ledger (1d) https://github.com/o/repo/pull/7", "• repo#8 chips (2h) https://github.com/o/repo/pull/8"]
+        brief = slack_brief.render_brief(NOW, {"bits": []}, {}, "", pending)
+        lines = brief.splitlines()
+        self.assertEqual(lines[2], "*awaiting merge* (2)")
+        self.assertEqual(lines[3:5], pending)
+        self.assertLess(brief.index("awaiting merge"), brief.index("*health*"))
+
+    def test_empty_pending_says_nothing_waits(self) -> None:
+        brief = slack_brief.render_brief(NOW, {"bits": []}, {}, "", [])
+        self.assertIn("*awaiting merge*: nothing", brief)
+
+    def test_missing_ledger_omits_the_section(self) -> None:
+        brief = slack_brief.render_brief(NOW, {"bits": []}, {}, "", None)
+        self.assertNotIn("awaiting merge", brief)
+
     def test_duration_formats(self) -> None:
         self.assertEqual(slack_brief._duration(150), "2m")
         self.assertEqual(slack_brief._duration(7500), "2h05m")
         self.assertEqual(slack_brief._duration(0), "0m")
+
+
+class FetchPendingTest(unittest.TestCase):
+    def fetch(self, proc):
+        with mock.patch.object(slack_brief.subprocess, "run", return_value=proc):
+            return slack_brief.fetch_pending()
+
+    def test_lines_come_back_without_blanks(self) -> None:
+        proc = subprocess.CompletedProcess([], 0, "• a\n\n• b\n", "")
+        self.assertEqual(self.fetch(proc), ["• a", "• b"])
+
+    def test_no_output_is_an_empty_ledger(self) -> None:
+        self.assertEqual(self.fetch(subprocess.CompletedProcess([], 0, "", "")), [])
+
+    def test_a_failing_ledger_is_unknown_not_empty(self) -> None:
+        self.assertIsNone(self.fetch(subprocess.CompletedProcess([], 1, "", "boom")))
+
+    def test_an_unrunnable_ledger_is_unknown(self) -> None:
+        with mock.patch.object(slack_brief.subprocess, "run", side_effect=OSError("no python3")):
+            self.assertIsNone(slack_brief.fetch_pending())
 
 
 if __name__ == "__main__":

@@ -1,0 +1,15 @@
+[Unit]
+Description=Settle Slack PR-ledger receipts whose pull request GitHub reports merged or closed
+Documentation=file:///opt/spectre-xt-worker/RUNBOOK.md
+# Prereqs (RUNBOOK 7.10): as slack-bridge.service, plus `gh` logged in for the
+# user. Edits the receipt posts as `claude`; no tokens in the environment.
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/spectre-slack-receipt --sync
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+UnsetEnvironment=DESKTOP_SESSION XDG_CURRENT_DESKTOP XDG_SESSION_TYPE DISPLAY
+NoNewPrivileges=true
+PrivateTmp=true
