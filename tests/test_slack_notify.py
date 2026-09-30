@@ -2,13 +2,16 @@
 """Unit tests for the spectre-slack-notify CLI."""
 from __future__ import annotations
 
+import contextlib
 import importlib.util
+import io
 import json
 import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts" / "slack-notify.py"
@@ -97,6 +100,12 @@ class IdentityTest(unittest.TestCase):
         ident = slack_notify.identity_for(self.agents, "bridge")
         payload = slack_notify.build_payload("C0123LOBBY", "hi", ident, "1736188888.123456")
         self.assertEqual(payload["thread_ts"], "1736188888.123456")
+
+    def test_update_payload_carries_only_channel_ts_and_text(self) -> None:
+        payload = slack_notify.build_update_payload("C0123LOBBY", "merged", "1736188888.123456")
+        self.assertEqual(
+            payload, {"channel": "C0123LOBBY", "ts": "1736188888.123456", "text": "merged"}
+        )
 
 
 class EnvFileTest(unittest.TestCase):
@@ -197,6 +206,80 @@ class CliSubprocessTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("OK (4 channels, 10 agents)", proc.stdout)
         self.assertNotIn(FAKE_TOKEN, proc.stdout)
+
+
+
+class UpdateTsTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.env_file = Path(self.tmp.name) / "slack.env"
+        write_env(self.env_file)
+
+    def cli(self, *args: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [sys.executable, str(SCRIPT), "--env-file", str(self.env_file), *args],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+    def test_dry_run_prints_the_update_payload(self) -> None:
+        proc = self.cli(
+            "--dry-run", "--channel", "lobby", "--update-ts", "1736188888.123456", "--text", "merged"
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(
+            json.loads(proc.stdout),
+            {"channel": "C0123LOBBY", "ts": "1736188888.123456", "text": "merged"},
+        )
+
+    def test_bad_update_ts_rejected(self) -> None:
+        proc = self.cli("--channel", "lobby", "--update-ts", "nope", "--text", "hi")
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("bad --update-ts", proc.stderr)
+
+    def test_update_and_thread_are_exclusive(self) -> None:
+        proc = self.cli(
+            "--channel", "lobby", "--update-ts", "1.5", "--thread-ts", "1.4", "--text", "hi"
+        )
+        self.assertEqual(proc.returncode, 2)
+        self.assertIn("exclusive", proc.stderr)
+
+    def test_update_goes_to_chat_update_and_reports_updated(self) -> None:
+        calls: list[tuple[str, dict[str, object], str]] = []
+
+        def fake_post(token: str, payload: dict[str, object], url: str = slack_notify.API_URL):
+            calls.append((token, payload, url))
+            return True, "1736188888.123456"
+
+        out = io.StringIO()
+        with mock.patch.object(slack_notify, "post", fake_post), contextlib.redirect_stdout(out):
+            rc = slack_notify.main(
+                [
+                    "--env-file", str(self.env_file),
+                    "--channel", "lobby",
+                    "--update-ts", "1736188888.123456",
+                    "--text", "merged",
+                ]
+            )
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][2], slack_notify.UPDATE_URL)
+        self.assertEqual(out.getvalue().strip(), "slack-notify: updated lobby ts=1736188888.123456")
+
+    def test_plain_post_still_uses_post_message(self) -> None:
+        urls: list[str] = []
+
+        def fake_post(token: str, payload: dict[str, object], url: str = slack_notify.API_URL):
+            urls.append(url)
+            return True, "1.5"
+
+        with mock.patch.object(slack_notify, "post", fake_post), contextlib.redirect_stdout(io.StringIO()):
+            slack_notify.main(
+                ["--env-file", str(self.env_file), "--channel", "lobby", "--text", "hi"]
+            )
+        self.assertEqual(urls, [slack_notify.API_URL])
 
 
 if __name__ == "__main__":
