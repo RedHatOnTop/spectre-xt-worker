@@ -26,8 +26,9 @@ minutes (default 90) or 10 idle minutes, so a crashed run cannot leave one
 running for long. Every instance is fresh: dependencies download and compile
 each run (a two-crate Rust test + clippy took 211 s on the default
 `c7i-flex.large`, 2 vCPU / 4 GiB; use `--type c7i.xlarge` or larger for big
-builds). `aws-burst status` lists running instances and the credit left;
-`aws-burst down --all` ends them.
+builds). `aws-burst status` lists running instances and the credit left.
+Other sessions burst too: end only an instance your own run started
+(`aws-burst down <id>`, the id is in the JSON line); never `down --all` or `reap`.
 
 The older route, `spectre-offload` (Lightning Studio, RUNBOOK §7.21), works
 only while the Lightning login is valid; prefer `burst-offload`.
