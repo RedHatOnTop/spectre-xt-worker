@@ -109,6 +109,11 @@ class ProtectedTest(unittest.TestCase):
         self.assertTrue(thermal.protected(row, thermal.AGENT_PROTECTED))
         self.assertEqual(thermal.crit_targets([row], {7: 99.0}), [])
 
+    def test_zcode_harness_is_protected_from_the_crit_fallback(self):
+        rows = [proc(8, ['ZCode']), proc(9, ['zcode-cli']),
+                proc(10, ['/home/person/.local/share/zcode-3.16.3/zcode', '--type=zygote'])]
+        self.assertEqual(thermal.crit_targets(rows, {8: 90.0, 9: 99.0, 10: 80.0}), [])
+
 
 class AllowlistTest(unittest.TestCase):
     def test_allowlisted_family_is_not_blocked(self):
