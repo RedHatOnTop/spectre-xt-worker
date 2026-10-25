@@ -13,6 +13,14 @@ not call the chat API and does not spend credits.
 Fail closed on new starts (unknown → refuse). Fail open on the 60s timer
 (unknown → do not kill a live 0x fleet). A billed trip writes a sentinel
 that stays until `qoder-efficient-guard clear`.
+
+Free models are exempt from the sentinel. A session started with `-m <model>`
+for a model in FREE_MODELS passes the hook and the reaper while a probe run of
+that model reported zero credits within FREE_TTL_S. The 60s timer re-probes
+every FREE_REFRESH_S; a probe that reports credits drops the exemption, and the
+next tick reaps that model's sessions. The probe itself runs with PROBE_ENV set
+so the hook lets it through. A model switch inside an interactive session is
+not seen: the exemption follows the `-m` the process was started with.
 """
 from __future__ import annotations
 
@@ -42,6 +50,11 @@ WORK_LOG = Path("/work/logs") / LOG_NAME
 ORCA = "/usr/bin/orca-ide"
 QODERCLI = str(Path.home() / ".local/bin/qodercli")
 HEALTH_ENV = Path.home() / ".config/remote-agent/health.env"
+FREE_NAME = "qoder-free-models.json"
+FREE_MODELS = ("Qwen3.8-Flash", "DeepSeek-Flash")
+FREE_TTL_S = 2 * 3600
+FREE_REFRESH_S = 30 * 60
+PROBE_ENV = "QODER_GUARD_FREE_PROBE"
 
 KEY_RE = re.compile(
     rb'["\']key["\']\s*:\s*["\']efficient["\']',
@@ -529,22 +542,154 @@ def _qoder_terminals(listing: dict) -> list[dict]:
     return picked
 
 
-def _kill_qodercli(sleep: Callable[[float], None] = time.sleep) -> list[int]:
-    pids = _qodercli_pids()
+def _kill_qodercli(
+    sleep: Callable[[float], None] = time.sleep,
+    keep: Callable[[int], bool] = lambda pid: False,
+) -> list[int]:
+    pids = [pid for pid in _qodercli_pids() if not keep(pid)]
     for pid in pids:
         try:
             os.kill(pid, signal.SIGTERM)
         except OSError:
             continue
     sleep(2)
-    leftover = _qodercli_pids()
+    leftover = [pid for pid in _qodercli_pids() if not keep(pid)]
     for pid in leftover:
         try:
             os.kill(pid, signal.SIGKILL)
         except OSError:
             continue
     sleep(0.5)
-    return _qodercli_pids()
+    return [pid for pid in _qodercli_pids() if not keep(pid)]
+
+
+def free_path(state_dir: Path = STATE_DIR) -> Path:
+    return state_dir / FREE_NAME
+
+
+def model_arg(argv: list[str]) -> str | None:
+    for i, arg in enumerate(argv):
+        if arg in ("-m", "--model") and i + 1 < len(argv):
+            return argv[i + 1]
+        if arg.startswith("--model="):
+            return arg.split("=", 1)[1]
+    return None
+
+
+def _proc_argv(pid: int) -> list[str]:
+    try:
+        raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+    except OSError:
+        return []
+    return [part.decode(errors="replace") for part in raw.split(b"\0") if part]
+
+
+def _proc_has_env(pid: int, name: str) -> bool:
+    try:
+        raw = Path(f"/proc/{pid}/environ").read_bytes()
+    except OSError:
+        return False
+    return f"{name}=1".encode() in raw.split(b"\0")
+
+
+def _parent(pid: int) -> int:
+    try:
+        fields = Path(f"/proc/{pid}/stat").read_text().split(") ", 1)[1].split()
+    except (OSError, IndexError):
+        return 0
+    return int(fields[1])
+
+
+def _session_model(event: dict, pid: int) -> str | None:
+    model = event.get("model")
+    if isinstance(model, str) and model:
+        return model
+    for _ in range(8):
+        if pid <= 1:
+            break
+        if _is_our_qodercli(pid):
+            return model_arg(_proc_argv(pid))
+        pid = _parent(pid)
+    return None
+
+
+def load_free(state_dir: Path = STATE_DIR) -> dict:
+    try:
+        data = json.loads(free_path(state_dir).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def is_verified_free(model: str | None, free: dict, now: float) -> bool:
+    if model not in FREE_MODELS:
+        return False
+    entry = free.get(model)
+    if not isinstance(entry, dict) or entry.get("free") is not True:
+        return False
+    checked = entry.get("checked_at")
+    return isinstance(checked, (int, float)) and now - checked < FREE_TTL_S
+
+
+def verify_free(
+    model: str,
+    qodercli: str = QODERCLI,
+    run: Callable[..., subprocess.CompletedProcess[str]] | None = None,
+) -> bool | None:
+    """One-line probe run of `model`: True on zero credits, False on any, None if unknown."""
+    env = {k: v for k, v in os.environ.items() if k not in ("DISPLAY", "WAYLAND_DISPLAY")}
+    env.update({PROBE_ENV: "1", "BROWSER": "echo"})
+    argv = [qodercli, "-p", "-m", model, "--tools", "", "-o", "json", "Reply with exactly OK."]
+    try:
+        proc = (run or subprocess.run)(
+            argv, env=env, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=180
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    for line in reversed((proc.stdout or "").splitlines()):
+        try:
+            result = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(result, dict) or result.get("type") != "result" or result.get("is_error"):
+            return None
+        credits, cost = result.get("total_credits"), result.get("total_cost_usd")
+        if not isinstance(credits, (int, float)) or not isinstance(cost, (int, float)):
+            return None
+        return credits == 0 and cost == 0
+    return None
+
+
+def refresh_free(
+    state_dir: Path = STATE_DIR,
+    qodercli: str = QODERCLI,
+    now: Callable[[], float] = time.time,
+    verify: Callable[[str], bool | None] | None = None,
+) -> dict:
+    free = load_free(state_dir)
+    changed = False
+    for model in FREE_MODELS:
+        entry = free.get(model) if isinstance(free.get(model), dict) else {}
+        probed = entry.get("probed_at")
+        if isinstance(probed, (int, float)) and now() - probed < FREE_REFRESH_S:
+            continue
+        result = (verify or (lambda m: verify_free(m, qodercli)))(model)
+        entry = {**entry, "probed_at": now()}
+        if result is not None:
+            entry.update(free=result, checked_at=now())
+        free[model] = entry
+        changed = True
+        log(f"free-probe model={model} free={result}", state_dir)
+    if changed:
+        state_dir.mkdir(parents=True, exist_ok=True)
+        free_path(state_dir).write_text(json.dumps(free, indent=2) + "\n", encoding="utf-8")
+    return free
+
+
+def exempt_pid(pid: int, free: dict, now: float) -> bool:
+    if _proc_has_env(pid, PROBE_ENV):
+        return True
+    return is_verified_free(model_arg(_proc_argv(pid)), free, now)
 
 
 def streak_path(state_dir: Path = STATE_DIR) -> Path:
@@ -611,7 +756,8 @@ def stop_all(
             timeout=15,
         )
 
-    leftover = (kill_qodercli or (lambda: _kill_qodercli(sleep)))()
+    free, now = load_free(state_dir), time.time()
+    leftover = (kill_qodercli or (lambda: _kill_qodercli(sleep, keep=lambda pid: exempt_pid(pid, free, now))))()
     if leftover:
         log(f"WARN qodercli still alive after kill leftover={leftover}", state_dir)
 
@@ -622,8 +768,10 @@ def stop_all(
     (notify or _notify_ntfy)(body)
 
 
-def hook_response(event: dict, sentinel_present: bool) -> tuple[int, str, str]:
-    if not sentinel_present:
+def hook_response(
+    event: dict, sentinel_present: bool, model_free: bool = False
+) -> tuple[int, str, str]:
+    if not sentinel_present or model_free:
         return 0, "", ""
     name = str(event.get("hook_event_name") or "")
     reason = (
@@ -710,7 +858,11 @@ def main(argv: list[str] | None = None) -> int:
             event = json.loads(raw) if raw.strip() else {}
         except json.JSONDecodeError:
             event = {}
-        code, stderr, stdout = hook_response(event, sentinel_path(state_dir).exists())
+        model = _session_model(event, os.getppid())
+        model_free = (os.environ.get(PROBE_ENV) == "1" and model in FREE_MODELS) or is_verified_free(
+            model, load_free(state_dir), time.time()
+        )
+        code, stderr, stdout = hook_response(event, sentinel_path(state_dir).exists(), model_free)
         if stderr:
             print(stderr, file=sys.stderr)
         if stdout:
@@ -782,9 +934,11 @@ def main(argv: list[str] | None = None) -> int:
 
     # check: never spawn if the fleet is already down or the sentinel is set.
     if sentinel_path(state_dir).exists():
-        leftover = _qodercli_pids()
+        free = load_free(state_dir) if args.dry_run else refresh_free(state_dir, args.qodercli)
+        now = time.time()
+        leftover = [pid for pid in _qodercli_pids() if not exempt_pid(pid, free, now)]
         if leftover and not args.dry_run:
-            still = _kill_qodercli()
+            still = _kill_qodercli(keep=lambda pid: exempt_pid(pid, free, now))
             log(f"sentinel present; reaped leftover={still}", state_dir)
         else:
             log("sentinel present; leaving fleet stopped", state_dir)
