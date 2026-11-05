@@ -1,0 +1,17 @@
+# Harness worker coordinator record — 2026-11-05
+
+`harness-workers start` rejected every launch with "worker launch requires the exact current native coordinator". The caller was the Run's coordinator. The concise `orchestration run-show` result is `{runId, objective, removedWork}` and has no `run` object, so the adapter treated a missing record as a foreign coordinator. `run-show --full` returns `run.coordinator_handle`. Live Run `run_0dcf570be1da` full record owner is `term_4dd6507f-342e-4ca8-a6ca-e5e8f8814945`.
+
+Folder terminals report `worktreePath: ""` and `paneKey: null`. The registered `worktree ps` path is the workspace, and the pane is `tabId:leafId`, which matches `ORCA_PANE_KEY` on that coordinator. A non-empty `worktreePath` still has to equal cwd. A concise Run view is still not ownership.
+
+The installed command is the content-addressed snapshot behind `~/.local/bin/harness-workers`, not the working tree. Source-only edits do not change that command.
+
+Checked: `python3 -W error::ResourceWarning -m unittest discover -s tests -p 'test_superagent*.py'` → `Ran 478 tests`, `OK`. `test_harness*.py` → `Ran 38 tests`, `OK`. `test_orca_runtime.py` → `Ran 37 tests`, `OK`. `py_compile` of the four edited modules exited 0.
+
+Installed with `scripts/install-harness-workers.py`. Final runtime `68d82d8c352e6e2c475998a3bb57bdbfb32e979ef9b43444792e08ab4cfa3b6c`. An earlier snapshot `0c7468df43a82eeb93b1f9fe760443b7dfc7482889c472c195d8c37eb39e30bd` had the Run-record fix only and was replaced after the task-list fix. Both installs reported `memory_backup` null, `session_restart` false, `native_start` false. The snapshot is the current source closure, so it also contains the working tree's `driver.py` and `selection.py`. `harness-workers` imports `worker_pool`, not `driver`.
+
+Read-only `harness-workers start` without `--apply`, using the live coordinator env for `run_0dcf570be1da`, exited 0 with `native_start: false` and handle `term_4dd6507f-342e-4ca8-a6ca-e5e8f8814945`. The same request with this other terminal's handle exited 2 with the coordinator error. No worker was started.
+
+The same concise-view gap is on `task-list --ready`. Rows are `id`, `status`, and `title`. `run_id` is only on `--full`. The ready task `task_5f7b7039c7b7` full record has `run_id` `run_0dcf570be1da`, status `ready`, and null `result` / `completed_at`. Worker inventory for that Run was empty. Launch now requests the full task record and still requires `run_id`.
+
+After the second install, calling `owner` and `ready_task` against live Orca for that Run and task returned the coordinator handle and did not raise. A different terminal handle still raised the coordinator error. `native_start` stayed false. `python3 -W error::ResourceWarning -m unittest discover -s tests -p 'test_harness_worker_pool.py'` after the task-list change: `Ran 29 tests`, `OK`.
