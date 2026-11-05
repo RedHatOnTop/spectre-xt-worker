@@ -8,7 +8,7 @@ import unittest
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
-from superagent_queue import worker_launch, worker_pool
+from superagent_queue import assignment, worker_launch, worker_pool
 
 POLICY = {'schema_version': 1, 'max_workers': 2, 'agents': ['dsh-worker', 'dsh-worker-go']}
 CALLER = {'ORCA_TERMINAL_HANDLE': 'coordinator_1', 'ORCA_PANE_KEY': 'pane_1',
@@ -140,6 +140,107 @@ class WorkerPoolTest(unittest.TestCase):
                 worker_pool.validate_policy(value)
         with self.assertRaises(ValueError):
             self.launch(request={**self.request, 'agent': 'codex'})
+
+    def test_screen_title_and_output_time_are_not_a_new_coordinator(self):
+        caller = {**CALLER, 'ORCA_PANE_KEY': 'tab_1:leaf_1'}
+        first = {'handle': 'coordinator_1', 'worktreeId': 'repo::/coordinator', 'worktreePath': '',
+                 'incarnationId': 'process_1', 'connected': True, 'writable': True,
+                 'tabId': 'tab_1', 'leafId': 'leaf_1', 'ptyId': 'pty_1', 'executionHostId': 'local',
+                 'title': 'before', 'lastOutputAt': 1, 'preview': 'old', 'rendererGraphEpoch': 1,
+                 'agentWait': None, 'agentIdentity': 'codex'}
+        second = {**first, 'title': 'after', 'lastOutputAt': 2, 'preview': 'new',
+                  'rendererGraphEpoch': 9, 'agentWait': {'since': 2}}
+        identity = {'handle': 'coordinator_1', 'incarnationId': 'process_1', 'ptyId': 'pty_1',
+                    'worktreeId': 'repo::/coordinator', 'worktreePath': '', 'pane': 'tab_1:leaf_1',
+                    'executionHostId': 'local'}
+        self.assertEqual(assignment.coordinator_identity(first), identity)
+        self.assertEqual(assignment.coordinator_identity(second), identity)
+        self.assertEqual(assignment.coordinator_identity(identity), identity)
+
+        def counting_query(cli, args):
+            if args[:2] == ['terminal', 'show']:
+                counting_query.calls += 1
+                return {'terminal': first if counting_query.calls == 1 else second}
+            return self.query(cli, args)
+        counting_query.calls = 0
+
+        with patch.object(worker_pool.observe, 'query', side_effect=counting_query), \
+                patch.object(worker_pool.observe, 'collect_workers', return_value=[]), \
+                patch.object(worker_launch.subprocess, 'run', return_value=subprocess.CompletedProcess(
+                    [], 0, json.dumps({'ok': True, 'result': self.ready}), '')) as execute:
+            report = worker_pool.start(self.root, '/exact/orca', POLICY, self.request, caller, '/coordinator')
+        self.assertEqual(report['state'], 'ready')
+        self.assertEqual(counting_query.calls, 2)
+        self.assertEqual(len(execute.call_args_list), 1)
+        stored = json.loads((self.root / 'run_1/launch_1/intent.json').read_text())['owner']
+        self.assertEqual(stored, identity)
+        self.assertNotIn('title', stored)
+        self.assertNotIn('lastOutputAt', stored)
+
+    def test_replaced_coordinator_process_still_blocks_launch(self):
+        caller = {**CALLER, 'ORCA_PANE_KEY': 'tab_1:leaf_1'}
+        first = {'handle': 'coordinator_1', 'worktreeId': 'repo::/coordinator', 'worktreePath': '',
+                 'incarnationId': 'process_1', 'connected': True, 'writable': True,
+                 'tabId': 'tab_1', 'leafId': 'leaf_1', 'ptyId': 'pty_1', 'executionHostId': 'local',
+                 'title': 'before', 'lastOutputAt': 1}
+        changes = (
+            ('incarnationId', 'process_2', 'identity changed'),
+            ('ptyId', 'pty_2', 'identity changed'),
+            ('executionHostId', 'other-host', 'identity changed'),
+            ('handle', 'coordinator_2', 'execution workspace'),
+            ('leafId', 'leaf_2', 'cannot be confirmed'),
+            ('worktreeId', 'repo::/other', 'execution workspace'),
+        )
+        for field, value, message in changes:
+            with self.subTest(field=field):
+                second = {**first, field: value, 'title': 'after', 'lastOutputAt': 2}
+                seen = {'count': 0}
+
+                def query(cli, args, second=second, seen=seen):
+                    if args[:2] == ['terminal', 'show']:
+                        seen['count'] += 1
+                        return {'terminal': first if seen['count'] == 1 else second}
+                    return self.query(cli, args)
+
+                with patch.object(worker_pool.observe, 'query', side_effect=query), \
+                        patch.object(worker_pool.observe, 'collect_workers', return_value=[]), \
+                        patch.object(worker_launch.subprocess, 'run') as execute, \
+                        self.assertRaisesRegex(ValueError, message):
+                    worker_pool.start(self.root, '/exact/orca', POLICY, self.request, caller, '/coordinator')
+                self.assertEqual(execute.call_args_list, [])
+                self.assertFalse((self.root / 'run_1/launch_1/intent.json').exists())
+
+    def test_display_drift_still_reconciles_the_original_coordinator(self):
+        caller = {**CALLER, 'ORCA_PANE_KEY': 'tab_1:leaf_1'}
+        first = {'handle': 'coordinator_1', 'worktreeId': 'repo::/coordinator', 'worktreePath': '',
+                 'incarnationId': 'process_1', 'connected': True, 'writable': True,
+                 'tabId': 'tab_1', 'leafId': 'leaf_1', 'ptyId': 'pty_1', 'executionHostId': 'local',
+                 'title': 'before', 'lastOutputAt': 1, 'preview': 'old'}
+        later = {**first, 'title': 'during', 'lastOutputAt': 2, 'preview': 'during'}
+        newest = {**first, 'title': 'after', 'lastOutputAt': 3, 'preview': 'after', 'rendererGraphEpoch': 4}
+        shows = [first, later, newest]
+
+        def query(cli, args):
+            if args[:2] == ['terminal', 'show']:
+                return {'terminal': shows.pop(0)}
+            return self.query(cli, args)
+
+        failed = subprocess.CompletedProcess([], 1, '', 'native launch response lost')
+        with patch.object(worker_pool.observe, 'query', side_effect=query), \
+                patch.object(worker_pool.observe, 'collect_workers', return_value=[]), \
+                patch.object(worker_launch.subprocess, 'run', return_value=failed):
+            report = worker_pool.start(self.root, '/exact/orca', POLICY, self.request, caller, '/coordinator')
+        self.assertEqual(report['state'], 'outcome_unknown')
+        record = {'requestId': 'native_launch_1', 'state': 'completed',
+                  'method': 'orchestration.workerStart', 'receipt': self.ready}
+        with patch.object(worker_pool.observe, 'query', side_effect=lambda cli, args:
+                          record if args[:2] == ['orchestration', 'request-show'] else query(cli, args)), \
+                patch.object(worker_launch.subprocess, 'run') as start:
+            reconciled = worker_pool.reconcile(self.root, '/orca', POLICY, 'run_1', 'launch_1',
+                                                'native_launch_1', caller, '/coordinator')
+        start.assert_not_called()
+        self.assertEqual(reconciled['state'], 'ready')
+        self.assertEqual(shows, [])
 
     def test_folder_terminal_confirms_the_registered_workspace_when_worktree_path_is_empty(self):
         caller = {**CALLER, 'ORCA_PANE_KEY': 'tab_1:leaf_1'}

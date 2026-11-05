@@ -38,7 +38,7 @@ def owner(cli, request, caller, cwd):
     run = observe.show_run(cli, request['run_id'])
     if run.get('legacy') or run.get('coordinator_handle') != caller.get('ORCA_TERMINAL_HANDLE'):
         raise ValueError('worker launch requires the exact current native coordinator')
-    return assignment.current_terminal(cli, caller, cwd)
+    return assignment.coordinator_identity(assignment.current_terminal(cli, caller, cwd))
 
 
 def occupancy(rows, run_id):

@@ -59,6 +59,22 @@ def current_dispatch(cli, task_id, dispatch_id, caller):
     return dispatch, preamble
 
 
+def terminal_pane(terminal):
+    if 'paneKey' in terminal or 'tabId' in terminal or 'leafId' in terminal:
+        return terminal.get('paneKey') or f'{terminal.get("tabId", "")}:{terminal.get("leafId", "")}'
+    return terminal.get('pane') or ''
+
+
+def coordinator_identity(terminal):
+    """Process identity of the coordinator pane. Screen title and output time are display."""
+    if not isinstance(terminal, dict):
+        raise ValueError('native coordinator identity changed before worker launch')
+    return {'handle': terminal.get('handle'), 'incarnationId': terminal.get('incarnationId'),
+            'ptyId': terminal.get('ptyId'), 'worktreeId': terminal.get('worktreeId'),
+            'worktreePath': terminal.get('worktreePath'), 'pane': terminal_pane(terminal),
+            'executionHostId': terminal.get('executionHostId')}
+
+
 def current_terminal(cli, caller, cwd):
     handle = caller['ORCA_TERMINAL_HANDLE']
     terminal = observe.query(cli, ['terminal', 'show', '--terminal', handle]).get('terminal')
@@ -72,7 +88,7 @@ def current_terminal(cli, caller, cwd):
             or not isinstance(reported, str) or (reported and reported != cwd)
             or not terminal.get('incarnationId')):
         raise ValueError('native terminal does not match the execution workspace')
-    pane = terminal.get('paneKey') or f'{terminal.get("tabId", "")}:{terminal.get("leafId", "")}'
+    pane = terminal_pane(terminal)
     if pane != caller['ORCA_PANE_KEY'] or not any(
             row.get('worktreeId') == terminal['worktreeId'] and row.get('path') == cwd for row in workspaces):
         raise ValueError('native execution pane or registered workspace cannot be confirmed')
