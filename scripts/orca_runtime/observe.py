@@ -37,7 +37,7 @@ def query(cli, args):
 def collect_workers(cli, run_id=None):
     workers, cursors = [], ()
     while True:
-        args = ['orchestration', 'worker-list', '--include-remote', '--limit', str(PAGE_LIMIT)]
+        args = ['orchestration', 'worker-list', '--include-remote', '--limit', str(PAGE_LIMIT), '--full']
         if run_id is not None:
             args = [*args, '--run', run_scope(run_id)]
         page = query(cli, [*args, '--cursor', cursors[-1]] if cursors else args)

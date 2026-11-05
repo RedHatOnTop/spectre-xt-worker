@@ -142,6 +142,14 @@ class CollectionTest(unittest.TestCase):
             self.assertEqual(len(observe.collect_workers('/cli', run_id='run_test')), 1)
         self.assertTrue(all(call.args[1][call.args[1].index('--run') + 1] == 'run_test'
                             for call in query.call_args_list))
+        self.assertTrue(all('--full' in call.args[1] for call in query.call_args_list))
+
+    def test_concise_worker_inventory_without_pagination_is_not_complete(self):
+        concise = {'workers': [], 'scope': {'run': 'run_test'}}
+        with patch.object(observe, 'query', return_value=concise) as query, \
+                self.assertRaisesRegex(ValueError, 'pagination'):
+            observe.collect_workers('/cli', run_id='run_test')
+        self.assertIn('--full', query.call_args.args[1])
 
     def test_scoped_worker_response_cannot_hide_another_run_or_missing_scope(self):
         for scope in ({}, {'run': 'other'}):
