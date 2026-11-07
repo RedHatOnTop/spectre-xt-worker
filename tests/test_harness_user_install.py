@@ -1,6 +1,7 @@
 """Install bounded harness policy without replacing sessions or existing instructions."""
 import importlib.util
 import json
+import hashlib
 from pathlib import Path
 import sys
 import tempfile
@@ -13,6 +14,30 @@ SPEC.loader.exec_module(INSTALL)
 
 
 class HarnessUserInstallTest(unittest.TestCase):
+    def test_reader_update_requires_expected_bytes_and_preserves_an_original_backup(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            reader = home / '.local/lib/spectre-superagent/scripts/spectre-dsh-worker.py'
+            reader.parent.mkdir(parents=True)
+            original = b'# Existing owned reader\n'
+            reader.write_bytes(original)
+            old_library = home / '.local/share/original-worker-library'
+            old_library.mkdir(parents=True)
+            library_link = reader.parent.parent / 'lib/spectre-superagent'
+            library_link.parent.mkdir()
+            library_link.symlink_to(old_library)
+            expected = hashlib.sha256(original).hexdigest()
+            with self.assertRaisesRegex(ValueError, 'reader'):
+                INSTALL.install(home, ROOT, expected_reader_sha256='0' * 64)
+            self.assertEqual(reader.read_bytes(), original)
+            self.assertFalse((home / '.local/bin/harness-workers').exists())
+            report = INSTALL.install(home, ROOT, expected_reader_sha256=expected)
+            self.assertEqual(reader.read_bytes(), (ROOT / 'scripts/spectre-dsh-worker.py').read_bytes())
+            self.assertTrue(reader.is_symlink())
+            self.assertEqual(library_link.resolve(), old_library)
+            self.assertEqual(Path(report['reader_backup']).read_bytes(), original)
+            self.assertEqual(INSTALL.install(home, ROOT)['reader_backup'], None)
+
     def test_user_install_preserves_existing_global_rules_and_replays_idempotently(self):
         with tempfile.TemporaryDirectory() as directory:
             home = Path(directory)

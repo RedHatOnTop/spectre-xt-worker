@@ -29,7 +29,8 @@ checks. Existing production, publication, cost and device-trust approvals remain
 
 
 def digest_sources(source):
-    files = [source / 'scripts/harness-workers.py', source / 'config/harness-workers.json',
+    files = [source / 'scripts/harness-workers.py', source / 'scripts/spectre-dsh-worker.py',
+             source / 'config/harness-workers.json',
              source / 'config/harness-workers-skill.md',
              *sorted((source / 'scripts/superagent_queue').glob('*.py')),
              *sorted((source / 'scripts/orca_runtime').glob('*.py'))]
@@ -66,7 +67,8 @@ def preflight(home, source):
 
 
 def verify_stage(root, source):
-    files = [(source / 'scripts/harness-workers.py', root / 'bin/harness-workers')]
+    files = [(source / 'scripts/harness-workers.py', root / 'bin/harness-workers'),
+             (source / 'scripts/spectre-dsh-worker.py', root / 'bin/spectre-dsh-worker')]
     for package in ('superagent_queue', 'orca_runtime'):
         files = [*files, *((path, root / 'lib/spectre-superagent' / package / path.name)
                  for path in sorted((source / 'scripts' / package).glob('*.py')))]
@@ -88,6 +90,8 @@ def stage(home, source, digest):
     (root / 'bin').mkdir()
     shutil.copy2(source / 'scripts/harness-workers.py', root / 'bin/harness-workers')
     (root / 'bin/harness-workers').chmod(0o755)
+    shutil.copy2(source / 'scripts/spectre-dsh-worker.py', root / 'bin/spectre-dsh-worker')
+    (root / 'bin/spectre-dsh-worker').chmod(0o755)
     command = [sys.executable, '-I', '-B', '-c',
         'import sys;sys.path.insert(0,sys.argv[1]);from superagent_queue import worker_pool,worker_launch', str(library)]
     result = subprocess.run(command, capture_output=True, text=True, check=False, timeout=20)
@@ -117,13 +121,49 @@ def memory(home):
     return str(backup)
 
 
-def install(home, source):
+def reader_bytes(home, source, expected):
+    reader = home / '.local/lib/spectre-superagent/scripts/spectre-dsh-worker.py'
+    if not reader.exists() and not reader.is_symlink():
+        return None
+    if reader.is_symlink() and not reader.resolve().is_relative_to(home / '.local/share/harness-workers'):
+        raise ValueError('worker reader symlink is not owned by this installer')
+    if not reader.is_file() or reader.stat().st_uid != os.getuid():
+        raise ValueError('worker reader must be an owned regular file')
+    body = reader.read_bytes()
+    if body != (source / 'scripts/spectre-dsh-worker.py').read_bytes() and hashlib.sha256(body).hexdigest() != expected:
+        raise ValueError('worker reader changed or lacks its expected original digest')
+    return body
+
+
+def promote_reader(home, root, original):
+    if original is None:
+        return None
+    reader = home / '.local/lib/spectre-superagent/scripts/spectre-dsh-worker.py'
+    target = root / 'bin/spectre-dsh-worker'
+    if reader.is_symlink() and reader.resolve() == target.resolve():
+        return None
+    if reader.read_bytes() != original:
+        raise ValueError('worker reader changed during installation')
+    backup = home / '.local/state/remote-agent/worker-updates' / str(time.time_ns())
+    backup.mkdir(parents=True, mode=0o700)
+    saved = backup / 'spectre-dsh-worker.py'
+    saved.write_bytes(original)
+    saved.chmod(0o600)
+    temporary = reader.with_name('.spectre-dsh-worker-' + str(time.time_ns()))
+    temporary.symlink_to(target)
+    os.replace(temporary, reader)
+    return str(saved)
+
+
+def install(home, source, expected_reader_sha256=None):
     home, source = Path(home).absolute(), Path(source).absolute()
     if home != home.resolve() or source != source.resolve():
         raise ValueError('harness install home/source cannot contain symlinks')
     preflight(home, source)
+    original_reader = reader_bytes(home, source, expected_reader_sha256)
     digest = digest_sources(source)
     root = stage(home, source, digest)
+    reader_backup = promote_reader(home, root, original_reader)
     policy = home / '.config/remote-agent/harness-workers.json'
     policy.parent.mkdir(parents=True, exist_ok=True)
     policy.write_bytes((source / 'config/harness-workers.json').read_bytes())
@@ -139,8 +179,9 @@ def install(home, source):
         temporary = command.with_name('.harness-workers-' + str(time.time_ns()))
         temporary.symlink_to(root / 'bin/harness-workers')
         os.replace(temporary, command)
-    refresh_worker_library(home, root)
-    return {'runtime_sha256': digest, 'runtime': str(root), 'memory_backup': backup,
+    if original_reader is None:
+        refresh_worker_library(home, root)
+    return {'runtime_sha256': digest, 'runtime': str(root), 'memory_backup': backup, 'reader_backup': reader_backup,
             'session_restart': False, 'native_start': False}
 
 
@@ -170,9 +211,10 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--home', type=Path, default=Path.home())
     parser.add_argument('--source', type=Path, default=Path(__file__).resolve().parents[1])
+    parser.add_argument('--expected-reader-sha256')
     args = parser.parse_args()
     try:
-        print(json.dumps(install(args.home, args.source), indent=2))
+        print(json.dumps(install(args.home, args.source, args.expected_reader_sha256), indent=2))
         return 0
     except (OSError, ValueError, RuntimeError, subprocess.TimeoutExpired) as error:
         print(f'harness worker install: {error}', file=sys.stderr)

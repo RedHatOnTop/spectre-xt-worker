@@ -1,0 +1,11 @@
+[Unit]
+Description=Reconcile approved Orca work and pending inputs
+
+[Timer]
+OnBootSec=90
+OnUnitInactiveSec=30
+Persistent=true
+Unit=spectre-superagent.service
+
+[Install]
+WantedBy=timers.target

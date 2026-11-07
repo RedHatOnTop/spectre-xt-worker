@@ -5,6 +5,7 @@ slack.env
 *.pem
 credentials.json
 node_modules/
+.devcodex/
 *.log
 __pycache__/
 *.pyc

@@ -28,6 +28,19 @@ workspace for each independent writer; do not run implementation in the
 coordinator's checkout. A ready Task with result/completed_at needs review first,
 not another execution. Use existing explicit subscription profiles unchanged.
 
+Start every packet with one exact kind line; the execution router uses it
+to choose the burn tier:
+
+    Kind: mechanical|implement|review|blocker
+
+`mechanical` and `implement` run free first when the verified-free DSH route is
+provisioned; `review` and `blocker` always stay paid ClinePass. A missing or
+unknown kind stays paid. Free-route gaps are recorded reasons
+(`free_unprovisioned`, `free_key_missing`, `free_profile_unsafe`) that fall back
+to paid, never a silent paid launch. Read
+`~/.local/state/remote-agent/free-tier-decisions.jsonl` before claiming which
+tier actually ran.
+
 From the current registered coordinator pane, pass the exact request on stdin:
 
 ```sh
@@ -48,6 +61,19 @@ not a new Task. Reuse the same launch ID only for readback of that exact request
 Unknown native response blocks additional managed starts. Preserve its original
 stdout/stderr/request receipt and follow the exact native recovery operation;
 never generate another ID as a retry workaround.
+
+To reuse a settled successful reader, include `terminal`, `reuse_of` (its last
+completed Dispatch) and `terminal_incarnation` in the managed request. Reuse
+requires matching native custody, the approved carrier and actual exited model
+and executor processes. It preserves the reader, its slot and native retry
+history; it does not relax capacity or create a second writer in the workspace.
+
+Keep a Task failed or blocked when using `retry_of`; Orca reopens it natively.
+For a recorded `task_not_startable` refusal with its exact original command and
+request ID, `harness-workers recover --run <run> --launch <launch> --request <id>`
+reads native state and recovers only that operation with `--retry-request`.
+It never replaces the original launch/response files or permits another start
+on an absent receipt alone. Pending native work and foreign requests stay owned.
 
 When an exact completed native workerStart request is known, reconcile it with
 `harness-workers reconcile --run <run-id> --launch <original-launch-id> --request <native-request-id>`.
