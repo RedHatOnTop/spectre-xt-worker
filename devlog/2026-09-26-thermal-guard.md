@@ -201,3 +201,152 @@ auto-vs-manual relaunch. Result goes into RUNBOOK §7.21.
    for the 100 %-on-AC heat the guard cannot see.
 3. Decide the speed/silence tradeoff: keep `powersave` (≈800 MHz, coolest) or
    switch the AC governor to `schedutil` with `CPU_MAX_PERF_ON_AC=55`.
+
+## A failure after the start stops the Studio too — 2026-09-27
+
+What happened: two offloads ran back to back. The second one's `studio start`
+got `INFO - Studio buildbox is already running`, and SSH answered. The rsync
+check then failed with `Error: We are still setting things up for you, please
+try again after the progress bar at the top of the Studio disappears.`, so the
+run ended with `could not install rsync in buildbox` (exit 6). The EXIT trap
+only removed the uploaded tree, and only the end of a normal run stopped the
+Studio. So every `die` after the start left the Studio running. The ones
+affected were the SSH wait, the rsync install and the rsync push. The Studio
+was found running two minutes later with `spectre-offload --studio-report`
+(`uptime_s: 130.57`). It was stopped by the next normal run.
+
+The fix: the run sets `STARTED=1` before `studio start`. `stop_studio()` stops
+the Studio only when this run started it and `--keep` was not given, and only
+once. It runs from the EXIT/HUP/INT/TERM trap after `cleanup_remote`, and at
+the normal place before the JSON verdict. `--studio-report` never starts the
+Studio, so it never stops one either.
+
+`tests/test_spectre_offload.py` runs the script against a fake `lightning`,
+`ssh` and `rsync` on `PATH`. A failed remote rsync install exits 6 and stops
+the Studio exactly once. A normal run stops it once. `--keep` and
+`--studio-report` stop nothing.
+
+The same investigation looked at why `home_used` climbed from 1.2G to 2.7G
+over the day's runs. A read-only report found none of it came from the
+control-plane runs, whose trees were all removed (`remote_cleaned: yes`). The
+growth is other sessions' data:
+
+- `~/.gradle`, 1.9G. Of that, `caches` is 1.6G: fabric-loom Minecraft jars and
+  the Gradle 9.4.0 and 9.6.1 API jars.
+- `~/.jdks`, 303M.
+- Trees left in `~/offload`: `tutorial-residuals` 244M,
+  `fmc-panorama-20260926T151219Z-269661` 53M, `rb-before` 23M,
+  `dashboard-runtime` 3.1M and two small ones.
+
+Nothing was deleted. `--prune-caches` would drop the Gradle caches at the cost
+of the next build's download, and the `~/offload` trees belong to whoever left
+them.
+
+The installed `/usr/local/bin/spectre-offload` is identical to the previous
+revision. Installing this one is the operator's step.
+
+Verified the same way as the control-plane slices. `verify.sh` ran through
+`spectre-offload` for `git archive 347f62e` and for the same tree plus the
+changed script and the new test. Both trees gave the same gate results, apart
+from unit tests going from 541 to 544 run, with the same one known Studio
+failure (`test_session_name_falls_back_to_home`). Against the HEAD script, the
+failure-path test fails
+(`Lists differ: [] != ['lightning studio stop --name box --teamspace team']`),
+and the other two pass.
+
+## The shared Studio: stop only what an offload started, with the last lease — 2026-09-27
+
+One Studio, `buildbox`, serves every session on this box. Until now every run
+stopped it at the end, and `8f91eb2` made a failed run stop it as well. On
+2026-09-27 that went wrong. A run from this session found `INFO - Studio
+buildbox is already running`, hit `We are still setting things up for you` on
+its first remote command, exited 6, and stopped the Studio. Another session
+had just started that Studio for its own offload (`lightning studio list`
+showed `Pending` minutes later), so this run most likely cut that offload off.
+Two changes follow.
+
+**Readiness is an exact echo.** A freshly started Studio accepts SSH before it
+is set up and answers commands with the setup message. The wait loop used
+`ssh … true`, which passed too early. It now waits until `ssh … 'echo
+spectre-ready'` prints exactly `spectre-ready`. Both of the day's rsync
+failures were this.
+
+**Leases, and a start marker.** Each run takes a lease before `studio start`.
+The lease is a file named by the run's pid in
+`~/.local/state/remote-agent/offload-leases`, or in `LIGHTNING_LEASE_DIR`.
+While taking it, the run reads the Studio's status. Unless the status is
+`Running` or `Pending`, it writes `.started`, meaning an offload lease started
+this Studio. At exit, from the trap or the normal path, the run drops its lease
+and every lease whose pid is gone. It stops the Studio only when no live lease
+remains and `.started` is present, and then it removes the marker. Otherwise
+it notes `leaving Studio <name> running for <n> other offload(s)` or `leaving
+Studio <name> running: it was already up when this offload began`. Taking,
+dropping and counting run under one `flock`. The status call is bounded by
+`timeout 60`, and `--studio-report` uses the same helper.
+
+This protects a run only from runs that use this script. Until
+`/usr/local/bin/spectre-offload` is reinstalled, other sessions neither take
+leases nor honour them. What the Lightning CLI does with a start that arrives
+during another run's stop has not been observed.
+
+### Verification
+
+This slice's Studio run used the working-tree `scripts/spectre-offload.sh`.
+The first attempt was the failure described above. On the second, the lease
+directory held only the run's pid (`355086`) and `.lock`, with no `.started`,
+because the Studio was already up for another session.
+
+At the end the run noted `leaving Studio buildbox running: it was already up
+when this offload began`, and the lease directory held only `.lock`. The other
+session's offload was still running, and the Studio was `Running`.
+
+`verify.sh` ran on `git archive 553e4ac` and on the same tree plus the changed
+script and test. Both trees gave the same gate results, apart from unit tests
+going from 546 to 550 run, with the same one known Studio failure. Against the
+HEAD script, the four new behaviours fail and the three earlier tests pass:
+
+- a dead lease gives `['13145'] != ['.lock']`;
+- a live other lease gives no `leaving … for 1 other offload(s)`;
+- a Studio found `Running` or `Pending` gives no `already up`;
+- the setup message is not waited out.
+
+All seven pass on the changed script.
+
+## A signal ends an offload at once — 2026-09-27
+
+The trap was `trap 'cleanup_remote; stop_studio' EXIT HUP INT TERM`. A trapped
+HUP, INT or TERM ran the cleanup and then resumed the script, which went on
+with remote calls against a Studio it had just released. It also printed a
+verdict. The read-only review of 2026-09-27 found this. The problem predates
+this session, but it now releases leases, so it mattered more. EXIT keeps the
+cleanup, and each signal now exits with 128 plus the signal number (129, 130,
+143), which runs the EXIT trap once. A new test sends SIGTERM to the process
+group during the remote command. It expects exit 143 at once, no verdict, no
+later `du -sb`, one Studio stop and an empty lease directory.
+
+Verification: `verify.sh` ran through the working-tree `spectre-offload` for
+`git archive 22cc27e` and for the same tree plus the six changed files. Both
+trees gave the same gate results, apart from unit tests going from 550 to 553
+run, with the same one known Studio failure. Against the HEAD tree the three
+new tests fail:
+
+- the retried confirm raises `ValueError: seat_owned_by_claude`;
+- the dry run gives `{'worker': 'minecraft', 'action': 'plan'}` instead of the
+  occupancy skip;
+- the terminated offload prints `{"ok":false,"exit":143,…}` after its cleanup.
+
+The Claude, handoff-runtime, offload and control-plane suites pass on the
+change (79 tests). The run itself ended with `leaving Studio buildbox running:
+it was already up when this offload began`.
+
+### Installed — 2026-09-27
+
+With the operator's approval, the wrapper from `61652f9` is installed as
+`/usr/local/bin/spectre-offload`. The install was `sudo install` to a temporary
+name followed by `mv -f`, so a run of the old file that was still going kept
+reading its own inode. `install-lightning-offload.sh` does not install the
+wrapper. It sets up only the Lightning CLI venv and the env template, and it
+was not run. The installed file is byte-identical to the repository, and
+`spectre-offload --dry-run` answers as before. From here, every run on the box
+takes a lease. A run of the old file that was already in flight at install
+time still stops the Studio when it ends.

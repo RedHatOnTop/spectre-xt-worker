@@ -22,9 +22,10 @@ class ReaperDecideTest(unittest.TestCase):
     def test_allowlist_listener_kept(self) -> None:
         self.assertEqual(
             spectre_reaper.decide(
-                {"cmd": "orca-ide serve", "listen": {6768}, "handle": ""},
+                {"cmd": "orca-ide serve", "listen": {6768}, "handle": "term_job"},
                 listen_ports={6768},
                 pins=set(),
+                owned={"term_job"},
                 flash_done_age=None,
             ),
             "keep",
@@ -33,20 +34,39 @@ class ReaperDecideTest(unittest.TestCase):
     def test_paper_jar_reaped_while_listening(self) -> None:
         self.assertEqual(
             spectre_reaper.decide(
-                {"cmd": "java -jar paper.jar nogui", "listen": {25569}, "handle": ""},
+                {"cmd": "java -jar paper.jar nogui", "listen": {25569}, "handle": "term_job"},
                 listen_ports={25569},
                 pins=set(),
+                owned={"term_job"},
                 flash_done_age=None,
             ),
             "term",
         )
 
+    def test_paper_jar_outside_a_recorded_tab_kept(self) -> None:
+        for handle in ("", "term_operator"):
+            self.assertEqual(
+                spectre_reaper.decide(
+                    {"cmd": "java -jar paper.jar nogui", "listen": {25569}, "handle": handle},
+                    listen_ports={25569},
+                    pins=set(),
+                    owned={"term_job"},
+                    flash_done_age=None,
+                ),
+                "keep",
+            )
+
     def test_minecraft_client_reaped(self) -> None:
         self.assertEqual(
             spectre_reaper.decide(
-                {"cmd": "java KnotClient --quickPlayMultiplayer localhost:25569", "listen": {8765}},
+                {
+                    "cmd": "java KnotClient --quickPlayMultiplayer localhost:25569",
+                    "listen": {8765},
+                    "handle": "term_job",
+                },
                 listen_ports={8765},
                 pins=set(),
+                owned={"term_job"},
                 flash_done_age=None,
             ),
             "term",
@@ -58,6 +78,7 @@ class ReaperDecideTest(unittest.TestCase):
                 {"cmd": "bash", "handle": "term_flash", "listen": set()},
                 listen_ports=set(),
                 pins={"term_flash"},
+                owned=set(),
                 flash_done_age=None,
             ),
             "keep",
@@ -73,6 +94,7 @@ class ReaperDecideTest(unittest.TestCase):
                 },
                 listen_ports=set(),
                 pins={"term_flash"},
+                owned=set(),
                 flash_done_age=301,
             ),
             "term",
@@ -86,6 +108,7 @@ class ReaperDecideTest(unittest.TestCase):
                 },
                 listen_ports=set(),
                 pins={"term_flash"},
+                owned=set(),
                 flash_done_age=10,
             ),
             "keep",
@@ -101,6 +124,7 @@ class ReaperDecideTest(unittest.TestCase):
                 },
                 listen_ports=set(),
                 pins={"term_flash"},
+                owned={"term_other"},
                 flash_done_age=900,
             ),
             "keep",
@@ -109,9 +133,10 @@ class ReaperDecideTest(unittest.TestCase):
     def test_unknown_listen_kept(self) -> None:
         self.assertEqual(
             spectre_reaper.decide(
-                {"cmd": "mystery", "listen": set(), "listen_unknown": True},
+                {"cmd": "mystery", "listen": set(), "listen_unknown": True, "handle": "term_job"},
                 listen_ports=set(),
                 pins=set(),
+                owned={"term_job"},
                 flash_done_age=None,
             ),
             "keep",
@@ -131,9 +156,11 @@ class ReaperCliTest(unittest.TestCase):
                     {
                         "listen_ports": [25569, 6768],
                         "pins": ["term_flash"],
+                        "owned": ["term_job"],
                         "flash_done_age": 400,
                         "procs": [
-                            {"cmd": "java -jar paper.jar", "listen": [25569], "handle": ""},
+                            {"cmd": "java -jar paper.jar", "listen": [25569], "handle": "term_job"},
+                            {"cmd": "java -jar paper.jar nogui", "listen": [25566], "handle": ""},
                             {"cmd": "dsh --profile tui", "listen": [], "handle": "term_other"},
                             {
                                 "cmd": "dsh --profile headless x",
@@ -157,6 +184,7 @@ class ReaperCliTest(unittest.TestCase):
             self.assertTrue(payload["dry_run"])
             by_cmd = {row["cmd"]: row["action"] for row in payload["decisions"]}
             self.assertEqual(by_cmd["java -jar paper.jar"], "term")
+            self.assertEqual(by_cmd["java -jar paper.jar nogui"], "keep")
             self.assertEqual(by_cmd["dsh --profile tui"], "keep")
             self.assertEqual(by_cmd["dsh --profile headless x"], "term")
             self.assertEqual(by_cmd["/usr/bin/orca-ide serve"], "keep")

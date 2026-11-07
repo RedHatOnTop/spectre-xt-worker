@@ -11,7 +11,7 @@ from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'scripts'))
-from control_plane import packets, runtime, providers, inventory, quota
+from control_plane import cline_free, packets, runtime, providers, inventory, quota
 from control_plane.io import read_json, write_json
 from worker_state.store import Store
 from worker_state.types import iso_from
@@ -96,9 +96,12 @@ class LoopRuntimeTest(unittest.TestCase):
                     'SPECTRE_PROVIDER_STATE': str(self.root / 'provider.json')}
         (self.root / 'packets').mkdir()
         write_json(self.root / 'provider.json', {'ok': True, 'id': 'anyrouter', 'checked_at': NOW})
+        self.usage = patch.object(cline_free, 'DEFAULT_PATH', self.root / 'cline-free-usage.json')
+        self.usage.start()
         self.sent = []
 
     def tearDown(self):
+        self.usage.stop()
         self.store.close()
         self.tmp.cleanup()
 
@@ -106,10 +109,10 @@ class LoopRuntimeTest(unittest.TestCase):
         self.sent.append(argv)
         return {'ok': True, 'parsed': {'ok': True, 'evt': 'dispatch_sent'}}
 
-    def tick(self, workers=None, now=NOW, dry=False):
+    def tick(self, workers=None, now=NOW, dry=False, load=None):
         self.client.now = now
         return runtime.tick(workers or {'minecraft': self.entry}, self.client,
-            self.path, self.env, now=now, dry=dry, run=self.run_command)
+            self.path, self.env, now=now, dry=dry, run=self.run_command, load=load)
 
     def test_plan_once_then_stable_packets_then_single_dispatch(self):
         completed(self.store)

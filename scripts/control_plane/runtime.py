@@ -4,10 +4,12 @@ from __future__ import annotations
 from pathlib import Path
 import time
 
-from . import budget, packets, planning, quota, seat
+from . import budget, cline_free, packets, planning, quota, seat
 from .io import locked, read_json, write_json, run as run_command
 
 TICK_SECONDS = 45
+# A Claude handoff is operator-driven; one left pending this long was likely abandoned.
+CLAUDE_HANDOFF_STALE = 30 * 60
 
 
 def enabled(env: dict, key: str) -> bool:
@@ -56,13 +58,69 @@ def escalation(worker, ws, reason, run, env):
     return updated, {'worker': worker, 'action': 'escalate', 'reason': reason, 'io': out}
 
 
-def dry_action(worker, entry, snapshot, env):
+def dry_action(worker, entry, snapshot, env, path, now):
     policy = snapshot.get('policy', {})
-    if entry.get('planner') and not enabled(env, 'ASTRA_ENABLED'):
+    if snapshot.get('goal', {}).get('state') == 'UNKNOWN' or policy.get('continuity_recovery_allowed'):
+        return {'worker': worker, 'action': 'skip', 'reason': 'occupancy'}
+    planner = entry.get('planner')
+    if planner and not enabled(env, 'ASTRA_ENABLED'):
         return {'worker': worker, 'action': 'skip', 'reason': 'planner_pin'}
-    if policy.get('grokbot_may_advance'):
-        return {'worker': worker, 'action': 'plan' if entry.get('planner') else 'goal'}
-    return {'worker': worker, 'action': 'skip', 'reason': snapshot.get('goal', {}).get('state')}
+    if not policy.get('grokbot_may_advance'):
+        return {'worker': worker, 'action': 'skip', 'reason': snapshot.get('goal', {}).get('state')}
+    if not planner:
+        return {'worker': worker, 'action': 'goal'}
+    reason = handoff_hold(read_json(path).get('workers', {}).get(worker, {}), now)
+    if reason:
+        return {'worker': worker, 'action': 'escalate' if reason == 'claude_handoff_stale' else 'skip',
+                'reason': reason}
+    owner = seat.load(seat.seat_path(seat_root(path, env), worker))['owner']
+    reason = pin_refusal(planner, owner)
+    if not reason and owner == seat.OWNER_ASTRA:
+        reason = codex_refusal(planner, read_json(provider_path(env)), read_json(path), snapshot, now)
+    elif not reason and owner == seat.OWNER_KIMI:
+        reason = kimi_refusal(now)
+    reason = reason or (None if planner.get('terminal') else 'planner_terminal_missing')
+    if reason:
+        return {'worker': worker, 'action': 'escalate', 'reason': reason}
+    return {'worker': worker, 'action': 'plan'}
+
+
+def handoff_hold(ws, now):
+    pending = ws.get('claude_handoff')
+    if not pending:
+        return None
+    launched = pending.get('launched_at') if isinstance(pending, dict) else None
+    if type(launched) not in {int, float} or now - launched > CLAUDE_HANDOFF_STALE:
+        return 'claude_handoff_stale'
+    return 'claude_handoff_pending'
+
+
+def codex_refusal(planner, provider, state, snapshot, now):
+    # codex_gate() also writes the Kimi handoff brief; a dry run only names the verdict.
+    reason = budget.planner_refusal(state, provider, now, snapshot['goal']['state'] == 'FAILED')
+    if reason:
+        return reason
+    if provider.get('id') == 'kimi_free':
+        return 'kimi_handoff_required'
+    if planner.get('provider') and planner['provider'] != provider.get('id'):
+        return 'provider_restart_required'
+    return None
+
+
+def kimi_refusal(now):
+    # While the relays are down the provider tick probes Kimi and records the free quota's
+    # first 429; a plan typed after it would only time out, and each timeout alerts anew.
+    return 'kimi_free_exhausted' if cline_free.status(cline_free.load(), now)['exhausted'] else None
+
+
+def provider_path(env):
+    return Path(env.get('SPECTRE_PROVIDER_STATE', Path.home() / '.local/state/remote-agent/codex-provider.json'))
+
+
+def pin_refusal(planner: dict, owner: str) -> str | None:
+    if (planner.get('harness') or seat.OWNER_ASTRA) == owner:
+        return None
+    return 'planner_harness_mismatch' if owner == seat.OWNER_ASTRA else f'seat_owned_by_{owner}'
 
 
 def seat_root(path, env):
@@ -104,11 +162,7 @@ def planner_seat(worker, snapshot, state, path, env, provider, now, run):
 def codex_gate(worker, entry, snapshot, state, path, env, now, run):
     ws = state.get('workers', {}).get(worker, {})
     planner = entry.get('planner', {})
-    if (planner.get('harness') or seat.OWNER_ASTRA) != seat.OWNER_ASTRA:
-        new_ws, action = escalation(worker, ws, 'planner_harness_mismatch', run, env)
-        return worker_state(state, worker, new_ws), action, None
-    provider_path = Path(env.get('SPECTRE_PROVIDER_STATE', Path.home() / '.local/state/remote-agent/codex-provider.json'))
-    provider = read_json(provider_path)
+    provider = read_json(provider_path(env))
     reason = budget.planner_refusal(state, provider, now, snapshot['goal']['state'] == 'FAILED')
     if reason:
         new_ws, action = escalation(worker, ws, reason, run, env)
@@ -124,19 +178,34 @@ def codex_gate(worker, entry, snapshot, state, path, env, now, run):
 
 
 def start_plan(worker, entry, snapshot, state, path, client, env, now, run):
+    # spectre-claude stops the old planner before it launches Claude; a plan requested
+    # meanwhile would sit unanswered and block the confirm.
+    ws = state.get('workers', {}).get(worker, {})
+    hold = handoff_hold(ws, now)
+    if hold == 'claude_handoff_stale':
+        new_ws, action = escalation(worker, ws, hold, run, env)
+        return worker_state(state, worker, new_ws), action
+    if hold:
+        return state, {'worker': worker, 'action': 'skip', 'reason': hold}
     planner = entry.get('planner', {})
     owner = seat.load(seat.seat_path(seat_root(path, env), worker))['owner']
+    refusal = pin_refusal(planner, owner)
+    if refusal:
+        ws = state.get('workers', {}).get(worker, {})
+        new_ws, action = escalation(worker, ws, refusal, run, env)
+        return worker_state(state, worker, new_ws), action
     if owner == seat.OWNER_ASTRA:
         state, action, ledger = codex_gate(worker, entry, snapshot, state, path, env, now, run)
         if action:
             return state, action
-    elif planner.get('harness') == owner:
-        # Codex budgets and provider health do not describe another harness.
-        ledger = seat.seats_for_owner(owner)[0]['provider']
     else:
-        ws = state.get('workers', {}).get(worker, {})
-        new_ws, action = escalation(worker, ws, f'seat_owned_by_{owner}', run, env)
-        return worker_state(state, worker, new_ws), action
+        # Codex budgets and provider health do not describe another harness.
+        refusal = kimi_refusal(now) if owner == seat.OWNER_KIMI else None
+        if refusal:
+            ws = state.get('workers', {}).get(worker, {})
+            new_ws, action = escalation(worker, ws, refusal, run, env)
+            return worker_state(state, worker, new_ws), action
+        ledger = seat.seats_for_owner(owner)[0]['provider']
     ws = state.get('workers', {}).get(worker, {})
     if not planner.get('terminal'):
         new_ws, action = escalation(worker, ws, 'planner_terminal_missing', run, env)
@@ -347,15 +416,22 @@ def progress(worker, entry, snapshot, state, path, client, env, now, run):
     return state, notice_action or {'worker': worker, 'action': 'skip'}
 
 
-def tick(workers, client, path, env, *, now=None, dry=False, run=run_command):
+def tick(workers, client, path, env, *, now=None, dry=False, run=run_command, load=None):
     if not enabled(env, 'SPECTRE_LOOP'):
         return {'ok': True, 'disabled': True, 'dry_run': dry}
     validate_workers(workers)
     now = time.time() if now is None else now
     if dry:
         return {'ok': True, 'dry_run': True, 'actions': [dry_action(name, entry,
-            client.snapshot(name), env) for name, entry in sorted(workers.items())]}
+            client.snapshot(name), env, path, now) for name, entry in sorted(workers.items())]}
     with locked(path.with_suffix('.lock')):
+        # spectre-kimi commits the seat and rewrites the planner pin under this lock; a
+        # registry read before it was taken can pair the new seat with the old pin.
+        if load is not None:
+            workers = load()
+            if not workers:
+                raise ValueError('worker registry is empty or unreadable')
+            validate_workers(workers)
         return live_tick(workers, client, path, env, now, run)
 
 

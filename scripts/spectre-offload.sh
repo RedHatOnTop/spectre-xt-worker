@@ -32,6 +32,9 @@ REPORT=0
 SETUP_CMD=""
 ARTIFACTS=()
 UPLOADED=0
+LEASED=0
+# One Studio serves every session on this box; each run holds a lease named by its pid.
+LEASE_DIR="${LIGHTNING_LEASE_DIR:-$HOME/.local/state/remote-agent/offload-leases}"
 TIMEOUT="${LIGHTNING_SSH_TIMEOUT:-300}"
 # Build caches that live in the persistent (billed) Studio home.
 CACHE_DIRS='.gradle/caches .m2/repository .cache .npm .cargo/registry'
@@ -104,11 +107,78 @@ cleanup_remote() {
   remote "rm -rf ${REMOTE_DIR}" >/dev/null 2>&1 || true
   UPLOADED=0
 }
-trap 'cleanup_remote' EXIT HUP INT TERM
+# Lease changes and the last-lease check run under one flock, so two runs that end
+# together cannot both leave the Studio to the other.
+with_leases() {
+  mkdir -p "${LEASE_DIR}"
+  exec {lease_fd}>"${LEASE_DIR}/.lock"
+  flock "${lease_fd}"
+  "$@"
+  local status=$?
+  exec {lease_fd}>&-
+  return "${status}"
+}
+studio_status() {
+  timeout 60 "${LIGHTNING_BIN}" studio list --teamspace "${TEAMSPACE}" --json 2>/dev/null \
+    | python3 -c 'import json,sys; name=sys.argv[1]; rows=json.load(sys.stdin); print(next((s.get("status","?") for s in rows if s.get("name")==name), "?"))' "${STUDIO}" 2>/dev/null || echo '?'
+}
+# `.started` marks a Studio that an offload lease started. One found Running or Pending
+# was started by someone else, whose run a stop from here would cut off.
+take_lease() {
+  printf '%s\n' "$$" > "${LEASE_DIR}/$$"
+  case "$(studio_status)" in
+    Running|Pending) ;;
+    *) : > "${LEASE_DIR}/.started" ;;
+  esac
+}
+# Drops this run's lease and any lease whose process is gone. Prints `stop` when this was
+# the last live lease on a Studio a lease started, else the number of live others.
+drop_lease() {
+  rm -f "${LEASE_DIR}/$$"
+  local lease pid live=0
+  for lease in "${LEASE_DIR}"/*; do
+    [[ -e "${lease}" ]] || continue
+    pid="${lease##*/}"
+    if [[ "${pid}" =~ ^[0-9]+$ ]] && kill -0 "${pid}" 2>/dev/null; then
+      live=$((live + 1))
+    else
+      rm -f "${lease}"
+    fi
+  done
+  if ((live == 0)) && [[ -e "${LEASE_DIR}/.started" ]]; then
+    rm -f "${LEASE_DIR}/.started"
+    echo stop
+  else
+    echo "${live}"
+  fi
+}
+# Runs from the trap too, so a `die` after the start (SSH wait, rsync install or push)
+# releases the lease; the Studio stops only with the last lease on one a lease started.
+stop_studio() {
+  ((LEASED == 1)) || return 0
+  LEASED=0
+  local verdict
+  verdict="$(with_leases drop_lease)"
+  ((KEEP == 0)) || return 0
+  if [[ "${verdict}" != stop ]]; then
+    if ((verdict > 0)); then
+      note "leaving Studio ${STUDIO} running for ${verdict} other offload(s)"
+    else
+      note "leaving Studio ${STUDIO} running: it was already up when this offload began"
+    fi
+    return 0
+  fi
+  note "stopping Studio ${STUDIO}"
+  "${LIGHTNING_BIN}" studio stop --name "${STUDIO}" --teamspace "${TEAMSPACE}" >&2 || true
+}
+trap 'cleanup_remote; stop_studio' EXIT
+# A trapped signal would otherwise resume the script after the cleanup; exiting runs it.
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 if ((REPORT == 1)); then
-  status="$("${LIGHTNING_BIN}" studio list --teamspace "${TEAMSPACE}" --json 2>/dev/null \
-    | python3 -c 'import json,sys; name=sys.argv[1]; rows=json.load(sys.stdin); print(next((s.get("status","?") for s in rows if s.get("name")==name), "?"))' "${STUDIO}" 2>/dev/null || echo '?')"
+  status="$(studio_status)"
   printf '{"studio":"%s","status":"%s"' "${STUDIO}" "${status}"
   if [[ "${status}" == "Running" ]]; then
     printf ',"home_used":"%s"' "$(remote 'du -sh "$HOME" 2>/dev/null | cut -f1' | tr -d '[:space:]')"
@@ -127,11 +197,15 @@ if ((REPORT == 1)); then
 fi
 
 note "starting Studio ${STUDIO} (${MACHINE})"
+with_leases take_lease
+LEASED=1
 "${LIGHTNING_BIN}" studio start --name "${STUDIO}" --teamspace "${TEAMSPACE}" --machine "${MACHINE}" >&2 || true
 
+# A freshly started Studio accepts SSH before it is set up and then answers commands with
+# "We are still setting things up for you"; only an exact echo means it is ready.
 deadline=$((SECONDS + TIMEOUT))
-until ssh -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new \
-      "${STUDIO}" true 2>/dev/null; do
+until [[ "$(ssh -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new \
+      -o LogLevel=ERROR "${STUDIO}" 'echo spectre-ready' 2>/dev/null)" == spectre-ready ]]; do
   ((SECONDS < deadline)) || die "Studio ${STUDIO} did not accept SSH within ${TIMEOUT}s" 5
   sleep 5
 done
@@ -201,10 +275,7 @@ fi
 home_used="$(remote 'du -sh "$HOME" 2>/dev/null | cut -f1' | tr -d '[:space:]' || true)"
 studio_used="$(remote 'df -h "$HOME" | awk "NR==2{print \$3}"' | tr -d '[:space:]' || true)"
 
-if ((KEEP == 0)); then
-  note "stopping Studio ${STUDIO}"
-  "${LIGHTNING_BIN}" studio stop --name "${STUDIO}" --teamspace "${TEAMSPACE}" >&2 || true
-fi
+stop_studio
 
 printf '{"ok":%s,"exit":%s,"studio":"%s","remote":"%s","remote_cleaned":"%s","uploaded_bytes":"%s","home_used":"%s","studio_used":"%s","pruned_bytes":%s,"artifacts":"%s"}\n' \
   "$([[ ${rc} -eq 0 ]] && echo true || echo false)" "${rc}" "${STUDIO}" "${REMOTE_DIR}" "${cleaned}" \

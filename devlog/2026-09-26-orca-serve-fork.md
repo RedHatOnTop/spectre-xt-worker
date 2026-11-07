@@ -172,7 +172,7 @@ The unit's `UnsetEnvironment=` and `Restart=always` stay in place.
   bbc15fac-…::/home/person/wt/release-readiness-spectre` (the minecraft repo
   id again, not the cwd's repo), while `worktree ps` lists `00bbf03b-…` for
   that path. The test terminal was closed. AGENTS.md / RUNBOOK §7.8 guidance
-  stands. A resolver fix is a candidate patch 8.
+  stands. A resolver fix is a candidate patch 9.
 - Rollback package: `~/pkgs/orca/orca-ide_1.4.198_amd64.deb` on the box.
 - The fork does not touch GUI code paths; every patch is gated on serve mode
   or lives inside the daemon's own log path.
@@ -181,3 +181,156 @@ The unit's `UnsetEnvironment=` and `Restart=always` stay in place.
   (`/proc/<pid>/environ` handles, one list per tick max, §7.10), and the cost
   looks dominated by Electron-as-node startup, not daemon RPC. Revisit only
   if a post-deploy profile says otherwise.
+
+## Patch 8: remote terminal stream drops (evening)
+
+Symptom (operator report): a terminal viewed from the Orca ADE client sometimes
+streamed slowly, or broke and kept remnants of an older screen on top of the
+new one. Not keystroke echo lag.
+
+Code read of 1.4.212 (no incident evidence exists yet, so this is mechanism,
+not diagnosis). Output can be dropped at two hops, each followed by a
+snapshot meant to repair the viewer:
+
+- daemon → serve: sessions serve marks background get keep-tail thinning
+  (`daemon-stream-keep-tail-drop.ts`, 512K chars per session shrinking to 64K,
+  2M global); the kept tail may start mid-escape-sequence by design, and a
+  `dataGap` replaces the dropped bytes. Logged by patch 7 once the daemon
+  generation turns over.
+- serve → remote client: per-stream ACK queue over 256 KB drops its oldest
+  chunks and sends a recovery snapshot; if no snapshot can be made the stream
+  ends `unverifiable`. That snapshot waits up to 8 s for the daemon and then
+  falls back to whatever mirror is available, and upstream's own test
+  (`bounds a hung authoritative provider acquisition and reuses its fallback`)
+  shows the fallback is reused until the hung daemon call settles.
+
+A TUI (Claude Code, qodercli) repaints by moving the cursor and overwriting
+changed cells, so a dropped span or a lagging repair image leaves old cells
+on screen until the next full redraw. That is consistent with the report but
+unproven.
+
+Patch 8 (`e7617156a7`) logs the serve → client hop. Serve installs a main-
+process sink (patch 7's sink is daemon-only) that writes `[serve]
+stream-backlog <event> <json>` to the journal, one line per event per 30 s:
+`remoteAckOverflow`, `remotePendingOverflow`, `remoteRecoverySnapshot`
+(source, seq, elapsedMs), `remoteRecoverySnapshotFailed`,
+`remoteStreamUnverifiable`, `remoteSnapshotUnavailable`,
+`remoteInitialSnapshotTruncated`, `authoritativeSnapshotFallback`
+(providerWaitMs, source). Upstream's existing `mainBackgroundSync` entries
+land there too. How to read them: RUNBOOK §7.8.
+
+Verification:
+
+- fedora: `make test` 71/71 plus the runtime fragment 2/2; `make typecheck`
+  clean; oxlint and oxfmt clean on the changed files. Red check: with the
+  source hunks stashed, 3 of the 4 new tests fail (the "stays quiet" case
+  passes either way, as it should).
+- Pre-existing failures seen on the unpatched parent too, unrelated:
+  `configure-process.test.ts` (2 GPU-flag tests, host-dependent) and flaky
+  lineage / worktree-scan tests in `orca-runtime.test.ts` (a different set
+  each run), which is why `make test` filters the runtime entry to the fork's
+  fragment.
+- Package `orca-ide_1.4.212_serve-e7617156a7b5_amd64.deb`: all new event
+  names present in `app.asar`.
+- Spectre deploy 21:33 KST: clean stop (`SIGTERM received` → `before-quit` →
+  `exiting with code 0`), daemon pid 2796 preserved with 16 live sessions,
+  16/16 terminals listed after, `NRestarts=0`, web-index 200. A throwaway
+  terminal (created and closed) produced
+  `[serve] stream-backlog mainBackgroundSync {"sessionIdSuffix":"@@00b5e9ab","background":true,"caller":"spawn","known":false,"visible":false}`,
+  so the production sink is live.
+- Not seen live: the `remote*` and fallback events. Inducing an ACK overflow
+  needs a client that pairs over E2EE and speaks the binary multiplex
+  protocol; they are covered by unit tests only and will show up on the next
+  real overflow.
+
+Finding on the way: a CLI-created terminal starts with thinning **on**
+(`background:true`, caller `spawn`). A remote viewer is supposed to flip it
+off (`caller:"remote-view"`, `background:false`). When a stale screen next
+appears, first check whether that flip was logged for the session; if not,
+the daemon was thinning a stream someone was watching. Caveat: the rate limit
+is per event name, so a flip within 30 s of another sync shows only as a
+`suppressedSinceLastEmit` count (fixed by patch 9 below).
+
+## Patch 9: PTY resize logging (2026-09-27, after midnight)
+
+Why: serve has no renderer process (checked on the box: zygotes, GPU process,
+Xvfb `:99` and the network service, no `--type=renderer`), so nothing measures
+a pane. `orca-runtime-create-terminal.ts` spawns CLI terminals at a fixed
+120×40, and the size changes only when a remote viewer claims its viewport
+(`RemoteDesktopTerminalFloor`) and again on the host reclaim when the last
+viewer leaves, back to the pre-claim size since serve has no renderer size to
+restore. Each change is a full TUI repaint at a new width, and none was
+recorded. The other renderer gaps found in the same read (lazy tab mount
+waits 10 s for a renderer that does not exist, then `no_connected_pty`; no
+renderer serializer as a snapshot source) are recorded here, not patched.
+
+Patch 9 (`9e4c765cc6`): `applyLayout`, the only resize path in serve, logs
+`ptyResize` with `from`/`to`, `kind` (`remote-desktop` claim, `desktop`
+reclaim, `phone`), `owner` (`multiplex:<connection>:<stream>`, the same
+stream id as the patch 8 `remote*` lines), `seq`, and `failed:true` when the
+provider refuses. The sink's rate limit now takes an optional key.
+`ptyResize` is keyed per kind and session, and `mainBackgroundSync` per
+direction and session. The box journal had already shown the need: between the
+patch 8 and patch 9 deploys, per-event-name keying folded session flips into
+`suppressedSinceLastEmit: 1` and `: 4`. Past 256 keys, closed windows with
+nothing suppressed are dropped.
+
+Real data from that window (patch 8 live, 21:33 → 00:34): 7 lines, all
+`mainBackgroundSync`. Five `spawn` → `background:true` for new CLI terminals,
+and two `remote-view` → `background:false` (`@@d92e03c2` at 21:51,
+`@@253b6fb0` at 00:21) when the ADE client (100.64.11.53) opened a terminal.
+So the flip-off works when a viewer attaches. No `remote*` overflow line
+appeared.
+
+Verification:
+
+- fedora: `make test` 77/77 plus the runtime fragment 2/2; typecheck, oxlint,
+  oxfmt clean. The `src/main/ipc/pty` suite plus the layout suites (89 files,
+  849 tests) pass. Red check: without the source hunks, 4 of the new resize
+  and probe tests fail, and the producer-sync test fails.
+- Pre-existing, unrelated: 7 bash-wrapper tests
+  (`bash-prompt-command-composition`, `shell-ready-bash-wrapper`) fail on
+  fedora's bash 5.3.9 with and without the patch, with identical names. An
+  8th in the wide run was a load flake.
+- Package `orca-ide_1.4.212_serve-9e4c765cc6b5_amd64.deb`: `ptyResize:` and
+  `mainBackgroundSync:` keys present in `app.asar`.
+- Spectre deploy 00:34 KST: clean stop (`SIGTERM received` → `exiting with
+  code 0`), daemon 2796 preserved with 26 live sessions, 26/26 terminals
+  after, `NRestarts=0`, web-index 200, the ADE client reconnected.
+
+### First live ptyResize data: tab switches shrink agent PTYs to 80x24
+
+Within minutes of the operator reconnecting (00:35-00:44 KST), the journal
+showed the same pattern on every terminal the ADE client opened and then left:
+
+```
+ptyResize {"sessionIdSuffix":"@@3f4d4deb","from":null,"to":"149x55","kind":"remote-desktop","owner":"multiplex:953506ff08500055:5","seq":1}
+ptyResize {"sessionIdSuffix":"@@3f4d4deb","from":"149x55","to":"80x24","kind":"desktop","seq":2}
+```
+
+Five sessions were claimed to the client's 149x55 and then reclaimed to
+**80x24** 1-7 s later, when the viewer moved on. Mechanism, from the code:
+
+- `getTerminalSize` is `ptyController.getSize`, which serve only knows for
+  PTYs it spawned itself (`@@Omj_DvqQ`, spawned at 00:38, logged
+  `from:"120x40"`). For sessions re-attached from the preserved daemon after
+  a serve restart it is `null` (`from:null` above).
+- On a first claim, `RemoteDesktopTerminalFloor` records the host reclaim
+  target via `resolveDesktopRestoreTarget`: mobile baseline (none) → last
+  renderer size (no renderer in serve) → current size (`null`) → the hard
+  default `{80,24}`, which upstream's comment says is "reached only under
+  bug". In serve it is reached for every re-attached PTY.
+- When the last viewer leaves, the floor resizes the PTY to that target.
+
+So every visit to an agent tab costs two full TUI reflows (149 → 80 → 149).
+The time at 80 columns also leaves output wrapped at 80 in scrollback. The
+80x24 `qodercli` PTYs seen on the box earlier fit this. This is the strongest
+candidate so far for the "stale screen remnants" report: Ink-style TUIs erase
+their previous frame by line count, and a width change rewraps that frame.
+It is not proven to be the cause, but the resize churn itself is now
+observed, not inferred.
+
+Candidate patch 10 (not written): in serve there is no host display to give
+width back to, so when the last remote viewer leaves, keep the PTY at the
+viewer's size instead of reclaiming. Alternative: seed the re-attached
+PTY's real size from the daemon so the reclaim target is at least not 80x24.

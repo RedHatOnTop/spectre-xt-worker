@@ -9,6 +9,8 @@ import time
 from . import cline_free, inventory, orca, pins, providers, runtime, seat
 from .io import locked, read_json, run as run_command, write_json, write_text
 
+PLANNER_MODELS = frozenset(seat.PLANNER_ROLES.values())
+
 
 def launch(workers_file: Path, modes: Path, provider_state: Path, *, dry=False,
            proc_root=Path('/proc'), run=run_command, now=None) -> dict:
@@ -23,6 +25,10 @@ def launch(workers_file: Path, modes: Path, provider_state: Path, *, dry=False,
         entry = registry['workers'].get('minecraft')
         if not entry:
             raise ValueError('minecraft worker missing')
+        running = [row['pid'] for row in processes
+                   if row.get('model') in PLANNER_MODELS and row.get('cwd') == entry['cwd']]
+        if running:
+            return {'ok': False, 'error': 'top_level_agent_already_running', 'pids': running}
         seat_root = Path(os.environ.get('SPECTRE_SEAT_ROOT', provider_state.parent))
         if not seat_root.is_absolute():
             raise ValueError('SPECTRE_SEAT_ROOT must be absolute')

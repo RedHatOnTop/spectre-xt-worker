@@ -709,8 +709,13 @@ function readTabRecords(env = process.env) {
   });
 }
 
-async function orcaWorktreeId(cwd) {
-  const listed = await runCommandCapture(ORCA_BIN, ["worktree", "ps", "--json"], 20_000);
+// `worktree ps` has a row cap and no offset; a page without the worktree is re-read
+// once with the reported total as the cap, never with an unbounded one.
+const MAX_ORCA_WORKTREES = 1000;
+
+async function orcaWorktreeList(limit = null) {
+  const args = ["worktree", "ps", "--json", ...(limit ? ["--limit", String(limit)] : [])];
+  const listed = await runCommandCapture(ORCA_BIN, args, 20_000);
   if (!listed.ok) return { ok: false, error: `orca_ps_failed: ${listed.error}` };
   let payload = null;
   try {
@@ -720,11 +725,22 @@ async function orcaWorktreeId(cwd) {
   }
   const body = (payload && payload.result) || {};
   if (!Array.isArray(body.worktrees)) return { ok: false, error: "unexpected orca worktree ps shape" };
-  const ids = body.worktrees
+  return { ok: true, rows: body.worktrees, truncated: Boolean(body.truncated), total: body.totalCount };
+}
+
+async function orcaWorktreeId(cwd) {
+  const matching = (rows) => rows
     .filter((row) => row && row.path === cwd && !row.isArchived)
     .map((row) => row.worktreeId);
+  let page = await orcaWorktreeList();
+  if (page.ok && page.truncated && !matching(page.rows).length && Number.isInteger(page.total)
+      && page.rows.length < page.total && page.total <= MAX_ORCA_WORKTREES) {
+    page = await orcaWorktreeList(page.total);
+  }
+  if (!page.ok) return page;
+  const ids = matching(page.rows);
   if (ids.length === 1 && typeof ids[0] === "string" && ids[0]) return { ok: true, worktreeId: ids[0] };
-  if (!ids.length && body.truncated) return { ok: false, error: `orca_ps_truncated: ${cwd}` };
+  if (!ids.length && page.truncated) return { ok: false, error: `orca_ps_truncated: ${cwd}` };
   return { ok: false, error: `orca_worktree_unregistered: ${cwd} (${ids.length} rows)` };
 }
 
@@ -1092,13 +1108,18 @@ export function astraCmdlinesFromEnv(env = process.env) {
   return String(raw).split("\n").filter(Boolean);
 }
 
-export function listPlannerCmdlines(role, env = process.env, procRoot = "/proc") {
+// Astra is counted box-wide, as its launcher refuses box-wide. A Claude or Kimi planner is
+// counted only in the dispatched worktree: an operator session elsewhere is not a planner.
+const WORKTREE_PLANNER_ROLES = new Set(["claude", "kimi"]);
+
+export function listPlannerCmdlines(role, env = process.env, procRoot = "/proc", cwd = null) {
   const fromEnv = astraCmdlinesFromEnv(env);
   if (fromEnv) return fromEnv;
   try {
     const rows = processes(env.SPECTRE_PROC_ROOT || procRoot).filter((row) => row.role === role);
     const leaves = rows.filter((row) => !rows.some((other) => other.ppid === row.pid));
-    return leaves.map((row) => row.argv.join(" "));
+    const scoped = cwd && WORKTREE_PLANNER_ROLES.has(role) ? leaves.filter((row) => row.cwd === cwd) : leaves;
+    return scoped.map((row) => row.argv.join(" "));
   } catch {
     return [];
   }
@@ -1972,7 +1993,7 @@ async function dispatchCli(argv) {
         code: 1,
       };
     }
-    const pids = plannerPidVerdict(listPlannerCmdlines(role), role);
+    const pids = plannerPidVerdict(listPlannerCmdlines(role, process.env, "/proc", entry.cwd), role);
     if (!pids.ok) {
       audit({ evt: pids.evt, worker: opts.worker, origin: opts.operator, count: pids.count });
       return {
