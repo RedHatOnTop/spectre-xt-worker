@@ -13,6 +13,8 @@ ExecStart=/usr/bin/orca-ide serve --port 6768 --pairing-address 100.119.252.88 -
 Restart=always
 RestartSec=3
 RestartPreventExitStatus=3
+# control-group would SIGTERM Chromium's zygote/GPU children directly, and serve
+# then dies with a GPU FATAL (SIGILL) instead of quitting.
 KillMode=mixed
 
 [Install]

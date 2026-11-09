@@ -1,0 +1,12 @@
+[Unit]
+Description=Recover the Spectre worker-state socket if it stops responding
+After=spectre-worker-state.service
+
+[Service]
+Type=oneshot
+Environment=SPECTRE_STATE_WATCHDOG=1
+ExecStart=/usr/local/bin/spectre-worker-state-watchdog
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+Environment=HOME=%h
+NoNewPrivileges=true
+TimeoutStartSec=50

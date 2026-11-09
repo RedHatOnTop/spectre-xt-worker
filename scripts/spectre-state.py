@@ -10,6 +10,7 @@ def _prepare() -> None:
     here = Path(__file__).resolve().parent
     candidates = [
         here,
+        here.parent / "lib/spectre-worker-state",
         Path("/usr/local/lib/spectre-worker-state"),
     ]
     for parent in candidates:

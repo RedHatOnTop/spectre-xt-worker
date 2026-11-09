@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 import json
+import socket
 import sys
 import tempfile
 import threading
@@ -39,8 +40,8 @@ class ApiTest(unittest.TestCase):
         self.assertTrue(body["ok"])
         code, body = handle(self.store, "GET", "/v1/workers/pugc/snapshot", None, NOW)
         self.assertEqual(code, 200)
-        self.assertEqual(body["goal"]["state"], "IDLE")
-        self.assertTrue(body["policy"]["can_dispatch_goal"])
+        self.assertEqual(body["goal"]["state"], "UNKNOWN")
+        self.assertFalse(body["policy"]["can_dispatch_goal"])
 
     def test_post_evidence(self):
         code, body = handle(
@@ -63,6 +64,7 @@ class ApiTest(unittest.TestCase):
         self.assertEqual(body["goal"]["state"], "RUNNING")
 
     def test_claim_result_roundtrip(self):
+        self.store.snapshot("pugc", NOW, rebuild=True)
         handle(self.store, "GET", "/v1/workers/pugc/snapshot", None, NOW)
         code, claim = handle(
             self.store,
@@ -152,3 +154,50 @@ class ApiTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class UnixBindTest(unittest.TestCase):
+    def test_unix_bind_never_resolves_a_hostname(self):
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch('socket.getfqdn', side_effect=AssertionError('UDS bind performed DNS')):
+                server = UnixHTTPServer(str(Path(tmp) / 'state.sock'), Handler)
+                server.server_close()
+
+    def test_second_server_cannot_replace_live_listener(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = str(Path(tmp) / 'state.sock')
+            first = UnixHTTPServer(path, Handler)
+            try:
+                with self.assertRaises(OSError):
+                    UnixHTTPServer(path, Handler)
+                self.assertTrue(Path(path).exists())
+                with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+                    client.settimeout(1)
+                    client.connect(path)
+            finally:
+                first.server_close()
+
+    def test_stale_socket_is_replaced(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = str(Path(tmp) / 'state.sock')
+            stale = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            stale.bind(path)
+            stale.close()
+            server = UnixHTTPServer(path, Handler)
+            try:
+                self.assertTrue(Path(path).exists())
+            finally:
+                server.server_close()
+
+    def test_close_does_not_unlink_replacement(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'state.sock'
+            server = UnixHTTPServer(str(path), Handler)
+            path.unlink()
+            replacement = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            replacement.bind(str(path))
+            try:
+                server.server_close()
+                self.assertTrue(path.exists())
+            finally:
+                replacement.close()

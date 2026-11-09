@@ -1,0 +1,11 @@
+[Unit]
+Description=Durable continuation of approved Orca work
+After=network-online.target orca-serve.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/spectre-superagent tick --apply
+TimeoutStartSec=300
+UMask=0077
+Nice=10

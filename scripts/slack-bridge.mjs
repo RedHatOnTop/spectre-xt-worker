@@ -22,19 +22,13 @@
 // Pure helpers are exported for tests/slack_bridge.test.mjs.
 
 import { execFile, spawn } from "node:child_process";
-import {
-  appendFileSync,
-  existsSync,
-  mkdirSync,
-  readFileSync,
-  realpathSync,
-  renameSync,
-  writeFileSync,
-} from "node:fs";
+import { accessSync, appendFileSync, chmodSync, constants as fsConstants, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { randomUUID } from "node:crypto";
+import { nativeProcessGuard, processRole, processes } from "./dispatch-process.mjs";
+import { planGuard, plannerPrompt, reservePlan } from "./planner-dispatch.mjs";
 import { actionResult, claimAction, getSnapshot } from "./worker-state-client.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -463,7 +457,9 @@ export function controlDispatchArgs(decision) {
 // permission dialog — blind keystrokes could select a dialog option, so the
 // operator must approve that one in the orca UI.
 export function dispatchAction(builtin) {
-  return builtin === "resume" ? "resume" : "dispatch_goal";
+  if (builtin === "resume") return "resume";
+  if (builtin === "plan") return "plan";
+  return "dispatch_goal";
 }
 
 export function dispatchAllowed(pos, action = "dispatch_goal") {
@@ -471,7 +467,11 @@ export function dispatchAllowed(pos, action = "dispatch_goal") {
   if (!policy || typeof policy !== "object") {
     return { ok: false, detail: "state api unavailable (no policy) — refusing to type blind" };
   }
-  const flag = action === "resume" ? "can_resume" : "can_dispatch_goal";
+  const flag = action === "resume"
+    ? "can_resume"
+    : action === "plan"
+      ? "grokbot_may_advance"
+      : "can_dispatch_goal";
   if (policy[flag] === true) return { ok: true };
   const park = (pos.goal && pos.goal.park_reason) || pos.park_reason || pos.reason;
   const state = (pos.goal && pos.goal.state) || pos.goal_state || pos.state || "UNKNOWN";
@@ -489,11 +489,14 @@ export function dispatchAllowed(pos, action = "dispatch_goal") {
 // runs in that pane. A pane that fell back to a shell would execute it, and a
 // pane in another project would take the goal into the wrong session.
 const SHELL_COMMANDS = ["bash", "zsh", "sh", "dash", "fish", "ksh", "tcsh"];
-export function paneRefusal(command, path, cwd) {
+export function paneRefusal(command, path, cwd, opts = {}) {
   const cmd = String(command || "").replace(/^-/, "").toLowerCase();
   if (SHELL_COMMANDS.includes(cmd)) {
-    return `pane runs a shell (${cmd}) — the text would execute as a shell command`;
+    if (!(opts.allowFlashShell && String(opts.line || "").startsWith(FLASH_FILE_PREFIX))) {
+      return `pane runs a shell (${cmd}) — the text would execute as a shell command`;
+    }
   }
+  if (cwd && !path) return "pane cwd is missing";
   if (cwd && path) {
     let same = path === cwd;
     if (!same) {
@@ -506,6 +509,15 @@ export function paneRefusal(command, path, cwd) {
     if (!same) return `pane cwd (${path}) is not the worker cwd (${cwd})`;
   }
   return null;
+}
+
+async function inspectPane(target) {
+  const [command, path] = await Promise.all([
+    runCommandCapture(TMUX_BIN, ["display-message", "-p", "-t", target, "#{pane_current_command}"], 10_000),
+    runCommandCapture(TMUX_BIN, ["display-message", "-p", "-t", target, "#{pane_current_path}"], 10_000),
+  ]);
+  if (!command.ok || !path.ok) return { ok: false, error: command.error || path.error };
+  return { ok: true, command: command.stdout.trim(), path: path.stdout.trim() };
 }
 
 // A bare registry name is ambiguous as a tmux target: tmux matches it as a
@@ -559,50 +571,616 @@ export function oneLine(text) {
 export function dispatchLine(builtin, goalText, clauseText) {
   let line = builtin === "resume" ? "/goal resume" : `/goal ${oneLine(goalText)}`;
   if (builtin !== "resume" && oneLine(clauseText)) line += ` ${oneLine(clauseText)}`;
-  return line.length > GOAL_LINE_MAX ? line.slice(0, GOAL_LINE_MAX) : line;
+  if (line.length > GOAL_LINE_MAX) throw new RangeError(`goal line exceeds ${GOAL_LINE_MAX} characters`);
+  return line;
+}
+
+export const FLASH_FILE_PREFIX = "/usr/local/bin/dsh-clinepass --file ";
+export const FLASH_PACKET_DIR = join(homedir(), ".local/state/remote-agent/packets");
+export const FLASH_WRAPPER = "/usr/local/bin/dsh-clinepass";
+export const FLASH_KEY_DEFAULT = join(homedir(), ".config/fullmoon-agent-control/cline_api_key");
+export const FLASH_DSH_DEFAULT = join(homedir(), ".local/share/deepseek-harness-venv/bin/dsh");
+
+export function packetDir(env = process.env) {
+  const override = String((env && env.SPECTRE_PACKET_DIR) || "").trim();
+  return override || FLASH_PACKET_DIR;
+}
+
+export function sanitizeDispatchId(dispatchId) {
+  return String(dispatchId || "").replace(/[^A-Za-z0-9._-]/g, "");
+}
+
+export function flashSendLine(dispatchId, env = process.env, tier = "paid") {
+  const id = sanitizeDispatchId(dispatchId) || "dry-run";
+  return `${FLASH_FILE_PREFIX}${packetDir(env)}/${id}.txt${tier === "free" ? " --tier free" : ""}`;
+}
+
+export function flashPin(entry) {
+  const flash = entry && entry.targets && entry.targets.flash;
+  return String((flash && flash.terminal) || "");
+}
+
+export const MIMO_WRAPPER = "/usr/local/bin/mimo-clinepass";
+export const MIMO_FILE_PREFIX = `${MIMO_WRAPPER} --file `;
+
+export function mimoPin(entry) {
+  const mimo = entry && entry.targets && entry.targets.mimo;
+  return String((mimo && mimo.terminal) || "");
+}
+
+export function mimoSendLine(dispatchId, env = process.env) {
+  const id = sanitizeDispatchId(dispatchId) || "dry-run";
+  return `${MIMO_FILE_PREFIX}${packetDir(env)}/${id}.txt`;
+}
+
+export function mimoReady(entry, env = process.env) {
+  const wrapper = String(env.SPECTRE_MIMO_WRAPPER || MIMO_WRAPPER);
+  const bin = String(env.SPECTRE_MIMO_BIN || join(homedir(), ".mimocode/bin/mimo"));
+  const pin = mimoPin(entry);
+  if (!pin && packetSurface(env) === "job") {
+    // job surface creates its own terminal; a registry pin is optional
+  } else if (!pin) {
+    return { ok: false, evt: "dispatch_mimo_unavailable", detail: "mimo pin missing (targets.mimo.terminal) — run ensurePacketPin" };
+  }
+  try {
+    const st = statSync(wrapper);
+    if ((st.mode & 0o777) !== 0o755) {
+      return { ok: false, evt: "dispatch_mimo_unavailable", detail: `wrapper mode ${(st.mode & 0o777).toString(8)} is not 755` };
+    }
+  } catch {
+    return { ok: false, evt: "dispatch_mimo_unavailable", detail: `wrapper missing (${wrapper})` };
+  }
+  try {
+    const st = statSync(bin);
+    if (!st.isFile() || (st.mode & 0o111) === 0) {
+      return { ok: false, evt: "dispatch_mimo_unavailable", detail: `mimo not executable (${bin})` };
+    }
+  } catch {
+    return { ok: false, evt: "dispatch_mimo_unavailable", detail: `mimo missing (${bin})` };
+  }
+  return { ok: true, line: mimoSendLine("dry-run", env), pin };
+}
+
+export const PACKET_SHELL_TITLES = { flash: "flash-packets", mimo: "mimo-packets" };
+
+export function packetSurface(env = process.env) {
+  const raw = String(env.SPECTRE_PACKET_SURFACE || "pin").trim().toLowerCase();
+  return raw === "job" ? "job" : "pin";
+}
+
+export function packetShellTitle(role) {
+  return PACKET_SHELL_TITLES[String(role)] || `${String(role || "packet")}-packets`;
+}
+
+export function packetJobTitle(role, dispatchId) {
+  const id = sanitizeDispatchId(dispatchId) || "pending";
+  return `${String(role || "packet")} ${id}`;
+}
+
+// The shell's OSC title replaces --title within seconds and agents set their
+// own, so a tab the bridge created is known only by the record written here.
+const TAB_HANDLE = /^term_[A-Za-z0-9_-]{1,96}$/;
+
+function tabRecordDir(env = process.env) {
+  return join(packetDir(env), "tabs");
+}
+
+function tabRecordsWritable(env = process.env) {
+  const dir = tabRecordDir(env);
+  try {
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    accessSync(dir, fsConstants.W_OK);
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, error: `orca_record_unwritable: ${dir}: ${(err && err.code) || err}` };
+  }
+}
+
+function writeTabRecord(record, env = process.env) {
+  if (!TAB_HANDLE.test(record.handle)) return { ok: false, error: "bad handle" };
+  const dir = tabRecordDir(env);
+  try {
+    const tmp = join(dir, `${record.handle}.json.tmp`);
+    writeFileSync(tmp, `${JSON.stringify(record)}\n`, { encoding: "utf8", mode: 0o600, flag: "wx" });
+    renameSync(tmp, join(dir, `${record.handle}.json`));
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, error: String((err && err.code) || err) };
+  }
+}
+
+function readTabRecords(env = process.env) {
+  const dir = tabRecordDir(env);
+  let names = [];
+  try {
+    names = readdirSync(dir);
+  } catch {
+    return [];
+  }
+  return names.flatMap((name) => {
+    const handle = name.endsWith(".json") ? name.slice(0, -".json".length) : "";
+    if (!TAB_HANDLE.test(handle)) return [];
+    try {
+      const record = JSON.parse(readFileSync(join(dir, name), "utf8"));
+      return record && typeof record === "object" && record.handle === handle ? [record] : [];
+    } catch {
+      return [];
+    }
+  });
+}
+
+// `worktree ps` has a row cap and no offset; a page without the worktree is re-read
+// once with the reported total as the cap, never with an unbounded one.
+const MAX_ORCA_WORKTREES = 1000;
+
+async function orcaWorktreeList(limit = null) {
+  const args = ["worktree", "ps", "--json", ...(limit ? ["--limit", String(limit)] : [])];
+  const listed = await runCommandCapture(ORCA_BIN, args, 20_000);
+  if (!listed.ok) return { ok: false, error: `orca_ps_failed: ${listed.error}` };
+  let payload = null;
+  try {
+    payload = JSON.parse(listed.stdout.trim());
+  } catch {
+    return { ok: false, error: "bad orca worktree ps output" };
+  }
+  const body = (payload && payload.result) || {};
+  if (!Array.isArray(body.worktrees)) return { ok: false, error: "unexpected orca worktree ps shape" };
+  return { ok: true, rows: body.worktrees, truncated: Boolean(body.truncated), total: body.totalCount };
+}
+
+async function orcaWorktreeId(cwd) {
+  const matching = (rows) => rows
+    .filter((row) => row && row.path === cwd && !row.isArchived)
+    .map((row) => row.worktreeId);
+  let page = await orcaWorktreeList();
+  if (page.ok && page.truncated && !matching(page.rows).length && Number.isInteger(page.total)
+      && page.rows.length < page.total && page.total <= MAX_ORCA_WORKTREES) {
+    page = await orcaWorktreeList(page.total);
+  }
+  if (!page.ok) return page;
+  const ids = matching(page.rows);
+  if (ids.length === 1 && typeof ids[0] === "string" && ids[0]) return { ok: true, worktreeId: ids[0] };
+  if (!ids.length && page.truncated) return { ok: false, error: `orca_ps_truncated: ${cwd}` };
+  return { ok: false, error: `orca_worktree_unregistered: ${cwd} (${ids.length} rows)` };
+}
+
+function closeOrcaTab(handle) {
+  return runCommandCapture(ORCA_BIN, ["terminal", "close", "--terminal", handle, "--tab", "--json"], 15_000);
+}
+
+// Only a registered worktree renders, and only the active selector run from
+// inside it binds to that registration; `path:<dir>` synthesizes an id the UI
+// never shows. The record directory is checked before create; otherwise every
+// loop tick would create a tab only to close it again.
+async function createOrcaTerminal({ cwd, title, command, focus = true, record }) {
+  const writable = tabRecordsWritable();
+  if (!writable.ok) return writable;
+  const registered = await orcaWorktreeId(cwd);
+  if (!registered.ok) return registered;
+  const args = ["terminal", "create", "--worktree", "active", "--title", String(title || ""), "--command", String(command || ""), "--json"];
+  if (focus) args.splice(args.length - 1, 0, "--focus");
+  const result = await runCommandCapture(ORCA_BIN, args, 20_000, { cwd });
+  if (!result.ok) return { ok: false, error: result.error || "orca create failed" };
+  let payload = null;
+  try {
+    payload = JSON.parse(result.stdout.trim());
+  } catch {
+    return { ok: false, error: "bad orca create response" };
+  }
+  const resultBody = (payload && payload.result) || {};
+  const terminal = resultBody.terminal || resultBody;
+  const handle = terminal.handle;
+  if (typeof handle !== "string" || !handle.startsWith("term_")) {
+    return { ok: false, error: "orca_handle_missing; inspect terminal list before retry" };
+  }
+  if (terminal.worktreeId !== registered.worktreeId) {
+    const closed = await closeOrcaTab(handle);
+    return {
+      ok: false,
+      error: `orca_terminal_invisible: ${handle} bound to ${terminal.worktreeId}, expected ${registered.worktreeId}; closed=${closed.ok}`,
+    };
+  }
+  const saved = writeTabRecord({
+    handle,
+    role: record.role,
+    kind: record.kind,
+    dispatch_id: record.dispatch_id || null,
+    cwd,
+    worktree_id: registered.worktreeId,
+    created_at: nowSec(),
+  });
+  if (!saved.ok) {
+    const closed = await closeOrcaTab(handle);
+    return { ok: false, error: `orca_record_failed: ${handle}: ${saved.error}; closed=${closed.ok}` };
+  }
+  return { ok: true, handle, payload };
+}
+
+async function switchOrcaTerminal(handle) {
+  if (!handle) return { ok: true, skipped: true };
+  const result = await runCommandCapture(ORCA_BIN, ["terminal", "switch", "--terminal", String(handle), "--json"], 15_000);
+  return result.ok ? { ok: true } : { ok: false, error: result.error };
+}
+
+/** Live pin for a packet role, creating a visible Orca shell when missing. */
+export async function ensurePacketPin(entry, role, cwd) {
+  const listed = await listOrcaTerminals();
+  if (!listed.ok) return { ok: false, evt: "dispatch_orca_failed", detail: listed.error };
+  const wanted = role === "mimo" ? mimoPin(entry) : flashPin(entry);
+  const title = packetShellTitle(role);
+  const live = listed.terminals.filter(
+    (term) => term && term.worktreePath === cwd && term.connected === true && term.writable === true,
+  );
+  const byPin = wanted ? live.find((term) => term.handle === wanted) : null;
+  if (byPin) return { ok: true, handle: byPin.handle, created: false };
+  const owned = new Map(
+    readTabRecords()
+      .filter((record) => record.kind === "shell" && record.role === role && record.cwd === cwd)
+      .map((record) => [record.handle, record]),
+  );
+  const byRecord = live
+    .filter((term) => owned.has(term.handle))
+    .sort((a, b) => Number(owned.get(b.handle).created_at) - Number(owned.get(a.handle).created_at))[0];
+  if (byRecord) return { ok: true, handle: byRecord.handle, created: false };
+  const created = await createOrcaTerminal({
+    cwd,
+    title,
+    command: "bash",
+    focus: true,
+    record: { role, kind: "shell" },
+  });
+  if (!created.ok) {
+    return { ok: false, evt: "dispatch_orca_failed", detail: created.error };
+  }
+  return { ok: true, handle: created.handle, created: true, title };
+}
+
+/** Per-packet visible job tab running the wrapper itself. */
+export async function startPacketJob({ role, cwd, line, dispatchId }) {
+  const title = packetJobTitle(role, dispatchId);
+  const created = await createOrcaTerminal({
+    cwd,
+    title,
+    command: line,
+    focus: true,
+    record: { role, kind: "job", dispatch_id: sanitizeDispatchId(dispatchId) },
+  });
+  if (!created.ok) {
+    return { ok: false, evt: "dispatch_orca_failed", detail: created.error };
+  }
+  return { ok: true, handle: created.handle, title, created: true };
+}
+
+export function applyPacketPin(entry, role, handle) {
+  const targets = { ...((entry && entry.targets) || {}) };
+  const current = { ...((targets && targets[role]) || {}), terminal: handle };
+  if (role === "flash" && !current.wrapper) {
+    current.wrapper = MIMO_WRAPPER.replace("mimo-clinepass", "dsh-clinepass");
+    current.harness = "dsh-clinepass";
+    current.profile = "headless";
+    current.model = current.model || "cline-pass/deepseek-v4.1-flash";
+  }
+  if (role === "mimo" && !current.wrapper) {
+    current.wrapper = MIMO_WRAPPER;
+    current.harness = "mimo-clinepass";
+    current.model = current.model || "mimo-v2.6-pro";
+  }
+  targets[role] = current;
+  return { ...entry, targets };
+}
+
+function persistWorkersPin(workersFile, workerName, entry) {
+  if (!workersFile) return { ok: false, error: "no workers file" };
+  try {
+    const payload = JSON.parse(readFileSync(workersFile, "utf8"));
+    if (!payload || typeof payload.workers !== "object" || !payload.workers) {
+      return { ok: false, error: "no workers map" };
+    }
+    const next = { ...payload, workers: { ...payload.workers, [workerName]: entry } };
+    const tmp = `${workersFile}.tmp`;
+    writeFileSync(tmp, `${JSON.stringify(next, null, 2)}\n`, { mode: 0o600 });
+    renameSync(tmp, workersFile);
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, error: String((err && err.message) || err) };
+  }
+}
+
+
+export function writeFlashPacket(dispatchId, text, env = process.env) {
+  const id = sanitizeDispatchId(dispatchId);
+  if (!id) return { ok: false, error: "missing dispatch_id" };
+  const dir = packetDir(env);
+  try {
+    mkdirSync(dir, { recursive: true });
+    const dest = join(dir, `${id}.txt`);
+    const tmp = join(dir, `${id}.txt.tmp`);
+    writeFileSync(tmp, `${String(text).trim()}\n`, { encoding: "utf8", mode: 0o600, flag: "wx" });
+    chmodSync(tmp, 0o600);
+    renameSync(tmp, dest);
+    return { ok: true, path: dest };
+  } catch (err) {
+    return { ok: false, error: String((err && err.message) || err) };
+  }
+}
+
+function _readProcCmd(procRoot, pid) {
+  try {
+    return String(readFileSync(join(procRoot, String(pid), "cmdline"))).replace(/\0/g, " ");
+  } catch {
+    return "";
+  }
+}
+
+function _readProcHandle(procRoot, pid) {
+  try {
+    const raw = String(readFileSync(join(procRoot, String(pid), "environ")));
+    const m = raw.match(/ORCA_TERMINAL_HANDLE=([^\0]*)/);
+    return m ? m[1] : "";
+  } catch {
+    return "";
+  }
+}
+
+function _readProcPpid(procRoot, pid) {
+  try {
+    const text = readFileSync(join(procRoot, String(pid), "stat"), "utf8");
+    const rparen = text.lastIndexOf(")");
+    const fields = text.slice(rparen + 2).trim().split(/\s+/);
+    return parseInt(fields[1], 10);
+  } catch {
+    return null;
+  }
+}
+
+function _cmdIsDsh(cmd) {
+  return /\bdsh\b/.test(cmd) && /--profile\s+(headless|tui)/.test(cmd);
+}
+
+export function pinTreeHasDsh(pin, procRoot = "/proc") {
+  const wanted = String(pin || "");
+  if (!wanted) return true;
+  let ents;
+  try {
+    ents = readdirSync(procRoot, { withFileTypes: true });
+  } catch {
+    return true;
+  }
+  const pids = ents.filter((e) => e.isDirectory() && /^\d+$/.test(e.name)).map((e) => e.name);
+  const tree = new Set();
+  for (const pid of pids) {
+    if (_readProcHandle(procRoot, pid) === wanted) tree.add(pid);
+  }
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const pid of pids) {
+      if (tree.has(pid)) continue;
+      const ppid = _readProcPpid(procRoot, pid);
+      if (ppid != null && tree.has(String(ppid))) {
+        tree.add(pid);
+        changed = true;
+      }
+    }
+  }
+  for (const pid of tree) {
+    if (_cmdIsDsh(_readProcCmd(procRoot, pid))) return true;
+  }
+  return false;
+}
+
+export function flashReady(entry, env = process.env, tier = "paid") {
+  const wrapper = String(env.SPECTRE_DSH_WRAPPER || FLASH_WRAPPER);
+  const free = tier === "free";
+  const unavailable = free ? "dispatch_flash_free_unavailable" : "dispatch_flash_unavailable";
+  const key = String((free ? env.SPECTRE_DSH_FREE_KEY : env.SPECTRE_DSH_KEY)
+    || (free ? join(homedir(), ".config/omni-proxy/client_key") : FLASH_KEY_DEFAULT));
+  const dsh = String(env.SPECTRE_DSH_BIN || FLASH_DSH_DEFAULT);
+  const pin = flashPin(entry);
+  if (free && !["1", "true", "yes", "on"].includes(String(env.SPECTRE_FREE_PACKETS_ENABLED || "").toLowerCase())) {
+    return { ok: false, evt: unavailable, detail: "free packets are disabled" };
+  }
+  if (free) {
+    const home = String(env.SPECTRE_DSH_FREE_HOME || join(homedir(), ".local/share/fullmoon-dsh-free"));
+    try {
+      const config = lstatSync(join(home, "settings.yaml"));
+      if (!config.isFile() || (config.mode & 0o077) !== 0) throw new Error("mode");
+    } catch {
+      return { ok: false, evt: unavailable, detail: "private free DSH profile missing" };
+    }
+  }
+  if (!pin && packetSurface(env) === "job") {
+    // job surface creates its own terminal; a registry pin is optional
+  } else if (!pin) {
+    return { ok: false, evt: unavailable, detail: "flash pin missing (targets.flash.terminal) — run ensurePacketPin or spectre-pin-sync --flash-terminal" };
+  }
+  try {
+    const st = statSync(wrapper);
+    if ((st.mode & 0o777) !== 0o755) {
+      return {
+        ok: false,
+        evt: unavailable,
+        detail: `wrapper mode ${(st.mode & 0o777).toString(8)} is not 755`,
+      };
+    }
+  } catch {
+    return { ok: false, evt: unavailable, detail: `wrapper missing (${wrapper})` };
+  }
+  try {
+    const st = lstatSync(key);
+    if (!st.isFile() || (st.mode & 0o777) !== 0o600) {
+      return {
+        ok: false,
+        evt: unavailable,
+        detail: `key mode ${(st.mode & 0o777).toString(8)} is not 600`,
+      };
+    }
+  } catch {
+    return { ok: false, evt: unavailable, detail: "cline key missing" };
+  }
+  try {
+    const st = statSync(dsh);
+    if (!(st.mode & 0o111)) {
+      return { ok: false, evt: unavailable, detail: `dsh not executable (${dsh})` };
+    }
+  } catch {
+    return { ok: false, evt: unavailable, detail: `dsh missing (${dsh})` };
+  }
+  const procRoot = String(env.SPECTRE_PROC_ROOT || "/proc");
+  if (pinTreeHasDsh(pin, procRoot)) {
+    return { ok: false, evt: "dispatch_flash_busy", detail: "dsh already in the Flash pin tree" };
+  }
+  return { ok: true, pin, wrapper, key, dsh };
+}
+
+export async function freeProxyReady(env = process.env) {
+  const raw = String(env.SPECTRE_OMNI_ENDPOINT || "http://127.0.0.1:8790/v1");
+  let endpoint;
+  try {
+    endpoint = new URL(raw);
+  } catch {
+    return { ok: false, evt: "dispatch_flash_free_unavailable", detail: "invalid proxy endpoint" };
+  }
+  if (endpoint.protocol !== "http:" || endpoint.hostname !== "127.0.0.1"
+      || !endpoint.port || endpoint.pathname !== "/v1" || endpoint.search || endpoint.hash
+      || endpoint.username || endpoint.password) {
+    return { ok: false, evt: "dispatch_flash_free_unavailable", detail: "proxy endpoint must be loopback /v1" };
+  }
+  try {
+    const response = await fetch(`${endpoint.origin}/omni/health`, { signal: AbortSignal.timeout(2000) });
+    const body = await response.json();
+    if (response.ok && body.ok === true && Array.isArray(body.providers)
+        && body.providers.includes("cline-free") && body.providers.includes("cline-paid")) {
+      return { ok: true };
+    }
+  } catch {
+    return { ok: false, evt: "dispatch_flash_free_unavailable", detail: "proxy unavailable" };
+  }
+  return { ok: false, evt: "dispatch_flash_free_unavailable", detail: "proxy providers unavailable" };
+}
+
+export function finalizeFlashInjection(claimed, goalText, env = process.env, tier = "paid") {
+  const id = claimed && claimed.claim && claimed.claim.dispatch_id;
+  if (!id) return { ok: false, error: "claim missing dispatch_id" };
+  const written = writeFlashPacket(id, goalText, env);
+  if (!written.ok) return written;
+  return { ok: true, line: flashSendLine(id, env, tier), dispatch_id: id, packet: written.path };
+}
+
+export function injectionLine({ builtin, target, goalText, clauseText, dispatchId }) {
+  if (builtin === "plan") return oneLine(goalText);
+  if (builtin === "goal" && String(target || "efficient") === "flash") {
+    return flashSendLine(dispatchId);
+  }
+  if (builtin === "goal" && String(target || "") === "mimo") {
+    return mimoSendLine(dispatchId);
+  }
+  if (builtin === "resume") return dispatchLine("resume", "", "");
+  return dispatchLine("goal", goalText, clauseText);
+}
+
+// Must match PLANNER_ROLES in scripts/control_plane/seat.py.
+const PLANNER_ROLES = new Map([["codex", "astra"], ["claude", "claude"], ["kimi", "kimi"]]);
+
+export function plannerRole(entry) {
+  return PLANNER_ROLES.get(entry?.planner?.harness || "codex") ?? null;
+}
+
+export function plannerPidVerdict(cmdlines, role) {
+  const lines = (Array.isArray(cmdlines) ? cmdlines : []).map((c) => String(c));
+  const matched = lines.filter((c) => processRole(c.split(/\s+/)) === role);
+  if (role === "astra" && matched.some((c) => /model_provider\s*=\s*["\']?openai/.test(c))) {
+    return { ok: false, evt: "dispatch_astra_plus_burn" };
+  }
+  if (matched.length !== 1) {
+    return { ok: false, evt: `dispatch_${role}_busy`, count: matched.length };
+  }
+  return { ok: true };
+}
+
+export function astraPidVerdict(cmdlines) {
+  return plannerPidVerdict(cmdlines, "astra");
+}
+
+export function astraCmdlinesFromEnv(env = process.env) {
+  const raw = env.SPECTRE_ASTRA_CMDLINES;
+  if (raw == null || String(raw).trim() === "") return null;
+  return String(raw).split("\n").filter(Boolean);
+}
+
+// Astra is counted box-wide, as its launcher refuses box-wide. A Claude or Kimi planner is
+// counted only in the dispatched worktree: an operator session elsewhere is not a planner.
+const WORKTREE_PLANNER_ROLES = new Set(["claude", "kimi"]);
+
+export function listPlannerCmdlines(role, env = process.env, procRoot = "/proc", cwd = null) {
+  const fromEnv = astraCmdlinesFromEnv(env);
+  if (fromEnv) return fromEnv;
+  try {
+    const rows = processes(env.SPECTRE_PROC_ROOT || procRoot).filter((row) => row.role === role);
+    const leaves = rows.filter((row) => !rows.some((other) => other.ppid === row.pid));
+    const scoped = cwd && WORKTREE_PLANNER_ROLES.has(role) ? leaves.filter((row) => row.cwd === cwd) : leaves;
+    return scoped.map((row) => row.argv.join(" "));
+  } catch {
+    return [];
+  }
 }
 
 // CLI parsing for `--dispatch` (the goal supervisor's path; needs no Slack).
 // Returns {builtin, worker, text, dryRun, operator, workersFile} or {error}.
 export function parseDispatchArgs(argv) {
-  const out = {
-    builtin: null,
-    worker: null,
-    text: "",
+  let options = {
     dryRun: false,
     operator: "supervisor",
     workersFile: null,
-    error: null,
+    target: "efficient",
+    tier: "paid",
+    requestId: null,
   };
-  const rest = [];
+  let rest = [];
   for (let i = 0; i < argv.length; i += 1) {
     const arg = String(argv[i]);
     if (arg === "--dry-run") {
-      out.dryRun = true;
+      options = { ...options, dryRun: true };
     } else if (arg === "--operator") {
-      out.operator = String(argv[i + 1] || "").trim() || "supervisor";
+      options = { ...options, operator: String(argv[i + 1] || "").trim() || "supervisor" };
       i += 1;
     } else if (arg === "--workers-file") {
-      out.workersFile = String(argv[i + 1] || "").trim() || null;
+      options = { ...options, workersFile: String(argv[i + 1] || "").trim() || null };
+      i += 1;
+    } else if (arg === "--request-id") {
+      options = { ...options, requestId: String(argv[i + 1] || "") };
+      i += 1;
+    } else if (arg === "--target") {
+      options = { ...options, target: String(argv[i + 1] || "efficient").trim().toLowerCase() || "efficient" };
+      i += 1;
+    } else if (arg === "--tier") {
+      options = { ...options, tier: String(argv[i + 1] || "").trim().toLowerCase() };
       i += 1;
     } else {
-      rest.push(arg);
+      rest = [...rest, arg];
     }
   }
   const builtin = String(rest[0] || "").toLowerCase();
-  if (builtin !== "goal" && builtin !== "resume") {
-    out.error = "usage: --dispatch goal|resume <worker> [goal text] [--dry-run]";
-    return out;
+  const worker = String(rest[1] || "").toLowerCase() || null;
+  const text = rest.slice(2).join(" ").trim();
+  const parsed = { ...options, builtin, worker, text, error: null };
+  if (builtin !== "goal" && builtin !== "resume" && builtin !== "plan") {
+    return { ...parsed, error: "usage: --dispatch goal|resume|plan <worker> [goal text] [--target flash|mimo|efficient] [--tier paid|free] [--dry-run]" };
   }
-  out.builtin = builtin;
-  out.worker = String(rest[1] || "").toLowerCase() || null;
-  out.text = rest.slice(2).join(" ").trim();
-  if (!out.worker) {
-    out.error = `usage: --dispatch ${builtin} <worker>${builtin === "goal" ? " <goal text>" : ""}`;
-  } else if (builtin === "goal" && !out.text) {
-    out.error = "usage: --dispatch goal <worker> <goal text>";
+  let error = null;
+  if (!worker) {
+    error = `usage: --dispatch ${builtin} <worker>${builtin === "goal" ? " <goal text>" : ""}`;
+  } else if (builtin === "goal" && !text) {
+    error = "usage: --dispatch goal <worker> <goal text>";
   }
-  return out;
+  if (!["flash", "mimo", "efficient"].includes(options.target) || (builtin === "resume" && options.target !== "efficient")) {
+    error = "invalid target for dispatch";
+  }
+  if (!["free", "paid"].includes(options.tier)) error = "invalid dispatch tier";
+  else if (options.tier === "free" && (builtin !== "goal" || options.target !== "flash")) {
+    error = "free tier requires a Flash goal";
+  }
+  return { ...parsed, error };
 }
 
 export function chunkText(text, limit = REPLY_CHUNK) {
@@ -1231,9 +1809,9 @@ async function runJob(job) {
   audit({ evt: "job_done", kind: job.kind, speaker: job.speaker, chars: result.text.length });
 }
 
-function runCommandCapture(command, args, timeoutMs) {
+function runCommandCapture(command, args, timeoutMs, { cwd } = {}) {
   return new Promise((resolve) => {
-    execFile(command, args, { timeout: timeoutMs, maxBuffer: 1_000_000 }, (err, stdout) => {
+    execFile(command, args, { timeout: timeoutMs, maxBuffer: 1_000_000, cwd }, (err, stdout) => {
       resolve({ ok: !err, stdout: String(stdout || ""), error: err ? String(err.message) : "" });
     });
   });
@@ -1250,7 +1828,9 @@ async function runLocalStatus() {
 }
 
 function loadWorkers(overridePath) {
-  const path = overridePath || (existsSync(BOX_WORKERS_FILE) ? BOX_WORKERS_FILE : REPO_WORKERS_FILE);
+  const local = join(homedir(), ".config/remote-agent/qoder-workers.json");
+  const path = overridePath || process.env.QODER_WORKERS_FILE || (existsSync(local) ? local
+    : existsSync(BOX_WORKERS_FILE) ? BOX_WORKERS_FILE : REPO_WORKERS_FILE);
   try {
     const payload = JSON.parse(readFileSync(path, "utf8"));
     const workers = payload && typeof payload.workers === "object" ? payload.workers : null;
@@ -1301,7 +1881,7 @@ async function finishClaim(claim, ok, error) {
   }
 }
 
-async function claimDispatch(worker, builtin, snapshot) {
+async function claimDispatch(worker, builtin, snapshot, target, terminal) {
   const action = dispatchAction(builtin);
   try {
     const { status, payload } = await claimAction({
@@ -1309,6 +1889,8 @@ async function claimDispatch(worker, builtin, snapshot) {
       action,
       expected_snapshot_version: snapshot.snapshot_version,
       idempotency_key: `${action}:${worker}:${snapshot.snapshot_version}:${randomUUID()}`,
+      target: target || "efficient",
+      ...(terminal ? { terminal } : {}),
     });
     if (status !== 200 || !payload || !payload.action_id) {
       return {
@@ -1320,6 +1902,20 @@ async function claimDispatch(worker, builtin, snapshot) {
   } catch (err) {
     return { ok: false, error: String((err && err.message) || err) };
   }
+}
+
+async function bindFlashAfterClaim(opts, targetName, claimed, injected) {
+  const packetTarget = targetName === "flash" || targetName === "mimo";
+  if (!(opts.builtin === "goal" && packetTarget)) {
+    return { ok: true, injected, dispatch_id: null };
+  }
+  const made = finalizeFlashInjection(claimed, opts.text, process.env, opts.tier);
+  if (!made.ok) {
+    await finishClaim(claimed.claim, false, made.error);
+    return { ok: false, evt: `dispatch_${targetName}_packet_failed`, error: made.error };
+  }
+  const line = targetName === "mimo" ? mimoSendLine(made.dispatch_id) : made.line;
+  return { ok: true, injected: line, dispatch_id: made.dispatch_id, packet: made.packet };
 }
 
 async function sendKeysToWorker(target, text) {
@@ -1380,14 +1976,78 @@ async function dispatchCli(argv) {
       code: 1,
     };
   }
-  const entry = workers[opts.worker];
+  let entry = workers[opts.worker];
   if (!entry) {
     const known = Object.keys(workers).sort().join(", ");
     return { ok: false, evt: "dispatch_unknown_worker", detail: `unknown worker ${opts.worker} (known: ${known})`, code: 1 };
   }
 
+  if (opts.builtin === "plan") {
+    const role = plannerRole(entry);
+    if (!role) {
+      audit({ evt: "dispatch_planner_unknown", worker: opts.worker, origin: opts.operator });
+      return {
+        ok: false,
+        evt: "dispatch_planner_unknown",
+        detail: "planner harness is unknown — refusing plan, not creating a terminal",
+        code: 1,
+      };
+    }
+    const pids = plannerPidVerdict(listPlannerCmdlines(role, process.env, "/proc", entry.cwd), role);
+    if (!pids.ok) {
+      audit({ evt: pids.evt, worker: opts.worker, origin: opts.operator, count: pids.count });
+      return {
+        ok: false,
+        evt: pids.evt,
+        detail: pids.evt === "dispatch_astra_plus_burn"
+          ? "plus-burn gpt-6-astra pid present — refusing plan, not creating a terminal"
+          : `${role} pid count is not 1 — refusing plan, not creating a terminal`,
+        code: 1,
+      };
+    }
+  }
+
+  const targetName = opts.target || "efficient";
+  const surface = packetSurface();
+  let ensuredPin = null;
+  if (opts.builtin === "goal" && (targetName === "flash" || targetName === "mimo") && surface === "pin") {
+    const existingPin = targetName === "mimo" ? mimoPin(entry) : flashPin(entry);
+    if (existingPin) {
+      ensuredPin = existingPin;
+    } else {
+      const ensured = await ensurePacketPin(entry, targetName, entry.cwd);
+      if (!ensured.ok) {
+        audit({ evt: ensured.evt, worker: opts.worker, origin: opts.operator, detail: ensured.detail });
+        return { ok: false, evt: ensured.evt, detail: ensured.detail, code: 1 };
+      }
+      ensuredPin = ensured.handle;
+      entry = applyPacketPin(entry, targetName, ensured.handle);
+      const persisted = persistWorkersPin(opts.workersFile || workersFile, opts.worker, entry);
+      if (!persisted.ok) {
+        audit({ evt: "dispatch_pin_persist_failed", worker: opts.worker, origin: opts.operator, terminal: ensured.handle, error: persisted.error });
+      }
+    }
+  }
+  if (opts.builtin === "goal" && (targetName === "flash" || targetName === "mimo")) {
+    const ready = targetName === "mimo" ? mimoReady(entry, process.env) : flashReady(entry, process.env, opts.tier);
+    if (!ready.ok) {
+      audit({ evt: ready.evt, worker: opts.worker, origin: opts.operator, detail: ready.detail });
+      return { ok: false, evt: ready.evt, detail: ready.detail, code: 1 };
+    }
+    if (opts.tier === "free") {
+      const proxy = await freeProxyReady(process.env);
+      if (!proxy.ok) return { ...proxy, code: 1 };
+    }
+  }
+
   let injected;
-  if (opts.builtin === "goal") {
+  if (opts.builtin === "plan") {
+    injected = "";
+  } else if (opts.builtin === "goal" && (targetName === "flash" || targetName === "mimo")) {
+    // Placeholder for paneRefusal / dry-run. Live send overwrites after claim
+    // writes packets/<dispatch_id>.txt named after the claimed id.
+    injected = targetName === "mimo" ? mimoSendLine("dry-run") : flashSendLine("dry-run", process.env, opts.tier);
+  } else if (opts.builtin === "goal") {
     const clause = loadClause();
     if (!clause.text) {
       audit({ evt: "dispatch_clause_failed", origin: opts.operator, error: clause.error });
@@ -1398,9 +2058,18 @@ async function dispatchCli(argv) {
         code: 1,
       };
     }
-    injected = dispatchLine("goal", opts.text, clause.text);
+    try {
+      injected = injectionLine({
+        builtin: "goal",
+        target: targetName,
+        goalText: opts.text,
+        clauseText: clause.text,
+      });
+    } catch (error) {
+      return { ok: false, evt: "dispatch_goal_too_long", detail: error.message, code: 1 };
+    }
   } else {
-    injected = dispatchLine("resume", "", "");
+    injected = injectionLine({ builtin: "resume" });
   }
 
   const probe = await probeWorker(workersFile, opts.worker);
@@ -1413,7 +2082,9 @@ async function dispatchCli(argv) {
       code: 1,
     };
   }
-  const verdict = dispatchAllowed(probe.payload, dispatchAction(opts.builtin));
+  const verdict = opts.builtin === "plan"
+    ? planGuard(opts.worker, entry, probe.payload, opts.requestId)
+    : dispatchAllowed(probe.payload, dispatchAction(opts.builtin));
   if (!verdict.ok) {
     audit({ evt: "dispatch_refused", builtin: opts.builtin, worker: opts.worker, state: probe.payload.state, origin: opts.operator });
     return {
@@ -1426,16 +2097,36 @@ async function dispatchCli(argv) {
     };
   }
 
+  if (opts.builtin === "plan") {
+    try {
+      injected = oneLine(plannerPrompt(opts.requestId, probe.payload));
+    } catch (error) {
+      return { ok: false, evt: "dispatch_plan_prompt_failed", detail: error.message, code: 1 };
+    }
+  }
+
   if (!entry.tmux) {
     const listed = await listOrcaTerminals();
     if (!listed.ok) {
       audit({ evt: "dispatch_orca_failed", worker: opts.worker, origin: opts.operator, error: listed.error });
       return { ok: false, evt: "dispatch_orca_failed", detail: `cannot list orca terminals for ${opts.worker}: ${listed.error}`, code: 1 };
     }
-    const pick = pickNativeTerminal(listed.terminals, entry.cwd, entry.terminal);
+    const pin = opts.builtin === "plan" ? entry.planner.terminal
+      : targetName === "flash" ? (ensuredPin || flashPin(entry))
+      : targetName === "mimo" ? (ensuredPin || mimoPin(entry))
+      : (entry.targets?.efficient?.terminal || entry.terminal);
+    const pick = pickNativeTerminal(listed.terminals, entry.cwd, pin);
     if (!pick.ok) {
       audit({ evt: "dispatch_orca_refused", worker: opts.worker, origin: opts.operator, detail: pick.detail });
       return { ok: false, evt: "dispatch_orca_refused", detail: pick.detail, code: 1 };
+    }
+    const role = opts.builtin === "plan" ? plannerRole(entry) : targetName;
+    try {
+      if (!nativeProcessGuard(pick.terminal.handle, entry.cwd, role)) {
+        return { ok: false, evt: "dispatch_model_mismatch", detail: "pinned process argv/cwd does not match target", code: 1 };
+      }
+    } catch (error) {
+      return { ok: false, evt: "dispatch_model_mismatch", detail: error.message, code: 1 };
     }
     const base = {
       builtin: opts.builtin,
@@ -1447,18 +2138,59 @@ async function dispatchCli(argv) {
       origin: opts.operator,
     };
     if (opts.dryRun) {
-      audit({ evt: "dispatch_dry_run", ...base });
-      return { ok: true, evt: "dispatch_dry_run", ...base };
+      audit({ evt: "dispatch_dry_run", ...base, line: injected });
+      return { ok: true, evt: "dispatch_dry_run", ...base, line: injected };
     }
-    const claimed = await claimDispatch(opts.worker, opts.builtin, probe.payload);
+    if (opts.builtin === "plan") {
+      const reserved = reservePlan(opts.requestId, packetDir());
+      if (!reserved.ok) {
+        return { ok: false, evt: "dispatch_plan_duplicate", detail: reserved.error, code: 1 };
+      }
+    }
+    const claimed = opts.builtin === "plan"
+      ? { ok: true, claim: { action_id: null } }
+      : await claimDispatch(opts.worker, opts.builtin, probe.payload, targetName, pick.terminal.handle);
     if (!claimed.ok) {
       audit({ evt: "dispatch_claim_failed", worker: opts.worker, origin: opts.operator, error: claimed.error });
       return { ok: false, evt: "dispatch_claim_failed", detail: `claim refused for ${opts.worker}: ${claimed.error}`, code: 1 };
     }
-    const sent = await sendToNativeTerminal(pick.terminal.handle, injected);
-    await finishClaim(claimed.claim, sent.ok, sent.error);
+    const bound = await bindFlashAfterClaim(opts, targetName, claimed, injected);
+    if (!bound.ok) {
+      audit({ evt: bound.evt, worker: opts.worker, origin: opts.operator, error: bound.error });
+      return { ok: false, evt: bound.evt, detail: bound.error, code: 1 };
+    }
+    injected = bound.injected;
+    if (bound.dispatch_id) base.dispatch_id = bound.dispatch_id;
+    base.chars = injected.length;
+    let sent = { ok: false, error: "not sent" };
+    let usedTerminal = pick.terminal.handle;
+    if (opts.builtin === "goal" && (targetName === "flash" || targetName === "mimo") && surface === "job") {
+      const job = await startPacketJob({
+        role: targetName,
+        cwd: entry.cwd,
+        line: injected,
+        dispatchId: bound.dispatch_id,
+      });
+      if (!job.ok) {
+        await finishClaim(claimed.claim, false, job.detail || job.error);
+        return { ok: false, evt: job.evt || "dispatch_orca_failed", detail: job.detail || job.error, code: 1 };
+      }
+      usedTerminal = job.handle;
+      base.terminal = usedTerminal;
+      base.surface = "job";
+      sent = { ok: true };
+      await finishClaim(claimed.claim, true, null);
+    } else {
+      sent = await sendToNativeTerminal(pick.terminal.handle, injected);
+      await finishClaim(claimed.claim, sent.ok, sent.error);
+      // Reveal only packet harness tabs (flash/mimo). Plan/efficient must not steal focus.
+      if (sent.ok && (targetName === "flash" || targetName === "mimo")) {
+        base.surface = "pin";
+        await switchOrcaTerminal(pick.terminal.handle);
+      }
+    }
     if (!sent.ok) {
-      audit({ evt: "dispatch_send_failed", worker: opts.worker, terminal: pick.terminal.handle, origin: opts.operator, error: sent.error });
+      audit({ evt: "dispatch_send_failed", worker: opts.worker, terminal: usedTerminal, origin: opts.operator, error: sent.error });
       return { ok: false, evt: "dispatch_send_failed", detail: `orca terminal send failed for ${pick.terminal.handle}: ${sent.error}`, code: 1 };
     }
     audit({ evt: "dispatch_sent", ...base, action_id: claimed.claim.action_id });
@@ -1466,17 +2198,17 @@ async function dispatchCli(argv) {
   }
 
   const target = paneTarget(entry.tmux);
-  const pane = await runCommandCapture(
-    TMUX_BIN,
-    ["display-message", "-p", "-t", target, "#{pane_current_command}\t#{pane_current_path}"],
-    10_000,
-  );
+  const pane = await inspectPane(target);
   if (!pane.ok) {
     audit({ evt: "dispatch_pane_failed", worker: opts.worker, origin: opts.operator, error: pane.error });
     return { ok: false, evt: "dispatch_pane_failed", detail: `cannot read tmux pane ${entry.tmux}: ${pane.error}`, code: 1 };
   }
-  const [paneCommand, panePath] = pane.stdout.trim().split("\t");
-  const refusal = paneRefusal(paneCommand, panePath, entry.cwd);
+  const paneCommand = pane.command;
+  const panePath = pane.path;
+  const refusal = paneRefusal(paneCommand, panePath, entry.cwd, {
+    allowFlashShell: targetName === "flash",
+    line: injected,
+  });
   if (refusal) {
     audit({ evt: "dispatch_pane_refused", builtin: opts.builtin, worker: opts.worker, pane: paneCommand, origin: opts.operator });
     return { ok: false, evt: "dispatch_pane_refused", detail: refusal, pane: paneCommand, code: 1 };
@@ -1493,14 +2225,24 @@ async function dispatchCli(argv) {
     origin: opts.operator,
   };
   if (opts.dryRun) {
-    audit({ evt: "dispatch_dry_run", ...base });
-    return { ok: true, evt: "dispatch_dry_run", ...base };
+    audit({ evt: "dispatch_dry_run", ...base, line: injected });
+    return { ok: true, evt: "dispatch_dry_run", ...base, line: injected };
   }
-  const claimed = await claimDispatch(opts.worker, opts.builtin, probe.payload);
+  const claimed = opts.builtin === "plan"
+    ? { ok: true, claim: { action_id: null } }
+    : await claimDispatch(opts.worker, opts.builtin, probe.payload, targetName);
   if (!claimed.ok) {
     audit({ evt: "dispatch_claim_failed", worker: opts.worker, origin: opts.operator, error: claimed.error });
     return { ok: false, evt: "dispatch_claim_failed", detail: `claim refused for ${opts.worker}: ${claimed.error}`, code: 1 };
   }
+  const bound = await bindFlashAfterClaim(opts, targetName, claimed, injected);
+  if (!bound.ok) {
+    audit({ evt: bound.evt, worker: opts.worker, origin: opts.operator, error: bound.error });
+    return { ok: false, evt: bound.evt, detail: bound.error, code: 1 };
+  }
+  injected = bound.injected;
+  if (bound.dispatch_id) base.dispatch_id = bound.dispatch_id;
+  base.chars = injected.length;
   const sent = await sendKeysToWorker(target, injected);
   await finishClaim(claimed.claim, sent.ok, sent.error);
   if (!sent.ok) {
@@ -1544,7 +2286,12 @@ async function handleDispatch(msg, ctx, builtin, workerName, goalText) {
       await reply(`:warning: protocol clause unreadable (${clause.path}) — refusing to dispatch without it`);
       return;
     }
-    injected = dispatchLine("goal", goalText, clause.text);
+    try {
+      injected = dispatchLine("goal", goalText, clause.text);
+    } catch (error) {
+      await reply(`goal refused: ${error.message}`);
+      return;
+    }
   } else {
     injected = dispatchLine("resume", "", "");
   }
@@ -1578,7 +2325,16 @@ async function handleDispatch(msg, ctx, builtin, workerName, goalText) {
       await reply(`:no_entry: ${builtin} refused: ${pick.detail}`);
       return;
     }
-    const claimed = await claimDispatch(workerName, builtin, probe.payload);
+    try {
+      if (!nativeProcessGuard(pick.terminal.handle, entry.cwd, "efficient")) {
+        await reply("dispatch refused: pinned process argv/cwd does not match Efficient");
+        return;
+      }
+    } catch (error) {
+      await reply(`dispatch refused: ${error.message}`);
+      return;
+    }
+    const claimed = await claimDispatch(workerName, builtin, probe.payload, "efficient", pick.terminal.handle);
     if (!claimed.ok) {
       audit({ evt: "dispatch_claim_failed", worker: workerName, error: claimed.error });
       await reply(`:no_entry: ${builtin} refused: claim failed (${claimed.error})`);
@@ -1606,17 +2362,14 @@ async function handleDispatch(msg, ctx, builtin, workerName, goalText) {
   }
 
   const target = paneTarget(entry.tmux);
-  const pane = await runCommandCapture(
-    TMUX_BIN,
-    ["display-message", "-p", "-t", target, "#{pane_current_command}\t#{pane_current_path}"],
-    10_000,
-  );
+  const pane = await inspectPane(target);
   if (!pane.ok) {
     audit({ evt: "dispatch_pane_failed", worker: workerName, error: pane.error });
     await reply(`:warning: cannot read tmux pane \`${entry.tmux}\`: ${pane.error}`);
     return;
   }
-  const [paneCommand, panePath] = pane.stdout.trim().split("\t");
+  const paneCommand = pane.command;
+  const panePath = pane.path;
   const refusal = paneRefusal(paneCommand, panePath, entry.cwd);
   if (refusal) {
     audit({ evt: "dispatch_pane_refused", builtin, worker: workerName, pane: paneCommand });

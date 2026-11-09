@@ -3,7 +3,7 @@
 # Runs: shell lint, python compile + unit tests. Exits non-zero on any failure.
 set -uo pipefail
 
-cd "$(dirname "$0")"
+cd "$(dirname "$0")" || exit 1
 
 failed=0
 section() { printf '\n== %s ==\n' "$1"; }
@@ -20,7 +20,7 @@ done
 
 section "shellcheck"
 if command -v shellcheck >/dev/null 2>&1; then
-  if shellcheck -S style scripts/*.sh install.sh; then
+  if shellcheck -S style scripts/*.sh install.sh verify.sh; then
     echo "ok    shellcheck clean"
   else
     echo "FAIL  shellcheck findings above"
@@ -31,7 +31,7 @@ else
 fi
 
 section "python compile"
-if python3 -m py_compile scripts/*.py scripts/worker_state/*.py; then
+if python3 -m py_compile scripts/*.py scripts/worker_state/*.py scripts/control_plane/*.py scripts/orca_runtime/*.py scripts/relay_probe/*.py scripts/superagent_queue/*.py scripts/dsh-clinepass scripts/mimo-clinepass scripts/spectre-astra scripts/spectre-kimi scripts/spectre-omni-proxy scripts/spectre-omni-configure; then
   echo "ok    py_compile"
 else
   echo "FAIL  py_compile"
@@ -46,9 +46,13 @@ if command -v node >/dev/null 2>&1; then
     echo "FAIL  node --check slack-bridge.mjs"
     failed=1
   fi
-  bridge_out="$(node --test tests/slack_bridge.test.mjs 2>&1)"
+  bridge_out="$(node --test --test-concurrency=1 tests/*.test.mjs 2>&1)"
   rc=$?
-  echo "${bridge_out}" | tail -3
+  if [[ ${rc} -ne 0 ]]; then
+    echo "${bridge_out}"
+  else
+    echo "${bridge_out}" | tail -8
+  fi
   if [[ ${rc} -ne 0 ]]; then
     echo "FAIL  slack bridge tests"
     failed=1
@@ -61,9 +65,13 @@ fi
 
 section "node (devcodex, vendored)"
 if command -v node >/dev/null 2>&1; then
-  dcx_out="$(node --test devcodex/test/*.test.js 2>&1)"
+  dcx_out="$(node --test --test-concurrency=1 devcodex/test/*.test.js 2>&1)"
   rc=$?
-  echo "${dcx_out}" | tail -3
+  if [[ ${rc} -ne 0 ]]; then
+    echo "${dcx_out}"
+  else
+    echo "${dcx_out}" | tail -8
+  fi
   if [[ ${rc} -ne 0 ]]; then
     echo "FAIL  devcodex tests"
     failed=1
@@ -77,14 +85,19 @@ fi
 section "unit tests"
 test_out="$(python3 -m unittest discover -s tests 2>&1)"
 rc=$?
-echo "${test_out}" | tail -3
 if [[ ${rc} -ne 0 ]]; then
+  echo "${test_out}"
   echo "FAIL  unit tests"
   failed=1
 elif ! echo "${test_out}" | grep -q "^OK"; then
   echo "FAIL  unit tests did not report OK"
   failed=1
+elif ! echo "${test_out}" | grep -qE '^Ran [1-9][0-9]* tests'; then
+  echo "${test_out}"
+  echo "FAIL  unit tests did not run a nonzero test suite"
+  failed=1
 else
+  printf '%s\n' "${test_out}" | grep -E '^Ran [1-9][0-9]* tests|^OK'
   echo "ok    $(echo "${test_out}" | grep -oE 'Ran [0-9]+ tests')"
 fi
 

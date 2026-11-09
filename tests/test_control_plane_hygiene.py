@@ -1,0 +1,348 @@
+"""Process-backed hygiene and launcher regression tests."""
+import argparse
+import contextlib
+import io
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+import unittest
+from unittest.mock import patch
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / 'scripts'))
+from control_plane import inventory, pins, astra
+from control_plane.io import locked, write_json
+import importlib.util
+spec = importlib.util.spec_from_file_location('reaper', ROOT / 'scripts/spectre-reaper.py')
+reaper = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(reaper)
+
+
+class ReaperTest(unittest.TestCase):
+    def test_duplicate_and_untitled_require_observed_identity_and_grace(self):
+        args = {'listen_ports': set(), 'pins': set(), 'owned': {'term_job'}, 'flash_done_age': None}
+        self.assertEqual(reaper.decide({'cmd': 'qodercli -m Efficient', 'duplicate': True,
+                                       'age': 301, 'handle': 'term_job'}, **args), 'term')
+        self.assertEqual(reaper.decide({'cmd': 'qodercli -m Efficient', 'duplicate': True,
+                                       'age': 5, 'handle': 'term_job'}, **args), 'keep')
+        self.assertEqual(reaper.decide({'cmd': 'bash', 'untitled': True, 'age': 301,
+                                       'handle': 'term_job'}, **args), 'term')
+        self.assertEqual(reaper.decide({'cmd': 'dsh --profile headless task',
+                                       'unpinned_flash_done_age': 301, 'handle': 'term_job'}, **args), 'term')
+
+    def test_processes_outside_recorded_tabs_are_never_selected(self):
+        # The classes the first box dry-run marked `term` in the operator's tabs.
+        args = {'listen_ports': set(), 'pins': set(), 'owned': {'term_job'}, 'flash_done_age': None}
+        rows = [{'cmd': 'java -jar server.jar nogui', 'listen': {25566}, 'rss_mib': 1400},
+                {'cmd': 'pasta --config-net', 'listen': {5432}},
+                {'cmd': 'node vite', 'listen': {5180}, 'rss_mib': 300},
+                {'cmd': 'qodercli -m Efficient', 'duplicate': True, 'age': 301},
+                {'cmd': 'bash', 'untitled': True, 'age': 301},
+                {'cmd': 'claude', 'rss_mib': 400, 'cpu_hot_twice': True}]
+        for row in rows:
+            for handle in (None, '', 'term_operator'):
+                with self.subTest(cmd=row['cmd'], handle=handle):
+                    self.assertEqual(reaper.decide({**row, 'handle': handle}, **args), 'keep')
+            self.assertEqual(reaper.decide({**row, 'handle': 'term_job'}, **args), 'term')
+
+    def test_only_a_reported_default_title_marks_a_shell_untitled(self):
+        proc = {'handle': 'term_a', 'start': 0, 'comm': 'bash'}
+
+        def untitled(**fields):
+            terminals = [{'handle': 'term_a', 'worktreePath': '/work/mc', **fields}]
+            return reaper.hygiene_fields(proc, {'cwd': '/work/mc'}, {}, terminals, 0)['untitled']
+
+        self.assertTrue(untitled(title='bash'))
+        self.assertTrue(untitled(title='(person@spectre shell, untitled) 3'))
+        self.assertFalse(untitled(title='flash-packets'))
+        self.assertFalse(untitled(title=None))
+        self.assertFalse(untitled())
+
+    def test_descendant_listener_protects_parent_tree(self):
+        rows = [{'pid': 20, 'ppid': 1}, {'pid': 21, 'ppid': 20}]
+        self.assertEqual(reaper.tree_listeners(rows, {21: {6768}})[20], {6768})
+
+    def test_headless_command_in_pinned_shell_is_not_headless_process(self):
+        self.assertEqual(reaper.decide({'cmd': 'bash -c "dsh --profile headless task"',
+            'handle': 'term_flash'}, listen_ports=set(), pins={'term_flash'}, owned=set(),
+            flash_done_age=301), 'keep')
+
+    def test_no_listener_heavy_is_selected_but_astra_is_kept(self):
+        args = {'listen_ports': set(), 'pins': set(), 'owned': {'term_job'}, 'flash_done_age': None}
+        self.assertEqual(reaper.decide({'cmd': 'java', 'rss_mib': 300, 'handle': 'term_job'}, **args), 'term')
+        self.assertEqual(reaper.decide({'cmd': 'codex -m gpt-6-astra', 'rss_mib': 300,
+                                        'handle': 'term_job'}, **args), 'keep')
+
+    def test_allowlisted_listener_kept_before_named_rules(self):
+        self.assertEqual(reaper.decide({'cmd': 'java -jar paper.jar', 'listen': [9091], 'handle': 'term_job'},
+            listen_ports={9091}, pins=set(), owned={'term_job'}, flash_done_age=None), 'keep')
+
+    def test_the_reapers_parent_is_protected_but_not_its_subtree(self):
+        # Under a user unit the parent is `systemd --user`, which also parents the
+        # operator's whole session; a root there would exempt everything.
+        parent, me = 900001, os.getpid()
+
+        def row(pid, ppid, handle, rss_mib=300):
+            return {'pid': pid, 'ppid': ppid, 'start': 0, 'ticks': 0, 'comm': 'java', 'cwd': '/work/mc',
+                    'handle': handle, 'rss_mib': rss_mib, 'cmd': 'java -jar server.jar'}
+
+        class Client:
+            def snapshot(self, name):
+                return {}
+
+        processes = [row(parent, 1, 'term_job'), row(me, parent, 'term_job'),
+                     row(900002, parent, 'term_job'), row(900003, parent, 'term_operator'),
+                     row(900004, me, 'term_job')]
+        decisions, _ = reaper.observe({}, processes, {}, {}, Client(), 100.0, owned=frozenset({'term_job'}))
+        actions = {row['pid']: row['action'] for row in decisions}
+        self.assertEqual(actions, {parent: 'keep', me: 'keep', 900002: 'term', 900003: 'keep',
+                                   900004: 'keep'})
+
+    def test_live_child_signal_checks_identity(self):
+        child = subprocess.Popen(['sleep', '30'])
+        try:
+            observed = next(row for row in inventory.scan() if row['pid'] == child.pid)
+            with self.assertRaises(ValueError):
+                reaper.terminate({**observed, 'start': observed['start'] + 1})
+            self.assertIsNone(child.poll())
+            reaper.terminate(observed)
+            self.assertEqual(child.wait(timeout=3), -15)
+        finally:
+            if child.poll() is None:
+                child.terminate()
+                child.wait(timeout=3)
+
+    def test_listener_parser(self):
+        text = 'LISTEN 0 128 127.0.0.1:6768 0.0.0.0:* users:(("orca",pid=42,fd=7))\n'
+        self.assertEqual(inventory.listeners(text), {42: {6768}})
+
+    def test_only_this_uids_unattributed_listeners_count(self):
+        text = ('LISTEN 0 128 0.0.0.0:22 0.0.0.0:* ino:1 sk:1 cgroup:/system.slice/ssh.service <->\n'
+                'LISTEN 0 511 0.0.0.0:6768 0.0.0.0:* users:(("orca",pid=42,fd=7)) uid:1000 ino:2 sk:2 <->\n'
+                'LISTEN 0 128 127.0.0.1:8080 0.0.0.0:* uid:1000 ino:3 sk:3 <->\n'
+                'LISTEN 0 128 127.0.0.1:9000 0.0.0.0:* uid:1001 ino:4 sk:4 <->\n'
+                'garbled\n\n')
+        self.assertEqual(inventory.unattributed(text, 1000), ['127.0.0.1:8080', 'garbled'])
+        self.assertEqual(inventory.unattributed(text, 0), ['0.0.0.0:22', 'garbled'])
+        self.assertEqual(inventory.listeners(text), {42: {6768}})
+
+
+class LiveTest(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        self.packet_dir = root / 'packets'
+        (self.packet_dir / 'tabs').mkdir(parents=True)
+        self.record = self.packet_dir / 'tabs' / 'term_gone.json'
+        self.record.write_text(json.dumps({'handle': 'term_gone', 'role': 'flash', 'kind': 'shell',
+                                           'dispatch_id': None, 'created_at': 0}) + '\n')
+        write_json(root / 'workers.json', {'workers': {'minecraft': {'cwd': '/work/mc'}}})
+        self.args = argparse.Namespace(apply=False, workers_file=root / 'workers.json',
+                                       state=root / 'reaper.json')
+
+    def live(self, listener_uid, observe):
+        row = f'LISTEN 0 128 127.0.0.1:8080 0.0.0.0:* uid:{listener_uid} ino:3 sk:3 <->\n'
+
+        def fake_ss(argv, **kwargs):
+            self.assertEqual(argv, ['ss', '-ltnpeH'])
+            return subprocess.CompletedProcess(argv, 0, row, '')
+
+        listing = {'ok': True, 'parsed': {'result': {'terminals': [], 'truncated': False}}}
+        with patch.dict(os.environ, {'SPECTRE_PACKET_DIR': str(self.packet_dir)}), \
+                patch.object(reaper.subprocess, 'run', side_effect=fake_ss), \
+                patch.object(reaper, 'run', return_value=listing), \
+                patch.object(reaper, 'observe', side_effect=observe):
+            return reaper.live(self.args)
+
+    def test_another_uids_unattributed_listener_does_not_block(self):
+        out = self.live(os.getuid() + 1, lambda *args, **kwargs: ([], {}))
+        self.assertTrue(out['ok'])
+        self.assertNotIn('error', out)
+        self.assertEqual([row['reason'] for row in out['tab_records']], ['tab_gone'])
+
+    def test_recorded_tabs_are_the_only_owned_handles(self):
+        seen = []
+
+        def observe(*args, owned, **kwargs):
+            seen.append(owned)
+            return [], {}
+
+        self.live(os.getuid() + 1, observe)
+        self.assertEqual(seen, [frozenset({'term_gone'})])
+
+    def test_orca_failure_names_its_cause(self):
+        with patch.object(reaper, 'run', return_value={'ok': False, 'error': 'orca-ide: exit 1'}), \
+                patch.object(reaper.subprocess, 'run',
+                             return_value=subprocess.CompletedProcess([], 0, '', '')):
+            with self.assertRaisesRegex(ValueError, r'^Orca inventory unavailable \(orca-ide: exit 1\); '
+                                                    r'refusing reap$'):
+                reaper.live(self.args)
+
+    def test_own_unattributed_listener_refuses_processes_but_sweeps_tabs(self):
+        def refuse_observe(*args, **kwargs):
+            raise AssertionError('observe ran despite an unattributed listener')
+
+        out = self.live(os.getuid(), refuse_observe)
+        self.assertFalse(out['ok'])
+        self.assertEqual(out['error'],
+                         'listener ownership incomplete: 127.0.0.1:8080; refusing process reap')
+        self.assertEqual(out['decisions'], [])
+        self.assertEqual([(row['handle'], row['reason'], row['dry_run']) for row in out['tab_records']],
+                         [('term_gone', 'tab_gone', True)])
+        self.assertTrue(self.record.exists())
+
+    def test_a_held_lock_stops_inventory_and_sweep(self):
+        def untouched(*args, **kwargs):
+            raise AssertionError('reaper read inventory or swept while another run held the lock')
+
+        with locked(self.args.state.with_suffix('.lock')), \
+                patch.object(reaper.subprocess, 'run', side_effect=untouched), \
+                patch.object(reaper, 'run', side_effect=untouched), \
+                patch.object(reaper.tidy, 'sweep', side_effect=untouched):
+            with self.assertRaises(BlockingIOError):
+                reaper.live(self.args)
+        self.assertTrue(self.record.exists())
+
+    def test_unexpected_error_still_prints_a_json_verdict(self):
+        malformed = {'ok': True, 'parsed': {'result': []}}
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with patch.dict(os.environ, {'SPECTRE_PACKET_DIR': str(self.packet_dir)}), \
+                patch.object(reaper.subprocess, 'run',
+                             return_value=subprocess.CompletedProcess([], 0, '', '')), \
+                patch.object(reaper, 'run', return_value=malformed), \
+                contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            code = reaper.main(['--workers-file', str(self.args.workers_file),
+                                '--state', str(self.args.state)])
+        self.assertEqual(code, 1)
+        self.assertEqual(json.loads(stdout.getvalue()),
+                         {'ok': False, 'error': "AttributeError: 'list' object has no attribute 'get'"})
+        self.assertIn('Traceback', stderr.getvalue())
+        with locked(self.args.state.with_suffix('.lock')):
+            pass
+
+
+class PinTest(unittest.TestCase):
+    def test_title_is_never_model_evidence(self):
+        terminals = [{'handle': 'term_a', 'worktreePath': '/work/a', 'connected': True,
+                      'writable': True, 'title': 'Qoder Efficient'}]
+        self.assertFalse(pins.pick(terminals, [], '/work/a', 'efficient')['ok'])
+        processes = [{'handle': 'term_a', 'cwd': '/work/a', 'model': 'efficient'}]
+        self.assertEqual(pins.pick(terminals, processes, '/work/a', 'efficient')['handle'], 'term_a')
+
+    def test_ambiguous_pins_preserved(self):
+        entry = {'cwd': '/work/a', 'terminal': 'term_old'}
+        updated, changes = pins.sync({'w': entry}, [], [])
+        self.assertEqual(updated['w'], entry)
+        self.assertFalse(changes[0]['ok'])
+
+
+class AstraTest(unittest.TestCase):
+    def test_existing_astra_never_creates_or_switches(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with patch('control_plane.astra.inventory.scan', return_value=[{'pid': 41, 'model': 'astra'}]):
+                called = []
+                out = astra.launch(root / 'workers', root / 'modes', root / 'provider.json',
+                                   run=lambda cmd, **kw: called.append(cmd))
+                self.assertFalse(out['ok'])
+                self.assertEqual(called, [])
+
+    def test_failed_switch_does_not_write_active_provider(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_json(root / 'workers', {'workers': {'minecraft': {'cwd': '/work/mc'}}})
+            write_json(root / 'provider.json', {'ok': True, 'id': 'anyrouter', 'checked_at': 100})
+            with patch('control_plane.astra.inventory.scan', return_value=[]):
+                out = astra.launch(root / 'workers', root, root / 'provider.json', now=100,
+                                   run=lambda cmd, **kw: {'ok': False})
+            self.assertEqual(out['error'], 'codex_mode_failed')
+            self.assertFalse((root / 'active-provider').exists())
+
+
+if __name__ == '__main__':
+    unittest.main()
+
+class LaunchFlowTest(unittest.TestCase):
+    def test_success_creates_only_orca_terminal_and_preserves_other_pins(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_json(root / 'workers', {'workers': {'minecraft': {'cwd': '/work/mc',
+                'targets': {'flash': {'terminal': 'term_flash'}, 'efficient': {'terminal': 'old'}}}}})
+            write_json(root / 'provider.json', {'ok': True, 'id': 'anyrouter', 'checked_at': 100})
+            calls = []
+            def run(argv, **kwargs):
+                calls.append((argv, kwargs.get('cwd')))
+                if argv[1:3] == ['terminal', 'list']:
+                    return {'ok': True, 'parsed': {'result': {'terminals': [{'handle': 'term_eff',
+                        'worktreePath': '/work/mc', 'connected': True, 'writable': True}]}}}
+                if argv[1:3] == ['worktree', 'ps']:
+                    return {'ok': True, 'parsed': {'result': {'worktrees': [
+                        {'worktreeId': 'wt-mc::/work/mc', 'path': '/work/mc'}]}}}
+                if argv[1:3] == ['terminal', 'create']:
+                    return {'ok': True, 'parsed': {'result': {'terminal': {
+                        'handle': 'term_astra', 'worktreeId': 'wt-mc::/work/mc'}}}}
+                return {'ok': True}
+            processes = [{'pid': 7, 'model': 'efficient', 'handle': 'term_eff', 'cwd': '/work/mc'}]
+            with patch('control_plane.astra.inventory.scan', return_value=processes):
+                output = astra.launch(root / 'workers', root, root / 'provider.json', run=run, now=100)
+            self.assertTrue(output['ok'])
+            self.assertEqual(output['worktree_id'], 'wt-mc::/work/mc')
+            self.assertEqual(calls[0][0], ['codex-mode', 'api', 'anyrouter', 'gpt-6-astra'])
+            create, cwd = calls[-1]
+            self.assertEqual(create[:6], ['orca-ide', 'terminal', 'create', '--worktree', 'active',
+                                          '--title'])
+            self.assertEqual(cwd, '/work/mc')
+            self.assertEqual((root / 'active-provider').read_text(), 'anyrouter\n')
+            updated = json.loads((root / 'workers').read_text())['workers']['minecraft']
+            self.assertEqual(updated['planner']['terminal'], 'term_astra')
+            self.assertEqual(updated['planner']['harness'], 'codex')
+            self.assertEqual(updated['targets']['efficient']['terminal'], 'term_eff')
+            self.assertEqual(updated['targets']['flash']['terminal'], 'term_flash')
+            self.assertNotIn('model_provider=openai', ' '.join(create))
+
+    def test_pin_sync_updates_all_efficient_aliases_and_planner(self):
+        workers = {'minecraft': {'cwd': '/work/mc', 'terminal': 'old', 'planner': {'terminal': 'old_a'},
+                                 'targets': {'efficient': {'terminal': 'old'}}}}
+        terminals = [{'handle': h, 'worktreePath': '/work/mc', 'connected': True, 'writable': True}
+                     for h in ('new_e', 'new_a')]
+        procs = [{'handle': 'new_e', 'cwd': '/work/mc', 'model': 'efficient'},
+                 {'handle': 'new_a', 'cwd': '/work/mc', 'model': 'astra'}]
+        updated, changes = pins.sync(workers, terminals, procs)
+        self.assertEqual(updated['minecraft']['targets']['efficient']['terminal'], 'new_e')
+        self.assertEqual(updated['minecraft']['planner']['terminal'], 'new_a')
+        self.assertEqual(workers['minecraft']['terminal'], 'old')
+
+    def test_pin_sync_follows_the_planner_harness(self):
+        terminals = [{'handle': h, 'worktreePath': '/work/mc', 'connected': True, 'writable': True}
+                     for h in ('new_e', 'new_a', 'new_c')]
+        procs = [{'handle': 'new_e', 'cwd': '/work/mc', 'model': 'efficient'},
+                 {'handle': 'new_a', 'cwd': '/work/mc', 'model': 'astra'},
+                 {'handle': 'new_c', 'cwd': '/work/mc', 'model': 'claude'}]
+        workers = {'minecraft': {'cwd': '/work/mc',
+                                 'planner': {'terminal': 'old', 'harness': 'claude'}}}
+        updated, changes = pins.sync(workers, terminals, procs)
+        self.assertEqual(updated['minecraft']['planner'], {'terminal': 'new_c', 'harness': 'claude'})
+        self.assertEqual(changes[-1]['role'], 'claude')
+        unknown = {'minecraft': {'cwd': '/work/mc',
+                                 'planner': {'terminal': 'old', 'harness': 'gemini'}}}
+        updated, changes = pins.sync(unknown, terminals, procs)
+        self.assertEqual(updated['minecraft']['planner']['terminal'], 'old')
+        self.assertFalse(changes[-1]['ok'])
+        self.assertIn('unknown planner harness', changes[-1]['error'])
+
+class FlashPinTest(unittest.TestCase):
+    def test_flash_binding_requires_an_idle_shell_in_minecraft(self):
+        workers = {'minecraft': {'cwd': '/work/mc', 'targets': {'flash': {'model': 'flash'}}}}
+        term = {'handle': 'term_f', 'worktreePath': '/work/mc', 'connected': True, 'writable': True}
+        procs = [{'handle': 'term_f', 'cwd': '/work/mc', 'model': None, 'comm': 'bash'}]
+        updated = pins.bind_flash(workers, [term], procs, 'term_f')
+        self.assertEqual(updated['minecraft']['targets']['flash']['terminal'], 'term_f')
+        self.assertNotIn('terminal', workers['minecraft']['targets']['flash'])
+        with self.assertRaises(ValueError):
+            pins.bind_flash(workers, [term], [{**procs[0], 'model': 'efficient'}], 'term_f')
+        with self.assertRaises(ValueError):
+            pins.bind_flash(workers, [{**term, 'worktreePath': '/elsewhere'}], procs, 'term_f')

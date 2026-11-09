@@ -207,11 +207,26 @@ class Lifecycle(unittest.TestCase):
         self.assertFalse(out["policy"]["continuity_recovery_allowed"])
         self.assertTrue(out["policy"]["continuity_eligible"])
 
-    def test_in_flight_tool_is_not_stalled(self):
-        events = [ev("tool.started", 1, turn_id="t1", ts=NOW - 4000, payload={"tool": "shell"})]
+    def test_in_flight_tool_with_cpu_is_not_stalled(self):
+        events = [
+            ev("tool.started", 1, turn_id="t1", ts=NOW - 4000, payload={"tool": "shell"}),
+            ev(
+                "process.sample",
+                2,
+                source="process",
+                ts=NOW - 5,
+                payload={"alive": True, "nprocs": 1, "cpu_delta": 20},
+            ),
+        ]
         out = snap(events, NOW)
         self.assertEqual(out["goal"]["state"], "RUNNING")
         self.assertFalse(out["execution"]["stalled"])
+
+    def test_wedged_in_flight_without_cpu_stalls(self):
+        events = [ev("tool.started", 1, turn_id="t1", ts=NOW - 4000, payload={"tool": "shell"})]
+        out = snap(events, NOW)
+        self.assertEqual(out["goal"]["state"], "RUNNING")
+        self.assertTrue(out["execution"]["stalled"])
 
     def test_running_without_progress_eventually_stalls(self):
         events = [ev("model.request.started", 1, turn_id="t1", ts=NOW - 2000)]
@@ -221,12 +236,12 @@ class Lifecycle(unittest.TestCase):
         self.assertFalse(out["policy"]["can_dispatch_goal"])
         self.assertTrue(out["policy"]["continuity_recovery_allowed"])
 
-    def test_injected_becomes_unconfirmed_after_timeout(self):
+    def test_unconfirmed_delivery_does_not_authorize_another_goal(self):
         events = [
             ev(
                 "terminal_write.succeeded",
                 1,
-                ts=NOW - 121,
+                ts=NOW - 241,
                 goal_id="g-1",
                 dispatch_id="d-1",
                 attempt_id=1,
@@ -236,6 +251,31 @@ class Lifecycle(unittest.TestCase):
         out = snap(events, NOW)
         self.assertEqual(out["goal"]["state"], "UNCONFIRMED")
         self.assertFalse(out["policy"]["can_dispatch_goal"])
+        self.assertTrue(out["policy"]["idle_slo_violated"])
+
+    def test_alive_process_does_not_clear_unconfirmed_delivery(self):
+        events = [
+            ev("terminal_write.succeeded", 1, ts=NOW - 500, goal_id="g-1",
+               dispatch_id="d-1", attempt_id=1,
+               payload={"action": "dispatch_goal"}),
+            ev("process.sample", 2, source="process", ts=NOW - 5,
+               payload={"alive": True, "nprocs": 1, "cpu_delta": 10}),
+        ]
+        out = snap(events, NOW)
+        self.assertEqual(out["goal"]["state"], "UNCONFIRMED")
+        self.assertFalse(out["policy"]["can_dispatch_goal"])
+
+    def test_cached_injected_snapshot_becomes_unconfirmed_without_dispatch_permission(self):
+        from worker_state.resolver import apply_now_effects
+
+        events = [ev("terminal_write.succeeded", 1, ts=NOW - 10,
+                     goal_id="g-1", dispatch_id="d-1", attempt_id=1,
+                     payload={"action": "dispatch_goal"})]
+        cached = snap(events, NOW)
+        later = apply_now_effects(cached, NOW + 500)
+        self.assertEqual(later["goal"]["state"], "UNCONFIRMED")
+        self.assertTrue(later["policy"]["idle_slo_violated"])
+        self.assertFalse(later["policy"]["can_dispatch_goal"])
 
     def test_injected_then_turn_id_accepts_and_runs(self):
         events = [
@@ -276,6 +316,16 @@ class Lifecycle(unittest.TestCase):
         out = snap(events, NOW)
         self.assertEqual(out["goal"]["state"], "RUNNING")
         self.assertFalse(out["execution"]["stalled"])
+
+    def test_assigning_ignores_dsh_jsonl(self) -> None:
+        events = [
+            ev("goal.completed", 1, turn_id="t1", goal_id="g1"),
+            ev("assignment.started", 2, source="api", goal_id="g1", turn_id="t1"),
+            ev("tool.started", 3, source="dsh_jsonl", turn_id="t1", payload={"tool": "x"}),
+            ev("turn.ended", 4, source="session_jsonl", turn_id="t1"),
+        ]
+        out = snap(events)
+        self.assertEqual(out["goal"]["state"], "ASSIGNING")
 
     def test_new_turn_after_park_starts_epoch(self):
         events = [

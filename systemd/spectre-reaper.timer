@@ -1,0 +1,10 @@
+[Unit]
+Description=Inspect unowned Spectre processes every five minutes
+
+[Timer]
+OnBootSec=180s
+OnUnitActiveSec=5min
+Unit=spectre-reaper.service
+
+[Install]
+WantedBy=timers.target

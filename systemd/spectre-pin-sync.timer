@@ -1,0 +1,10 @@
+[Unit]
+Description=Inspect Spectre worker pins every five minutes
+
+[Timer]
+OnBootSec=180s
+OnUnitActiveSec=5min
+Unit=spectre-pin-sync.service
+
+[Install]
+WantedBy=timers.target

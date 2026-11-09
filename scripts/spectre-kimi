@@ -1,0 +1,64 @@
+#!/usr/bin/env python3
+"""Operator handoff to a visible Kimi Code terminal."""
+import argparse
+import json
+import os
+from pathlib import Path
+import sys
+
+for parent in (Path(__file__).resolve().parent,
+               Path(__file__).resolve().parent.parent / 'lib/spectre-worker-state',
+               Path('/usr/local/lib/spectre-worker-state')):
+    if (parent / 'control_plane').is_dir():
+        sys.path.insert(0, str(parent))
+        break
+
+from control_plane import kimi
+from worker_state.client import StateClient
+from worker_state.qoder_jsonl import workers_path
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('action', choices=('launch', 'send-prompt', 'confirm', 'release'))
+    parser.add_argument('--workers-file', type=Path, default=workers_path())
+    parser.add_argument('--provider-state', type=Path, default=Path(os.environ.get(
+        'SPECTRE_PROVIDER_STATE', Path.home() / '.local/state/remote-agent/codex-provider.json')))
+    parser.add_argument('--loop-state', type=Path, default=Path(os.environ.get(
+        'SPECTRE_LOOP_STATE', Path.home() / '.local/state/remote-agent/spectre-loop.json')))
+    parser.add_argument('--seat-root', type=Path, default=Path(os.environ.get(
+        'SPECTRE_SEAT_ROOT', Path.home() / '.local/state/remote-agent')))
+    parser.add_argument('--kimi-config', type=Path, default=Path.home() / '.kimi-code/config.toml')
+    parser.add_argument('--terminal')
+    parser.add_argument('--observed-ready', action='store_true')
+    parser.add_argument('--observed-stopped', action='store_true')
+    parser.add_argument('--dry-run', action='store_true')
+    args = parser.parse_args()
+    if args.action in {'send-prompt', 'confirm'} and not args.terminal:
+        parser.error('--terminal is required for send-prompt and confirm')
+    if args.dry_run and args.action != 'launch':
+        parser.error('--dry-run is only valid for launch')
+    client = StateClient(timeout=2)
+    common = (args.workers_file, args.provider_state, args.loop_state,
+              args.seat_root, client)
+    try:
+        if args.action == 'launch':
+            output = kimi.launch(args.workers_file, args.provider_state, args.loop_state,
+                                 args.seat_root, args.kimi_config, client, dry=args.dry_run)
+        elif args.action == 'send-prompt':
+            output = kimi.send_prompt(*common, args.terminal)
+        elif args.action == 'confirm':
+            output = kimi.confirm(*common, args.terminal,
+                                  observed_ready=args.observed_ready)
+        else:
+            output = kimi.release(args.workers_file, args.provider_state,
+                                  args.loop_state, args.seat_root,
+                                  observed_stopped=args.observed_stopped)
+    except (OSError, ValueError, KeyError, RuntimeError) as exc:
+        output = {'ok': False, 'error': str(exc)}
+    print(json.dumps(output, sort_keys=True))
+    return 0 if output['ok'] else 1
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

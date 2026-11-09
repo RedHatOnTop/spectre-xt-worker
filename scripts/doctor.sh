@@ -313,13 +313,9 @@ if [[ -f "${slack_env}" ]]; then
     warn "grok not installed — goal supervisor has no reviewer (handoff stays manual)"
   fi
   if RUN_AS_USER systemctl --user is-enabled goal-supervisor.timer >/dev/null 2>&1; then
-    if grep -qs '^Environment=SPECTRE_GOAL_SUPERVISOR=1' "${TARGET_HOME}/.config/systemd/user/goal-supervisor.service" 2>/dev/null; then
-      ok "goal-supervisor.timer enabled (autonomous handoff on)"
-    else
-      warn "goal-supervisor.timer enabled but the unit's kill switch is off (no-op)"
-    fi
+    bad "goal-supervisor.timer enabled — Grok CLI supervisor stays installed-off (control plane)"
   else
-    warn "goal-supervisor.timer disabled — parked goals wait for you"
+    ok "goal-supervisor.timer disabled (installed off)"
   fi
 else
   warn "slack.env missing — Slack community not configured (RUNBOOK 7.10)"
@@ -331,6 +327,7 @@ if command -v spectre-state >/dev/null 2>&1; then
   ws_enabled="$(RUN_AS_USER systemctl --user is-enabled spectre-worker-state.service 2>/dev/null || true)"
   if [[ "${ws_enabled}" == "enabled" ]]; then
     check_cmd "spectre-worker-state.service active (user unit)" "$(declare -f RUN_AS_USER); RUN_AS_USER systemctl --user is-active spectre-worker-state.service 2>/dev/null | grep -qx active"
+    check_cmd "spectre-worker-state-watchdog.timer active (user unit)" "$(declare -f RUN_AS_USER); RUN_AS_USER systemctl --user is-active spectre-worker-state-watchdog.timer 2>/dev/null | grep -qx active"
     # `spectre-state health` is a raw read; the socket can still refuse under
     # load. What matters for dispatch is `get`: an UNKNOWN snapshot is
     # fail-closed (every policy flag false), which refuses /goal and /resume.
@@ -359,7 +356,10 @@ fi
 # Retired with the cutover: each of these classified occupancy on its own and
 # could type a second, contradictory goal. Enabled again = a regression.
 for ws_legacy in qoder-nudge.timer qoder-continuity.timer \
-                 codex-goal-healer.timer grokbot-goal-event.timer; do
+                 codex-goal-healer.timer grokbot-goal-event.timer \
+                 grokbot-goal-event.path \
+                 local-listener-reaper.timer qoder-idle-reaper.timer \
+                 native-worker-pin-sync.timer; do
   ws_legacy_state="$(RUN_AS_USER systemctl --user is-enabled "${ws_legacy}" 2>/dev/null || true)"
   if [[ "${ws_legacy_state}" == "enabled" ]]; then
     bad "${ws_legacy} enabled — retired classifier back on (RUNBOOK 7.17)"
@@ -367,11 +367,82 @@ for ws_legacy in qoder-nudge.timer qoder-continuity.timer \
     ok "${ws_legacy} disabled"
   fi
 done
+
+echo "== thermal / compile-farm guard (RUNBOOK 7.20) =="
+if [[ -x /usr/local/bin/spectre-thermal-guard ]]; then
+  ok "spectre-thermal-guard installed"
+  tg_timer="$(RUN_AS_USER systemctl --user is-enabled spectre-thermal-guard.timer 2>/dev/null || true)"
+  if [[ "${tg_timer}" == "enabled" ]]; then
+    check_cmd "spectre-thermal-guard.timer active (user unit)" "$(declare -f RUN_AS_USER); RUN_AS_USER systemctl --user is-active spectre-thermal-guard.timer 2>/dev/null | grep -qx active"
+  else
+    bad "spectre-thermal-guard.timer not enabled — compile-farm work is unguarded (RUNBOOK 7.20)"
+  fi
+  # Run as the agent user: as root the guard would sample root's /proc and state.
+  tg_probe="$(RUN_AS_USER env HOME="${TARGET_HOME}" /usr/local/bin/spectre-thermal-guard --check 2>/dev/null || true)"
+  tg_level="$(printf '%s' "${tg_probe}" | python3 -c "import json,sys; print(json.load(sys.stdin).get('level') or '')" 2>/dev/null || true)"
+  tg_temp="$(printf '%s' "${tg_probe}" | python3 -c "import json,sys; print(json.load(sys.stdin).get('temp_c') or '')" 2>/dev/null || true)"
+  if [[ -z "${tg_probe}" || -z "${tg_level}" ]]; then
+    bad "spectre-thermal-guard --check produced no readable status"
+  elif [[ "${tg_level}" == "ok" ]]; then
+    ok "thermal guard ok (package ${tg_temp}C)"
+  elif [[ "${tg_level}" == "unknown" ]]; then
+    warn "thermal guard cannot read a package temperature sensor"
+  else
+    bad "thermal guard level=${tg_level} (package ${tg_temp}C) — inspect ~/.local/state/remote-agent/thermal.jsonl"
+  fi
+  tg_log="${TARGET_HOME}/.local/state/remote-agent/thermal.jsonl"
+  if [[ -f "${tg_log}" ]]; then
+    tg_age=$(( $(date +%s) - $(stat -c %Y "${tg_log}" 2>/dev/null || echo 0) ))
+    if (( tg_age <= 300 )); then
+      ok "thermal sample ${tg_age}s old"
+    else
+      bad "thermal sample stale (${tg_age}s) — timer not sampling (RUNBOOK 7.20)"
+    fi
+  else
+    bad "no thermal sample log at ${tg_log} (RUNBOOK 7.20)"
+  fi
+else
+  bad "spectre-thermal-guard not installed — build-class work is unguarded (RUNBOOK 7.20)"
+fi
 ws_gs="$(RUN_AS_USER systemctl --user is-enabled goal-supervisor.timer 2>/dev/null || true)"
 if [[ "${ws_gs}" == "enabled" ]]; then
-  ok "goal-supervisor.timer enabled (Grokbot active, RUNBOOK 7.16)"
+  bad "goal-supervisor.timer enabled — Grok CLI supervisor stays installed-off (control plane)"
 else
-  warn "goal-supervisor.timer disabled — Grokbot advances nothing (installed off)"
+  ok "goal-supervisor.timer disabled (installed off)"
+fi
+
+echo "== lightning offload for heavy builds (RUNBOOK 7.21) =="
+# Optional infrastructure: a broken offload path means builds simply do not run
+# here, which is safe, so these are WARNs — not FAILs.
+lg_bin=/usr/local/lib/lightning-cli/venv/bin/lightning
+if [[ -x "${lg_bin}" || -n "$(command -v lightning 2>/dev/null)" ]]; then
+  ok "lightning CLI installed"
+else
+  warn "lightning CLI missing — no heavy-build offload target (RUNBOOK 7.21)"
+fi
+lg_env="${TARGET_HOME}/.config/remote-agent/lightning.env"
+lg_creds="${TARGET_HOME}/.lightning/credentials.json"
+if [[ -f "${lg_creds}" ]]; then
+  lg_mode="$(stat -c %a "${lg_creds}" 2>/dev/null || echo '?')"
+  if [[ "${lg_mode}" == "600" ]]; then
+    ok "Lightning credentials present (0600)"
+  else
+    warn "Lightning credentials mode ${lg_mode} — chmod 600 ${lg_creds}"
+  fi
+elif grep -qs '^LIGHTNING_API_KEY=.' "${lg_env}" 2>/dev/null; then
+  ok "Lightning credentials in ${lg_env}"
+else
+  warn "no Lightning credentials (run 'lightning login' or fill ${lg_env})"
+fi
+if [[ -f "${lg_env}" ]] && grep -qs '^LIGHTNING_STUDIO=.' "${lg_env}"; then
+  lg_plan="$(RUN_AS_USER env HOME="${TARGET_HOME}" /usr/local/bin/spectre-offload --dry-run -- true 2>/dev/null || true)"
+  if printf '%s' "${lg_plan}" | grep -q '"ok":true'; then
+    ok "spectre-offload plans an offload ($(printf '%s' "${lg_plan}" | sed -n 's/.*"studio":"\([^"]*\)".*/\1/p'))"
+  else
+    warn "spectre-offload --dry-run produced no plan (RUNBOOK 7.21)"
+  fi
+else
+  warn "LIGHTNING_STUDIO not set in ${lg_env} — offload target unknown (RUNBOOK 7.21)"
 fi
 
 echo "== codex CLI + session handoff (RUNBOOK 7.11, 7.15) =="
