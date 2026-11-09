@@ -137,8 +137,8 @@ It must not be committed or published.
 Native authority stays with Orca Run, Task, and Dispatch. The continuity
 journal resumes the same mandate after a lost response, provider outage, or
 process restart. Do not launch a second owner for a live or unverifiable
-worker. GPT-6.1 Sol on the existing Agentrouter/Anyrouter proxy
-(`~/.local/bin/codex-agentrouter-portable`) is the only orchestrator. Register
+worker. GPT-6.1 Sol on the direct Agentrouter B profile
+(`orca-agentrouter-b`, no local proxy) is the only orchestrator. Register
 a harness or a temporary free endpoint as route data with adapter
 `registered`; do not add a scheduler. SOS allows one insight for a recorded
 stuck episode inside five hours, keeps the same owner, and opens no paid

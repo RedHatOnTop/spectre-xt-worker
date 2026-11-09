@@ -356,7 +356,7 @@ class SelectionTest(unittest.TestCase):
         self.assertIn('second owner', text)
         self.assertIn('five hours', text)
         self.assertIn('selection_fault', text)
-        self.assertIn('codex-agentrouter-portable', text)
+        self.assertIn('orca-agentrouter-b', text)
 
     def test_proxy_snapshot_balances_the_existing_agentrouter_family(self):
         mapped = selection.budgets_from_proxy(

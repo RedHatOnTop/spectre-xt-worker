@@ -7,11 +7,16 @@ of RUNBOOK.md. Their journals are audit records, not current execution authority
 ## Roles and authority
 
 - The coordinator is one visible Codex session on Agentrouter, launched through
-  the direct profile `orca-agentrouter` (`https://agentrouter.org/v1`). The
-  profile carries the Codex-native idle timeout, retry cap, and compaction
-  settings from `scripts/codex_agentrouter_harness.py`. It does not use the
-  loopback proxy. Never silently fall back to the OpenAI account or enable
-  paid overages.
+  the direct profile `orca-agentrouter-b` (`https://agentrouter.org/v1`, key
+  file `agentrouter-b`). The profile file itself sets the Codex-native idle
+  timeout, retry cap, and compaction limit. It does not use the loopback proxy.
+  The launch clears inherited ChatGPT-account routing and desktop client
+  surfaces (apps, browser, computer use, in-app tools, and the extra MCP
+  servers). It also bind-mounts `~/.codex/AGENTS.agentrouter-b.md` (source
+  `config/codex-agents.agentrouter-b.md`) over `~/.codex/AGENTS.md` for that
+  process only, so the global Korean-reply rule and browser CDP note are not
+  part of the request. Never silently fall back
+  to the OpenAI account or enable paid overages.
   The operator selected **GPT-6.1 Sol** on November 2. Existing Run, Task, Gate,
   and session identities remain authoritative; a model change creates no owner.
 - The primary implementation/debugging worker is **DeepSeek Harness (DSH)** on
@@ -40,7 +45,7 @@ The coordinator launches through the direct Agentrouter profile:
 
 ```sh
 orca-ide terminal create --worktree active --title 'Fullmoon coordinator' \
-  --command '/home/person/.local/bin/codex --no-daemon --profile orca-agentrouter' --json
+  --command '/usr/local/bin/spectre-coordinator resume <session-uuid>' --json
 ```
 
 Wait for `terminal wait --for tui-idle` to report `satisfied: true` before sending
@@ -54,7 +59,7 @@ editors use separate registered worktrees.
 
 Route choice, resume, and SOS are journal decisions in
 `docs/SPECTRE_SUPERAGENT.md`. Native authority stays Orca. Do not launch a
-second owner for a live or unverifiable worker. GPT-6.1 Sol through the direct `orca-agentrouter` profile stays the only
+second owner for a live or unverifiable worker. GPT-6.1 Sol through the direct `orca-agentrouter-b` profile stays the only
 orchestrator. A new harness or a
 temporary free endpoint is registered as data; it does not add a scheduler or
 a proxy. SOS is one insight per recorded stuck episode inside five hours, with
