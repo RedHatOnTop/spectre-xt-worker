@@ -93,6 +93,8 @@ CORE_PROTECTED = (
 # The CRIT fallback must not kill the agent harness or its shells; only the
 # build rule may reach an agent's child processes. `obscura` is the agent
 # browser (RUNBOOK 7.19): its CDP worker is agent tooling, not runaway work.
+# ZCode is the Z.ai desktop harness: `ZCode`/`zcode` are its Electron processes
+# and `zcode-cli` the agent that runs the session; stopping either ends the run.
 # Interpreters are deliberately NOT listed: `protected()` also matches the first
 # two argv basenames, so `python3 /usr/local/bin/spectre-state` (and any
 # `node /usr/local/bin/spectre-slack-bridge`) stays protected while a generic
@@ -100,7 +102,7 @@ CORE_PROTECTED = (
 # offloaded to the Studio (RUNBOOK 7.21).
 AGENT_PROTECTED = CORE_PROTECTED + (
     'dsh', 'deepseek-harness', 'codex', 'claude', 'qoder', 'mimo-clinepass',
-    'obscura',
+    'obscura', 'zcode', 'ZCode',
 )
 
 
