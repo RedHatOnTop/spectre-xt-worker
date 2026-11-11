@@ -6,7 +6,8 @@
 //   #control  bot mention from an allowlisted member -> built-in or qoder run
 //             (goal/resume <worker>: type /goal[ resume] into a worker's tmux)
 //   #lobby    agent-identity post -> qoder discussion reply in-thread
-//             (humans only when allowlisted AND prefixed "qoder:").
+//             (humans only when allowlisted AND prefixed "qoder:"). Off with
+//             SLACK_LOBBY_DISCUSSION=0: the channel is then a ledger, never answered.
 //             With SLACK_DEBATE=1 the antigravity CLI (agy) joins as a
 //             second voice: a responder's own post draws the *other*
 //             responder, strictly alternating until [PASS] or a cap.
@@ -182,6 +183,7 @@ export function loadConfig(text) {
       .filter(Boolean),
     triage: truthy(env.SLACK_TRIAGE || "0"),
     debate: truthy(env.SLACK_DEBATE || "0"),
+    lobbyDiscussion: truthy(env.SLACK_LOBBY_DISCUSSION || "1"),
     maxRunsPerDay: Math.max(1, Math.floor(numberOr(env.SLACK_MAX_RUNS_PER_DAY, 30))),
     threadRunsPerHour: Math.max(
       1,
@@ -327,6 +329,7 @@ export function classifyMessage(msg, cfg, ctx) {
   }
 
   if (msg.channel === cfg.channels.lobby) {
+    if (!cfg.lobbyDiscussion) return { kind: "ignore", reason: "lobby_discussion_disabled" };
     if (!msg.botId) {
       if (!HUMAN_PREFIX.test(msg.text)) {
         return { kind: "ignore", reason: "lobby_human_unprefixed" };
@@ -2727,7 +2730,7 @@ async function main() {
   const ctx = { cfg: null, agents, botUserId: "", botId: "", envFile, state };
   const cfg0 = loadConfig(readTextFile(envFile));
   console.log(
-    `slack-bridge: starting (${Object.keys(agents).length} agents, triage=${cfg0.triage ? "on" : "off"}, debate=${cfg0.debate ? "on" : "off"})`,
+    `slack-bridge: starting (${Object.keys(agents).length} agents, triage=${cfg0.triage ? "on" : "off"}, debate=${cfg0.debate ? "on" : "off"}, lobby=${cfg0.lobbyDiscussion ? "on" : "off"})`,
   );
   const me = await slackCall(cfg0.botToken, "auth.test", {});
   if (!me.ok) {

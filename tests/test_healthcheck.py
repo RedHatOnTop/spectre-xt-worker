@@ -83,6 +83,72 @@ class DecideTest(unittest.TestCase):
         self.assertEqual(action, "notify_new")
         self.assertEqual(fresh.since, 700)
 
+    def test_measurement_drift_is_not_a_new_failure(self) -> None:
+        now = 1_000_000
+        action, st = healthcheck.decide(
+            ["disk:/=96%"], healthcheck.EMPTY_STATE, now, renotify_min=30
+        )
+        self.assertEqual(action, "notify_new")
+        for minute, pct in enumerate([97, 98, 99, 100, 99, 100, 96], start=1):
+            action, st = healthcheck.decide(
+                [f"disk:/={pct}%"], st, now + minute * 60, renotify_min=30
+            )
+            self.assertEqual(action, "log_only", f"{pct}% at +{minute}m")
+        self.assertEqual(st.bits, frozenset({"disk:/=96%"}))
+        self.assertEqual(st.count, 1)
+
+    def test_log_only_carries_the_latest_measurement(self) -> None:
+        prev = state(frozenset({"disk:/=96%"}), since=1000, last=1300, count=1)
+        _, nxt = healthcheck.decide(["disk:/=99%"], prev, now=1400, renotify_min=30)
+        self.assertEqual(nxt.bits, frozenset({"disk:/=99%"}))
+        self.assertEqual((nxt.since, nxt.last_notified, nxt.count), (1000, 1300, 1))
+
+    def test_another_probe_joining_still_notifies(self) -> None:
+        prev = state(frozenset({"disk:/=96%"}), since=1000, last=1300, count=1)
+        action, _ = healthcheck.decide(
+            ["disk:/=96%", "load1=9.10>=8"], prev, now=1400, renotify_min=30
+        )
+        self.assertEqual(action, "notify_new")
+
+    def test_renotify_backs_off_to_the_cap(self) -> None:
+        minutes = [
+            healthcheck.renotify_interval_sec(30, count) // 60 for count in range(1, 8)
+        ]
+        self.assertEqual(minutes, [30, 60, 120, 240, 240, 240, 240])
+
+    def test_backoff_never_undercuts_a_longer_configured_interval(self) -> None:
+        self.assertEqual(healthcheck.renotify_interval_sec(360, 1) // 60, 360)
+        self.assertEqual(healthcheck.renotify_interval_sec(360, 9) // 60, 360)
+
+    def test_second_renotify_waits_out_the_doubled_window(self) -> None:
+        prev = state(frozenset({"proxy_down"}), since=0, last=1000, count=2)
+        action, _ = healthcheck.decide(
+            ["proxy_down"], prev, now=1000 + 31 * 60, renotify_min=30
+        )
+        self.assertEqual(action, "log_only")
+        action, nxt = healthcheck.decide(
+            ["proxy_down"], prev, now=1000 + 61 * 60, renotify_min=30
+        )
+        self.assertEqual((action, nxt.count), ("renotify", 3))
+
+
+class FailureKeyTest(unittest.TestCase):
+    def test_measured_numbers_are_dropped(self) -> None:
+        self.assertEqual(healthcheck.failure_key("disk:/=96%"), "disk:/=#%")
+        self.assertEqual(healthcheck.failure_key("load1=6.12>=8"), "load1=#>=#")
+        self.assertEqual(healthcheck.failure_key("swap_used=4.2G"), "swap_used=#G")
+
+    def test_digits_in_names_and_words_survive(self) -> None:
+        self.assertEqual(healthcheck.failure_key("disk:/mnt/data2=96%"), "disk:/mnt/data2=#%")
+        self.assertNotEqual(
+            healthcheck.failure_key("disk:/mnt/data1=96%"),
+            healthcheck.failure_key("disk:/mnt/data2=96%"),
+        )
+        self.assertEqual(healthcheck.failure_key("proxy_status=empty"), "proxy_status=empty")
+        self.assertNotEqual(
+            healthcheck.failure_key("tailscale=down"), healthcheck.failure_key("tailscale=unreadable")
+        )
+
 
 class MessageTest(unittest.TestCase):
     def test_renotify_includes_duration(self) -> None:

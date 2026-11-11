@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Daily deterministic brief to the Slack #lobby commons — no LLM.
 
-Composes three box-local sources into one message:
+Composes four box-local sources into one message:
+  - `spectre-slack-receipt --pending` (pull requests waiting for the operator)
   - ~/.local/state/remote-agent/health-state.json (active failure streak)
   - the last 24 h of /work/logs/health.log (alert/recovery counts)
   - `spectre-status` output (falls back to scripts/status.sh in the repo)
@@ -30,6 +31,7 @@ STATUS_LINES_MAX = 24
 STATUS_CHARS_MAX = 1800
 NOTIFY_TIMEOUT = 30
 STATUS_TIMEOUT = 25
+PENDING_TIMEOUT = 15
 
 
 def _read(path: Path) -> str:
@@ -98,9 +100,16 @@ def render_brief(
     health: dict[str, object] | None,
     log_summary: dict[str, int],
     status_text: str,
+    pending: list[str] | None = None,
 ) -> str:
     date = time.strftime("%Y-%m-%d", time.localtime(now))
     lines = [f":desktop_computer: *daily brief — {date}*", ""]
+
+    if pending is not None:
+        if pending:
+            lines += [f"*awaiting merge* ({len(pending)})", *pending, ""]
+        else:
+            lines += ["*awaiting merge*: nothing", ""]
 
     bits = health.get("bits") if isinstance(health, dict) else None
     if bits:
@@ -124,7 +133,6 @@ def render_brief(
     if status_text.strip():
         lines += ["", "*box*", "```", _clip_lines(status_text, STATUS_LINES_MAX, STATUS_CHARS_MAX), "```"]
 
-    lines += ["", '_reply "qoder: ..." in-thread to ask qoder about this._']
     return "\n".join(lines)
 
 
@@ -146,6 +154,21 @@ def fetch_status() -> str:
     return ""
 
 
+def fetch_pending() -> list[str] | None:
+    """Waiting pull requests, or None when the ledger is not installed or did not answer."""
+    binary = shutil.which("spectre-slack-receipt")
+    cmd = [binary] if binary else ["python3", str(HERE / "slack-receipt.py")]
+    try:
+        proc = subprocess.run(
+            cmd + ["--pending"], capture_output=True, text=True, timeout=PENDING_TIMEOUT
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        return None
+    return [line for line in proc.stdout.splitlines() if line.strip()]
+
+
 def notify_command() -> list[str]:
     binary = shutil.which("spectre-slack-notify")
     if binary:
@@ -164,7 +187,7 @@ def main(argv: list[str] | None = None) -> int:
     health = read_health_state()
     summary = summarize_log(recent_log_lines(_read(LOG_FILE), now))
     status_text = fetch_status()
-    brief = render_brief(now, health, summary, status_text)
+    brief = render_brief(now, health, summary, status_text, fetch_pending())
 
     if args.dry_run:
         print(brief)

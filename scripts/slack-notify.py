@@ -8,6 +8,7 @@ environment and token values are never printed.
 Usage:
   spectre-slack-notify --agent orca --channel lobby --text 'daemon restarts?'
   spectre-slack-notify --channel alerts --text-file /tmp/msg --thread-ts 1.5
+  spectre-slack-notify --channel lobby --text 'merged' --update-ts 1.5
   spectre-slack-notify --agent healthcheck --channel alerts --recovery --text recovered
   spectre-slack-notify --self-test
   spectre-slack-notify --dry-run --channel lobby --text hi
@@ -33,6 +34,7 @@ DEFAULT_ENV_FILE = Path.home() / ".config/remote-agent/slack.env"
 BOX_REGISTRY = Path("/usr/local/share/remote-agent/slack-agents.json")
 REPO_REGISTRY = Path(__file__).resolve().parents[1] / "config" / "slack-agents.json"
 API_URL = "https://slack.com/api/chat.postMessage"
+UPDATE_URL = "https://slack.com/api/chat.update"
 TIMEOUT = 10.0
 
 CHANNEL_ALIASES = {
@@ -136,6 +138,11 @@ def build_payload(
     return payload
 
 
+def build_update_payload(channel: str, text: str, ts: str) -> dict[str, object]:
+    """chat.update keeps the original username/icon; it takes only channel, ts and text."""
+    return {"channel": channel, "ts": ts, "text": text}
+
+
 def _retry_after(exc: urllib.error.HTTPError) -> float:
     try:
         raw = exc.headers.get("Retry-After") if exc.headers else None
@@ -144,11 +151,13 @@ def _retry_after(exc: urllib.error.HTTPError) -> float:
         return 5.0
 
 
-def post(token: str, payload: dict[str, object]) -> tuple[bool, str]:
+def post(
+    token: str, payload: dict[str, object], url: str = API_URL
+) -> tuple[bool, str]:
     """(ok, detail). One retry on HTTP 429 (Retry-After) and once on 5xx."""
     data = json.dumps(payload).encode("utf-8")
     request = urllib.request.Request(
-        API_URL,
+        url,
         data=data,
         headers={
             "Authorization": f"Bearer {token}",
@@ -264,6 +273,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--text-file")
     parser.add_argument("--thread-ts", help="parent message ts for a threaded reply")
     parser.add_argument(
+        "--update-ts", help="ts of an earlier post of this app: edit it in place"
+    )
+    parser.add_argument(
         "--recovery", action="store_true", help="prefix the text with a green check"
     )
     parser.add_argument("--dry-run", action="store_true", help="print payload, post nothing")
@@ -294,6 +306,11 @@ def main(argv: list[str] | None = None) -> int:
     if args.thread_ts and not TS_RE.match(args.thread_ts):
         print(f"slack-notify: bad --thread-ts {args.thread_ts!r}", file=sys.stderr)
         return 1
+    if args.update_ts and args.thread_ts:
+        parser.error("--update-ts and --thread-ts are exclusive")
+    if args.update_ts and not TS_RE.match(args.update_ts):
+        print(f"slack-notify: bad --update-ts {args.update_ts!r}", file=sys.stderr)
+        return 1
     if args.recovery and not text.startswith(RECOVERY_PREFIX):
         text = RECOVERY_PREFIX + text
 
@@ -305,18 +322,26 @@ def main(argv: list[str] | None = None) -> int:
     agents = load_registry(registry_path())
     identity = identity_for(agents, args.agent)
     channel = resolve_channel(args.channel, env)
-    payload = build_payload(channel, text, identity, args.thread_ts)
+    if args.update_ts:
+        payload = build_update_payload(channel, text, args.update_ts)
+    else:
+        payload = build_payload(channel, text, identity, args.thread_ts)
 
     if args.dry_run:
         print(json.dumps(payload, indent=2, ensure_ascii=False))
         return 0
 
-    ok, detail = post(env["SLACK_BOT_TOKEN"].strip(), payload)
+    ok, detail = post(
+        env["SLACK_BOT_TOKEN"].strip(),
+        payload,
+        UPDATE_URL if args.update_ts else API_URL,
+    )
     if not ok:
         print(f"slack-notify: {detail}", file=sys.stderr)
         return 1
     shown = args.channel if args.channel in CHANNEL_ALIASES else channel
-    print(f"slack-notify: posted {shown} ts={detail}")
+    verb = "updated" if args.update_ts else "posted"
+    print(f"slack-notify: {verb} {shown} ts={detail}")
     return 0
 
 

@@ -222,6 +222,15 @@ if [[ -f "${slack_env}" ]]; then
     1|true|yes|on) debate_on=1 ;;
     *) debate_on=0 ;;
   esac
+  # SLACK_LOBBY_DISCUSSION defaults on; the bridge reads "0"/"off" as off.
+  lobby_val="$(sed -nE 's/^[[:space:]]*SLACK_LOBBY_DISCUSSION[[:space:]]*=[[:space:]]*(.*)$/\1/p' "${slack_env}" | tail -n1 | sed -E 's/^[[:space:]]+|[[:space:]]+$//g')"
+  case "${lobby_val,,}" in
+    ""|1|true|yes|on) lobby_on=1 ;;
+    *) lobby_on=0 ;;
+  esac
+  if (( ! lobby_on )); then
+    ok "lobby discussion off — #lobby is the PR ledger, the bridge never answers it"
+  fi
   # SLACK_AGY_BIN overrides the default bin (bridge: expandHome, default
   # ~/.local/bin/agy; a non-absolute value refuses startup).
   agy_bin="$(sed -nE 's/^[[:space:]]*SLACK_AGY_BIN[[:space:]]*=[[:space:]]*(.*)$/\1/p' "${slack_env}" | tail -n1 | sed -E 's/^[[:space:]]+|[[:space:]]+$//g')"
@@ -251,11 +260,12 @@ if [[ -f "${slack_env}" ]]; then
     else
       bad "antigravity missing from slack-agents.json — agy posts would be ignored"
     fi
-  else
+  elif (( lobby_on )); then
     warn "lobby debate off — single responder (SLACK_DEBATE unset or off)"
   fi
   check_cmd "slack-bridge.service active (user unit)" "$(declare -f RUN_AS_USER); RUN_AS_USER systemctl --user is-active slack-bridge.service 2>/dev/null | grep -qx active"
   check_cmd "slack-brief.timer enabled (user unit)" "$(declare -f RUN_AS_USER); RUN_AS_USER systemctl --user is-enabled slack-brief.timer 2>/dev/null | grep -qx enabled"
+  check_cmd "slack-receipt-sync.timer enabled (user unit)" "$(declare -f RUN_AS_USER); RUN_AS_USER systemctl --user is-enabled slack-receipt-sync.timer 2>/dev/null | grep -qx enabled"
   if command -v spectre-slack-notify >/dev/null 2>&1; then
     if RUN_AS_USER spectre-slack-notify --self-test >/dev/null 2>&1; then
       ok "spectre-slack-notify self-test OK"

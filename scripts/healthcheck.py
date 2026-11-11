@@ -21,6 +21,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -41,6 +42,7 @@ DEFAULT_MEM_FLOOR_MB = 800
 DEFAULT_SWAP_FAIL_PCT = 90
 DEFAULT_SWAP_USED_GIB = 4.0
 DEFAULT_RENOTIFY_MIN = 30
+RENOTIFY_MAX_MIN = 240
 DEFAULT_BRIDGE_URL = "http://127.0.0.1:8787/mcp"
 DEFAULT_ORCA_URL = "http://127.0.0.1:6768/web-index.html"
 
@@ -432,21 +434,36 @@ class State:
 EMPTY_STATE = State(bits=frozenset(), since=0, last_notified=0, count=0)
 
 
+_MEASURED = re.compile(r"(?<==)\d[\d.]*")
+
+
+def failure_key(bit: str) -> str:
+    """A failure without its measured numbers: `disk:/=96%` and `disk:/=97%` are one failure."""
+    return _MEASURED.sub("#", bit)
+
+
+def renotify_interval_sec(renotify_min: int, count: int) -> int:
+    """`renotify_min`, doubling with every notification already sent, capped at RENOTIFY_MAX_MIN."""
+    minutes = renotify_min * 2 ** min(max(count - 1, 0), 10)
+    return min(minutes, max(renotify_min, RENOTIFY_MAX_MIN)) * 60
+
+
 def decide(
     current_bits: list[str], previous: State, now: int, renotify_min: int
 ) -> tuple[str, State]:
     """Return (action, next_state); action in notify_new|renotify|
     notify_recover|log_only|quiet_ok."""
     current = frozenset(current_bits)
-    renotify_sec = renotify_min * 60
 
     if not current:
         if previous.bits:
             return "notify_recover", EMPTY_STATE
         return "quiet_ok", EMPTY_STATE
 
-    if current == previous.bits:
-        elapsed_ok = now - previous.last_notified >= renotify_sec
+    if {failure_key(b) for b in current} == {failure_key(b) for b in previous.bits}:
+        elapsed_ok = now - previous.last_notified >= renotify_interval_sec(
+            renotify_min, previous.count
+        )
         if elapsed_ok:
             return "renotify", State(
                 bits=current,
@@ -454,7 +471,7 @@ def decide(
                 last_notified=now,
                 count=previous.count + 1,
             )
-        return "log_only", previous
+        return "log_only", dataclasses.replace(previous, bits=current)
 
     if previous.bits:
         # streak continues but composition changed: alert now, keep since.

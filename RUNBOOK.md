@@ -779,7 +779,7 @@ Four public channels, four behaviors:
 | `#alerts` | healthcheck posts only. With `SLACK_TRIAGE=1` a failing alert draws a rate-limited read-only qoder triage reply in-thread |
 | `#fleet` | agent lifecycle posts. Never answered |
 | `#control` | you @-mention the bot -> builtin `ping`/`status`/`help`, else a headless read-only qoder run. Only member IDs in `SLACK_ALLOWED_USERS` |
-| `#lobby` | the commons: any registered agent (orca/zcode/qoder/spectre/...) may open a top-level issue and qoder answers in-thread — one hop. Allowlisted humans join with a `qoder:` prefix. With `SLACK_DEBATE=1` a second voice (antigravity/agy) joins and the two responders discuss: see "Lobby debate" below |
+| `#lobby` | the commons: any registered agent (orca/zcode/qoder/spectre/...) may open a top-level issue and qoder answers in-thread — one hop. Allowlisted humans join with a `qoder:` prefix. With `SLACK_DEBATE=1` a second voice (antigravity/agy) joins and the two responders discuss: see "Lobby debate" below. **With `SLACK_LOBBY_DISCUSSION=0` (the box setting since 2026-09-30) the bridge ignores every #lobby message** and the channel is the operator's PR ledger — see "PR ledger" |
 
 One Slack app, nine identities distinguished only by username/icon
 (`config/slack-agents.json`): `bridge`, `healthcheck`, `orca`, `zcode`,
@@ -800,6 +800,36 @@ died 2026-09-12 ("OAuth session expired and could not be refreshed"),
 and the bridge never fails over to it. With `SLACK_DEBATE=1` a second
 responder joins `#lobby` only: the Antigravity CLI (`agy`) — see "Lobby
 debate" below.
+
+### PR ledger (since 2026-09-30)
+
+The agents do the work; the operator's scarce resource is attention. `#lobby` therefore
+holds **one message per pull request**, edited in place as it moves, so it reads as
+"what is waiting for me" rather than a feed. It only works with
+`SLACK_LOBBY_DISCUSSION=0`, otherwise the bridge would answer every receipt with a
+qoder reply.
+
+```bash
+# right after `gh pr create` (Claude Code sessions run this; the Commits rule in CLAUDE.md)
+spectre-slack-receipt --pr https://github.com/<owner>/<repo>/pull/<n> \
+  --title "<PR title>" --note "<one line of evidence, e.g. CI green>"
+# later, same URL: keeps the title/note it is not given
+spectre-slack-receipt --pr <url> --state failing --note "CI: 1 red"
+spectre-slack-receipt --pending        # what still waits, one line each
+```
+
+States: `open` (yellow), `failing` (red), `merged` (purple), `closed` (black). The operator
+merges in GitHub, not here, so `slack-receipt-sync.timer` (every 15 min) asks `gh pr view`
+for every waiting receipt and edits the message to `merged`/`closed`; a `gh` that cannot
+answer is skipped and retried, never a unit failure. State lives in
+`~/.local/state/remote-agent/slack-receipts.json` (under `flock`; settled receipts are
+pruned after 14 days). The 09:00 brief opens with the `*awaiting merge*` list. If the
+receipt post was deleted in Slack the next call posts a fresh one.
+
+Not wired: a decision inbox. `~/.local/share/fullmoon-agent-control/slack_approval.py` posts a
+request in `#control` and types the operator's reply into an Orca terminal, but its daemon
+is not running and its `fleet_decision` also accepts a grokbot verdict, which is a policy
+call for the operator, not a default.
 
 ### Setup
 
@@ -824,7 +854,7 @@ mode 600, with: `SLACK_BOT_TOKEN`, `SLACK_APP_TOKEN`,
 `SLACK_MAX_RUNS_PER_DAY` (default 30), `SLACK_EXECUTOR_BIN` (default
 `~/.local/bin/qoder-efficient`), `SLACK_EXECUTOR_MODEL` (default
 `efficient`), and the debate block (all optional, defaults shown):
-`SLACK_DEBATE=0`, `SLACK_DEBATE_MAX_RUNS_PER_DAY=20`,
+`SLACK_LOBBY_DISCUSSION=1`, `SLACK_DEBATE=0`, `SLACK_DEBATE_MAX_RUNS_PER_DAY=20`,
 `SLACK_THREAD_RUNS_PER_HOUR=4`, `SLACK_THREAD_TURNS_PER_DAY=8`,
 `SLACK_AGY_BIN=~/.local/bin/agy`. Reference tokens by name only — never
 paste a token into chat, a commit, or the repo; one that traveled further
@@ -855,6 +885,7 @@ wholesale on this box; it would overwrite the box-only `spectre-status`):
 ```bash
 install -m 755 scripts/slack-notify.py  /usr/local/bin/spectre-slack-notify
 install -m 755 scripts/slack-brief.py   /usr/local/bin/spectre-slack-brief
+install -m 755 scripts/slack-receipt.py /usr/local/bin/spectre-slack-receipt
 install -m 755 scripts/slack-bridge.mjs /usr/local/bin/spectre-slack-bridge
 mkdir -p /usr/local/share/remote-agent
 install -m 644 config/slack-agents.json /usr/local/share/remote-agent/
@@ -884,8 +915,10 @@ else
   echo "WARN: jq not found; ${settings_dest} not refreshed from the repo" >&2
 fi
 install -m 644 systemd/slack-bridge.service systemd/slack-brief.service \
-  systemd/slack-brief.timer ~/.config/systemd/user/
+  systemd/slack-brief.timer systemd/slack-receipt-sync.service \
+  systemd/slack-receipt-sync.timer ~/.config/systemd/user/
 systemctl --user daemon-reload
+systemctl --user enable --now slack-receipt-sync.timer
 # executor prerequisite (box-local, not from this repo): qodercli reachable
 # at ~/.local/bin/qoder-efficient; the bridge spawns exactly that path.
 ```
@@ -3094,9 +3127,19 @@ Notification state machine:
 |---|---|
 | new failure set | push immediately |
 | failure set changed | push immediately (streak start time kept) |
-| same set < 30 min | log only |
-| same set ≥ 30 min (`RENOTIFY_MIN`) | re-push with total duration |
+| same set, only the measured numbers moved (`disk:/=96%` → `97%`) | same set — see below |
+| same set < the current interval | log only |
+| same set ≥ the current interval | re-push with total duration |
 | recovered | one recovery push, state cleared |
+
+"Same set" compares each failure without its measured numbers
+(`failure_key`: `disk:/=96%` and `disk:/=97%` are one failure, `load1=6.12>=8` is
+`load1`), so a metric drifting inside one failure never opens a fresh streak. The
+renotify interval starts at `RENOTIFY_MIN` (30) and doubles with every push in the
+streak up to 4 h (30, 60, 120, 240, 240 …); a longer configured `RENOTIFY_MIN`
+wins. Before 2026-09-30 the set compared whole strings and the interval was flat:
+one disk near full posted 84 alerts in two days and used the whole `#alerts`
+triage budget.
 
 Every passing tick touches
 `~/.local/state/remote-agent/heartbeat`. `spectre-status` prints its age,

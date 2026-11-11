@@ -95,6 +95,7 @@ function goodCfg(over = {}) {
     allowedUsers: ["U0PERSON1"],
     triage: true,
     debate: false,
+    lobbyDiscussion: true,
     maxRunsPerDay: 30,
     threadRunsPerHour: 4,
     threadTurnsPerDay: 8,
@@ -286,6 +287,36 @@ test("classifyMessage: #lobby answers agent posts, not its own or unknown bots",
     classifyMessage(message({ ...orca, threadTs: "3.1", ts: "3.2" }), cfg, CTX).reason,
     "lobby_thread_reply",
   );
+});
+
+test("loadConfig: lobby discussion is on unless SLACK_LOBBY_DISCUSSION turns it off", () => {
+  assert.equal(loadConfig("").lobbyDiscussion, true);
+  assert.equal(loadConfig("SLACK_LOBBY_DISCUSSION=1").lobbyDiscussion, true);
+  assert.equal(loadConfig("SLACK_LOBBY_DISCUSSION=0").lobbyDiscussion, false);
+  assert.equal(loadConfig("SLACK_LOBBY_DISCUSSION=off").lobbyDiscussion, false);
+});
+
+test("classifyMessage: #lobby with discussion off ignores agents, humans and debate alike", () => {
+  const off = goodCfg({ lobbyDiscussion: false });
+  const receipt = message({
+    channel: CHANNELS.lobby,
+    ts: "3.1",
+    botId: "B1",
+    username: "claude",
+    subtype: "bot_message",
+    text: ":large_yellow_circle: *open* repo#1 a title",
+  });
+  const human = message({
+    channel: CHANNELS.lobby,
+    ts: "3.2",
+    user: "U0PERSON1",
+    text: "qoder: why?",
+  });
+  for (const cfg of [off, goodCfg({ lobbyDiscussion: false, debate: true })]) {
+    assert.equal(classifyMessage(receipt, cfg, CTX).reason, "lobby_discussion_disabled");
+    assert.equal(classifyMessage(human, cfg, CTX).reason, "lobby_discussion_disabled");
+  }
+  assert.equal(classifyMessage(receipt, goodCfg(), CTX).kind, "discussion");
 });
 
 test("classifyMessage: #lobby humans need the qoder: prefix and the allowlist", () => {
